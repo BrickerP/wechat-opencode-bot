@@ -111,6 +111,14 @@ async function runDaemon(): Promise<void> {
   const sessionStore = createSessionStore();
   const session: Session = sessionStore.load(account.accountId);
 
+  // No query can survive a daemon restart: clear stale transient states so the
+  // next WeChat message is accepted instead of being rejected as "still running".
+  if (session.state !== 'idle') {
+    logger.warn('Resetting stale session state on startup', { state: session.state });
+    session.state = 'idle';
+    sessionStore.save(account.accountId, session);
+  }
+
   if (config.workingDirectory && session.workingDirectory === process.cwd()) {
     session.workingDirectory = config.workingDirectory;
     sessionStore.save(account.accountId, session);
@@ -166,6 +174,15 @@ async function handleMessage(
 ): Promise<void> {
   if (msg.message_type !== MessageType.USER) return;
   if (!msg.from_user_id || !msg.item_list) return;
+
+  const allowedIds = (process.env.WECHAT_ALLOWED_IDS || account.userId || '')
+    .split(',')
+    .map((id) => id.trim())
+    .filter(Boolean);
+  if (allowedIds.length === 0 || !allowedIds.includes(msg.from_user_id)) {
+    logger.warn('Ignoring message from unauthorized WeChat user', { fromUserId: msg.from_user_id });
+    return;
+  }
 
   const msgId = `${msg.from_user_id}-${msg.context_token}`;
   if (processingMsgIds.has(msgId)) {
@@ -383,6 +400,42 @@ async function sendToOpenCode(
       permissionMode: effectivePermissionMode,
       images,
       title: sessionTitle,
+      onSession: (newSessionId) => {
+        if (session.sdkSessionId !== newSessionId) {
+          session.sdkSessionId = newSessionId;
+          sessionStore.save(account.accountId, session);
+        }
+      },
+      onPermission: async (request) => {
+        const resources = request.resources.join(', ').slice(0, 800);
+        const text = [
+          '🔧 权限请求',
+          '',
+          `操作: ${request.action}`,
+          `资源: ${resources || '(无)'}`,
+          request.message ? `说明: ${request.message}` : '',
+          '',
+          '回复 y 允许，n 拒绝',
+          '(120秒未回复自动拒绝)',
+        ].filter(Boolean).join('\n');
+
+        session.state = 'waiting_permission';
+        sessionStore.save(account.accountId, session);
+
+        // Register the pending request before sending, so an immediate y/n reply
+        // cannot race ahead of the broker registration.
+        const pending = permissionBroker.createPending(
+          account.accountId,
+          request.action,
+          resources,
+        );
+        await sender.sendText(fromUserId, contextToken, text);
+        const allowed = await pending;
+
+        session.state = 'processing';
+        sessionStore.save(account.accountId, session);
+        return allowed ? 'once' : 'reject';
+      },
     };
 
     let result = await openCodeQuery(queryOptions);

@@ -2,7 +2,7 @@ import type { CommandContext, CommandResult } from './router.js';
 import { readFileSync, existsSync, mkdirSync, readdirSync, statSync } from 'node:fs';
 import { join, resolve, isAbsolute, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { listSessions, createSession } from '../opencode/provider.js';
+import { listSessions, createSession, listModels } from '../opencode/provider.js';
 import { loadConfig } from '../config.js';
 
 const HELP_TEXT = `可用命令：
@@ -107,8 +107,8 @@ export function handleCwd(ctx: CommandContext, args: string): CommandResult {
     };
   }
 
-  ctx.updateSession({ workingDirectory: targetPath });
-  return { reply: `✅ 工作目录已切换为: ${targetPath}`, handled: true };
+  ctx.updateSession({ workingDirectory: targetPath, sdkSessionId: undefined });
+  return { reply: `✅ 工作目录已切换为: ${targetPath}\n下一次消息会在新目录新开会话`, handled: true };
 }
 
 export function handleLs(ctx: CommandContext): CommandResult {
@@ -263,46 +263,31 @@ export function handleUndo(ctx: CommandContext, args: string): CommandResult {
 }
 
 export async function handleModels(ctx: CommandContext): Promise<CommandResult> {
-  const OPENCODE_URL = process.env.OPENCODE_URL || 'http://localhost:4096';
-
   try {
-    const res = await fetch(`${OPENCODE_URL}/config/providers`);
-    if (!res.ok) {
-      throw new Error(`Failed to fetch providers: ${res.status}`);
-    }
-
-    const data = await res.json() as any;
-    const providers = data.providers || [];
-
-    if (providers.length === 0) {
+    const models = await listModels();
+    if (models.length === 0) {
       return { reply: '⚠️ 未找到可用的模型提供商', handled: true };
     }
 
-    const lines: string[] = ['📋 可用模型（使用 /model <ID> 切换）：', ''];
+    const grouped = new Map<string, typeof models>();
+    for (const model of models) {
+      const list = grouped.get(model.providerID) || [];
+      list.push(model);
+      grouped.set(model.providerID, list);
+    }
 
-    for (const provider of providers) {
-      lines.push(`【${provider.name || provider.id}】`);
-      
-      let modelList: any[] = [];
-      if (Array.isArray(provider.models)) {
-        modelList = provider.models;
-      } else if (typeof provider.models === 'object' && provider.models !== null) {
-        modelList = Object.values(provider.models);
-      }
-      
-      for (const model of modelList) {
+    const lines: string[] = ['📋 可用模型（使用 /model <provider/model> 切换）：', ''];
+    for (const [providerID, list] of grouped) {
+      lines.push(`【${providerID}】`);
+      for (const model of list) {
         lines.push(`  - ${model.id}`);
       }
       lines.push('');
     }
 
     const currentModel = ctx.session.model;
-    if (currentModel) {
-      lines.push(`当前模型: ${currentModel}`);
-    } else {
-      lines.push('');
-      lines.push('💡 示例: /model mimo-v2-pro-free');
-    }
+    lines.push(currentModel ? `当前模型: ${currentModel}` : '当前模型: 默认');
+    lines.push('💡 示例: /model oneapi/DeepSeek-V4.1-Flash');
 
     return { reply: lines.join('\n'), handled: true };
   } catch (err) {

@@ -1,387 +1,235 @@
-import type { CommandContext, CommandResult } from './router.js';
-import { readFileSync, existsSync, mkdirSync, readdirSync, statSync } from 'node:fs';
-import { join, resolve, isAbsolute, dirname } from 'node:path';
+import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { listSessions, createSession, listModels } from '../opencode/provider.js';
-import { loadConfig } from '../config.js';
+import { loadConfig, saveConfig, type PermissionMode } from '../config.js';
+import { memoryStats } from '../memory.js';
+import { clip, formatElapsed, formatTime, STATUS_LABEL } from '../orchestrator.js';
+import { formatModelRef, listModels, resolveModelRef } from '../opencode/provider.js';
+import type { PermissionBroker } from '../permission.js';
+import { isPathInside, loadProjects, PROJECTS_PATH } from '../projects.js';
+import type { StateDb, TaskRow } from '../tasks/db.js';
+import type { TaskQueue } from '../tasks/queue.js';
+
+export interface CommandContext {
+  accountId: string;
+  db: StateDb;
+  queue: TaskQueue;
+  broker: PermissionBroker;
+}
+
+type Handler = (args: string, ctx: CommandContext) => string | Promise<string>;
+
+const DEFAULT_TASKS = 5;
+const MAX_TASKS = 20;
+const MAX_LS_ENTRIES = 100;
 
 const HELP_TEXT = `可用命令：
 
-会话管理：
-  /help             显示帮助
-  /clear            清除当前会话
-  /new [标题]       新建会话（清空上下文），可选标题
-  /reset            完全重置（包括工作目录等设置）
-  /status           查看当前会话状态
-  /compact          压缩上下文（开始新 SDK 会话，保留历史）
-  /history [数量]   查看对话记录（默认最近20条）
-  /undo [数量]      撤销最近对话（默认1条）
-  /sessions         查看当前目录的 OpenCode 会话列表
-  /session <序号|ID> 切换到指定会话（序号从1开始）
+任务：
+  /status           查看当前状态
+  /tasks [数量]     查看最近的任务（默认 5 个）
+  /stop             停止正在运行的任务
+  /stop all         同时取消所有排队的任务
 
-工作目录：
-  /cwd [路径]       切换工作目录（支持相对路径、绝对路径）
-  /ls               显示当前目录内容
+工作目录与项目：
+  /cwd [路径]       查看或切换工作目录
+  /ls               显示工作目录内容
+  /projects         查看项目列表
 
-权限：
+模型与权限：
+  /model [模型]     查看或切换模型（/model default 恢复默认）
+  /models           查看可用模型
   /permission [模式] 查看或设置权限模式
 
 其他：
-  /model [模型ID]   查看或切换模型
-  /models           查看可用模型
-  /skills           查看已安装的技能
-  /version          查看版本`;
+  /help             显示帮助
+  /version          查看版本
 
-export function handleHelp(_args: string): CommandResult {
-  return { reply: HELP_TEXT, handled: true };
-}
+直接发送文字或图片即创建任务；任务运行时新消息会排队，按顺序执行。
+以 @别名 开头或提到项目别名，任务就在该项目目录运行；“继续”这类追问沿用上一个任务的项目（2 小时内）。`;
 
-export function handleClear(ctx: CommandContext): CommandResult {
-  ctx.rejectPendingPermission?.();
-  const newSession = ctx.clearSession();
-  Object.assign(ctx.session, newSession);
-  return { reply: '✅ 会话已清除，下次消息将开始新会话。', handled: true };
-}
-
-export async function handleNew(ctx: CommandContext, args: string): Promise<CommandResult> {
-  ctx.rejectPendingPermission?.();
-
-  const cwd = ctx.session.workingDirectory;
-  const title = args.trim() || `Wechat-${Date.now()}`;
-
-  try {
-    const newSessionId = await createSession(title, cwd);
-
-    ctx.updateSession({
-      sdkSessionId: newSessionId,
-      chatHistory: [],
-    });
-
-    return { reply: `🆕 已创建新会话\n标题: ${title}\n会话ID: ${newSessionId}\n目录: ${cwd}`, handled: true };
-  } catch (err) {
-    return { reply: `⚠️ 创建新会话失败: ${String(err)}`, handled: true };
-  }
-}
-
-function isPathInside(parent: string, child: string): boolean {
-  const normalizedParent = parent.replace(/\\/g, '/').replace(/\/$/, '');
-  const normalizedChild = child.replace(/\\/g, '/').replace(/\/$/, '');
-  return normalizedChild.startsWith(normalizedParent + '/') || normalizedChild === normalizedParent;
-}
-
-function normalizePath(p: string): string {
-  return p.replace(/\\/g, '/');
-}
-
-export function handleCwd(ctx: CommandContext, args: string): CommandResult {
-  if (!args) {
-    return { reply: `当前工作目录: ${ctx.session.workingDirectory}\n用法: /cwd <路径>`, handled: true };
-  }
-
-  const config = loadConfig();
-  const baseDir = normalizePath(config.workingDirectory);
-  const currentDir = normalizePath(ctx.session.workingDirectory);
-
-  let targetPath: string;
-  if (isAbsolute(args)) {
-    targetPath = normalizePath(args);
-  } else {
-    targetPath = normalizePath(resolve(currentDir, args));
-  }
-
-  if (!existsSync(targetPath)) {
-    try {
-      mkdirSync(targetPath, { recursive: true });
-    } catch (err) {
-      return { reply: `⚠️ 无法创建目录: ${targetPath}\n错误: ${String(err)}`, handled: true };
-    }
-  }
-
-  const targetNormalized = normalizePath(targetPath);
-  const isInsideBase = isPathInside(baseDir, targetNormalized);
-
-  if (!isInsideBase) {
-    return {
-      reply: `⚠️ 目标目录超出允许范围\n允许范围: ${baseDir}\n目标目录: ${targetPath}`,
-      handled: true
-    };
-  }
-
-  ctx.updateSession({ workingDirectory: targetPath, sdkSessionId: undefined });
-  return { reply: `✅ 工作目录已切换为: ${targetPath}\n下一次消息会在新目录新开会话`, handled: true };
-}
-
-export function handleLs(ctx: CommandContext): CommandResult {
-  const currentDir = ctx.session.workingDirectory;
-
-  try {
-    const items = readdirSync(currentDir);
-
-    if (items.length === 0) {
-      return { reply: `${currentDir}\n(空目录)`, handled: true };
-    }
-
-    const lines: string[] = [];
-    for (const item of items) {
-      const fullPath = join(currentDir, item);
-      const isDir = statSync(fullPath).isDirectory();
-      const icon = isDir ? '📁' : '📄';
-      lines.push(`${icon} ${item}`);
-    }
-
-    return { reply: `${currentDir}\n${lines.join('\n')}`, handled: true };
-  } catch (err) {
-    return { reply: `⚠️ 无法读取目录: ${String(err)}`, handled: true };
-  }
-}
-
-export function handleModel(ctx: CommandContext, args: string): CommandResult {
-  if (!args) {
-    return { reply: '用法: /model <模型ID>\n例: /model mimo-v2-pro-free', handled: true };
-  }
-  ctx.updateSession({ model: args });
-  return { reply: `✅ 模型已切换为: ${args}`, handled: true };
-}
-
-const PERMISSION_MODES = ['default', 'acceptEdits', 'plan', 'auto'] as const;
-const PERMISSION_DESCRIPTIONS: Record<string, string> = {
-  default: '每次工具使用需手动审批',
+const PERMISSION_MODES: Record<PermissionMode, string> = {
+  default: '需要审批的操作发到微信，回复 y/n',
   acceptEdits: '自动批准文件编辑，其他需审批',
-  plan: '只读模式，不允许任何工具',
-  auto: '自动批准所有工具（危险模式）',
+  plan: '拒绝所有需要审批的操作',
+  auto: '自动批准所有需要审批的操作（危险模式）',
 };
 
-export function handlePermission(ctx: CommandContext, args: string): CommandResult {
-  if (!args) {
-    const current = ctx.session.permissionMode ?? 'default';
-    const lines = [
-      '🔒 当前权限模式: ' + current,
-      '',
-      '可用模式:',
-      ...PERMISSION_MODES.map(m => `  ${m} — ${PERMISSION_DESCRIPTIONS[m]}`),
-      '',
-      '用法: /permission <模式>',
-    ];
-    return { reply: lines.join('\n'), handled: true };
-  }
-  const mode = args.trim();
-  if (!PERMISSION_MODES.includes(mode as any)) {
-    return {
-      reply: `未知模式: ${mode}\n可用: ${PERMISSION_MODES.join(', ')}`,
-      handled: true,
-    };
-  }
-  ctx.updateSession({ permissionMode: mode as any });
-  const warning = mode === 'auto' ? '\n\n⚠️ 已开启危险模式：所有工具调用将自动批准，无需手动确认。' : '';
-  return { reply: `✅ 权限模式已切换为: ${mode}\n${PERMISSION_DESCRIPTIONS[mode]}${warning}`, handled: true };
+function workspaceOf(db: StateDb, accountId: string): string {
+  return db.getUser(accountId)?.workspace || loadConfig().workingDirectory;
 }
 
-export function handleStatus(ctx: CommandContext): CommandResult {
-  const s = ctx.session;
-  const mode = s.permissionMode ?? 'default';
+/** The input as the user sent it: the stored text has its "@alias" stripped. */
+const taskInput = (t: TaskRow, max: number): string => `${t.project_id ? `@${t.project_id} ` : ''}${clip(t.input, max)}`;
+
+/** The project of the latest task; a follow-up such as "继续" soon after it stays there. */
+function lastProject(db: StateDb, accountId: string): string {
+  const [last] = db.recentTasks(accountId, 1);
+  return last ? `${last.project_id ?? '工作目录'}（#${last.seq}）` : '无';
+}
+
+/** Shared by /status and --status. */
+export function formatStatus(db: StateDb, accountId: string): string {
+  const config = loadConfig();
+  const user = db.getUser(accountId);
+  const counts = db.statusCounts(accountId);
+  const running = db.runningTask(accountId);
+  const total = Object.values(counts).reduce((sum, n) => sum + n, 0);
   const lines = [
-    '📊 会话状态',
-    '',
-    `工作目录: ${s.workingDirectory}`,
-    `模型: ${s.model ?? '默认'}`,
-    `权限模式: ${mode}`,
-    `会话ID: ${s.sdkSessionId ?? '无'}`,
-    `状态: ${s.state}`,
+    `📂 工作目录: ${user?.workspace || config.workingDirectory}`,
+    `📁 最近项目: ${lastProject(db, accountId)}`,
+    `🤖 模型: ${user?.model || '默认'}`,
+    `🔒 权限模式: ${config.permissionMode ?? 'default'}`,
+    running
+      ? `▶️ 运行中: #${running.seq} ${taskInput(running, 30)}（已运行 ${formatElapsed(running.started_at ?? running.created_at)}）`
+      : '▶️ 运行中: 无',
+    `⏳ 排队: ${counts.queued} 个`,
+    `📊 累计: ${total} 个任务（完成 ${counts.done}，失败 ${counts.failed}，中断 ${counts.interrupted}）`,
+    `🧠 记忆: ${memoryStats(accountId).bullets} 条`,
   ];
-  return { reply: lines.join('\n'), handled: true };
+  const pending = db.pendingNotices(accountId).length;
+  if (pending) lines.push(`📮 待补发通知: ${pending} 条`);
+  return lines.join('\n');
 }
 
-export async function handleSkills(ctx: CommandContext): Promise<CommandResult> {
-  if (!ctx.opencodeClient) {
-    return { reply: '⚠️ OpenCode 服务未连接', handled: true };
-  }
+/** Shared by /tasks and --tasks. Newest first. */
+export function formatTasks(db: StateDb, accountId: string, limit: number): string {
+  const tasks = db.recentTasks(accountId, limit);
+  if (!tasks.length) return '暂无任务';
+  return tasks
+    .map((t) => {
+      const head = `#${t.seq} ${formatTime(t.created_at)} [${STATUS_LABEL[t.status]}] ${taskInput(t, 40)}`;
+      const detail = t.summary || t.error;
+      return detail ? `${head}\n    ${clip(detail, 80)}` : head;
+    })
+    .join('\n');
+}
 
+export function parseTaskLimit(args: string): number {
+  const n = Number.parseInt(args, 10);
+  return n > 0 ? Math.min(n, MAX_TASKS) : DEFAULT_TASKS;
+}
+const version: Handler = () => {
   try {
-    const agents = await ctx.opencodeClient.app.agents();
-    const agentList = agents.data as any[];
-    if (agentList.length === 0) {
-      return { reply: '暂无可用技能', handled: true };
-    }
-    const lines = agentList.map(a => `- ${a.name}: ${a.description || '无描述'}`);
-    return { reply: `📋 可用技能：\n\n${lines.join('\n')}`, handled: true };
-  } catch (err) {
-    return { reply: `⚠️ 获取技能列表失败: ${String(err)}`, handled: true };
-  }
-}
-
-const MAX_HISTORY_LIMIT = 100;
-
-export function handleHistory(ctx: CommandContext, args: string): CommandResult {
-  const limit = args ? parseInt(args, 10) : 20;
-  if (isNaN(limit) || limit <= 0) {
-    return { reply: '用法: /history [数量]\n例: /history 50（显示最近50条对话）', handled: true };
-  }
-  const effectiveLimit = Math.min(limit, MAX_HISTORY_LIMIT);
-
-  const historyText = ctx.getChatHistoryText?.(effectiveLimit) || '暂无对话记录';
-
-  return { reply: `📝 对话记录（最近${effectiveLimit}条）:\n\n${historyText}`, handled: true };
-}
-
-export function handleReset(ctx: CommandContext): CommandResult {
-  ctx.rejectPendingPermission?.();
-  const newSession = ctx.clearSession();
-  newSession.workingDirectory = process.cwd();
-  newSession.model = undefined;
-  newSession.permissionMode = undefined;
-  Object.assign(ctx.session, newSession);
-  return { reply: '✅ 会话已完全重置，所有设置恢复默认。', handled: true };
-}
-
-export function handleCompact(ctx: CommandContext): CommandResult {
-  const currentSessionId = ctx.session.sdkSessionId;
-  if (!currentSessionId) {
-    return { reply: 'ℹ️ 当前没有活动的 SDK 会话，无需压缩。', handled: true };
-  }
-  ctx.updateSession({
-    sdkSessionId: undefined,
-  });
-  return {
-    reply: '✅ 上下文已压缩\n\n下次消息将开始新的 SDK 会话（token 清零）\n聊天历史已保留，可用 /history 查看',
-    handled: true,
-  };
-}
-
-export function handleUndo(ctx: CommandContext, args: string): CommandResult {
-  const count = args ? parseInt(args, 10) : 1;
-  if (isNaN(count) || count <= 0) {
-    return { reply: '用法: /undo [数量]\n例: /undo 2（撤销最近2条对话）', handled: true };
-  }
-  const history = ctx.session.chatHistory || [];
-  if (history.length === 0) {
-    return { reply: '⚠️ 没有对话记录可撤销', handled: true };
-  }
-  const actualCount = Math.min(count, history.length);
-  ctx.session.chatHistory = history.slice(0, -actualCount);
-  ctx.updateSession({ chatHistory: ctx.session.chatHistory });
-  return { reply: `✅ 已撤销最近 ${actualCount} 条对话`, handled: true };
-}
-
-export async function handleModels(ctx: CommandContext): Promise<CommandResult> {
-  try {
-    const models = await listModels();
-    if (models.length === 0) {
-      return { reply: '⚠️ 未找到可用的模型提供商', handled: true };
-    }
-
-    const grouped = new Map<string, typeof models>();
-    for (const model of models) {
-      const list = grouped.get(model.providerID) || [];
-      list.push(model);
-      grouped.set(model.providerID, list);
-    }
-
-    const lines: string[] = ['📋 可用模型（使用 /model <provider/model> 切换）：', ''];
-    for (const [providerID, list] of grouped) {
-      lines.push(`【${providerID}】`);
-      for (const model of list) {
-        lines.push(`  - ${model.id}`);
-      }
-      lines.push('');
-    }
-
-    const currentModel = ctx.session.model;
-    lines.push(currentModel ? `当前模型: ${currentModel}` : '当前模型: 默认');
-    lines.push('💡 示例: /model oneapi/DeepSeek-V4.1-Flash');
-
-    return { reply: lines.join('\n'), handled: true };
-  } catch (err) {
-    return { reply: `⚠️ 获取模型列表失败: ${String(err)}`, handled: true };
-  }
-}
-
-export function handleVersion(): CommandResult {
-  try {
-    const __dirname = fileURLToPath(new URL('.', import.meta.url));
-    const pkg = JSON.parse(readFileSync(join(__dirname, '..', '..', 'package.json'), 'utf-8'));
-    const version = pkg.version || 'unknown';
-    return { reply: `wechat-opencode-bot v${version}`, handled: true };
+    const pkg = join(fileURLToPath(new URL('.', import.meta.url)), '..', '..', 'package.json');
+    return `wechat-opencode-bot v${JSON.parse(readFileSync(pkg, 'utf-8')).version}`;
   } catch {
-    return { reply: 'wechat-opencode-bot (version unknown)', handled: true };
+    return 'wechat-opencode-bot (version unknown)';
   }
-}
+};
 
-export async function handleSessions(ctx: CommandContext): Promise<CommandResult> {
-  const cwd = ctx.session.workingDirectory;
-  
-  try {
-    const sessions = await listSessions(cwd);
-    
-    if (sessions.length === 0) {
-      return { reply: `暂无会话记录\n当前目录: ${cwd}`, handled: true };
+export const handlers: Record<string, Handler> = {
+  help: () => HELP_TEXT,
+
+  status: (_args, { accountId, db }) => formatStatus(db, accountId),
+
+  tasks: (args, { accountId, db }) => formatTasks(db, accountId, parseTaskLimit(args)),
+
+  stop(args, { accountId, db, queue, broker }) {
+    const all = args.toLowerCase() === 'all';
+    const lines: string[] = [];
+    const running = db.runningTask(accountId);
+    // Finish the row first: the runner then sees the task already finished and stays quiet.
+    // This reply is the user's notice, so the outbox skips the task.
+    if (running && db.finishTask(running.id, 'interrupted', { error: '用户停止', notified: true })) {
+      broker.rejectPending(accountId);
+      queue.stop(accountId);
+      lines.push(`⏹ 已停止任务 #${running.seq}`);
     }
-
-    const lines = sessions.map((s, i) => {
-      const created = new Date(s.time.created).toLocaleString('zh-CN');
-      return `${i + 1}. ${s.title}\n   ID: ${s.id}\n   创建时间: ${created}`;
-    });
-
-    return { 
-      reply: `📋 会话列表（目录: ${cwd}）：\n\n${lines.join('\n\n')}\n\n使用 /session <ID> 切换会话`, 
-      handled: true 
-    };
-  } catch (err) {
-    return { reply: `⚠️ 获取会话列表失败: ${String(err)}`, handled: true };
-  }
-}
-
-export async function handleSession(ctx: CommandContext, args: string): Promise<CommandResult> {
-  const currentCwd = ctx.session.workingDirectory;
-
-  if (!args) {
-    return {
-      reply: `当前目录: ${currentCwd}\n当前会话ID: ${ctx.session.sdkSessionId || '无'}\n\n用法: /session <序号|会话ID>`,
-      handled: true
-    };
-  }
-
-  const arg = args.trim();
-
-  if (/^\d+$/.test(arg)) {
-    const index = parseInt(arg, 10);
-    if (index < 1) {
-      return { reply: '⚠️ 序号必须大于 0', handled: true };
+    if (all) {
+      const cancelled = db.cancelQueued(accountId, '用户取消');
+      if (cancelled) lines.push(`🗑 已取消 ${cancelled} 个排队任务`);
     }
+    if (lines.length) return lines.join('\n');
+    return all ? '没有运行中或排队的任务' : '没有运行中的任务';
+  },
 
+  cwd(args, { accountId, db }) {
+    const base = loadConfig().workingDirectory;
+    const current = workspaceOf(db, accountId);
+    if (!args) return `当前工作目录: ${current}\n用法: /cwd <路径>`;
+    const target = resolve(current, args);
+    if (!isPathInside(base, target)) return `⚠️ 目标目录超出允许范围\n允许范围: ${base}\n目标目录: ${target}`;
+    if (!statSync(target, { throwIfNoEntry: false })?.isDirectory()) return `⚠️ 目录不存在: ${target}`;
+    db.setWorkspace(accountId, target);
+    return `✅ 工作目录已切换为: ${target}`;
+  },
+  ls(_args, { accountId, db }) {
+    const dir = workspaceOf(db, accountId);
+    let entries;
     try {
-      const sessions = await listSessions(currentCwd);
-      if (sessions.length === 0) {
-        return { reply: '⚠️ 当前目录暂无会话，请先使用 /new 创建', handled: true };
-      }
-
-      const listIndex = index - 1;
-      if (listIndex >= sessions.length) {
-        return { reply: `⚠️ 序号超出范围，当前目录共有 ${sessions.length} 个会话`, handled: true };
-      }
-
-      const targetSession = sessions[listIndex];
-      ctx.updateSession({ sdkSessionId: targetSession.id });
-
-      return {
-        reply: `✅ 已切换到会话 [${index}] ${targetSession.title}\n会话ID: ${targetSession.id}`,
-        handled: true
-      };
+      entries = readdirSync(dir, { withFileTypes: true });
     } catch (err) {
-      return { reply: `⚠️ 获取会话列表失败: ${String(err)}`, handled: true };
+      return `⚠️ 无法读取目录: ${err instanceof Error ? err.message : String(err)}`;
     }
-  }
+    if (!entries.length) return `${dir}\n(空目录)`;
+    entries.sort((a, b) => Number(b.isDirectory()) - Number(a.isDirectory()) || a.name.localeCompare(b.name));
+    const lines = entries.slice(0, MAX_LS_ENTRIES).map((e) => `${e.isDirectory() ? '📁' : '📄'} ${e.name}`);
+    if (entries.length > MAX_LS_ENTRIES) lines.push(`… 还有 ${entries.length - MAX_LS_ENTRIES} 项`);
+    return `${dir}\n${lines.join('\n')}`;
+  },
 
-  ctx.updateSession({ sdkSessionId: arg });
+  projects(_args, { accountId, db }) {
+    const base = loadConfig().workingDirectory;
+    const projects = loadProjects(base);
+    const lines = projects.length
+      ? ['📁 项目（以 @别名 开头指定项目）：', ...projects.map((p) => `- ${p.id}: ${p.dir}（${p.aliases.join(', ')}）`)]
+      : ['⚠️ 没有可用的项目'];
+    lines.push('', `📌 上个任务: ${lastProject(db, accountId)}`, `📂 基础目录: ${base}`, `📝 配置: ${PROJECTS_PATH}`);
+    return lines.join('\n');
+  },
 
-  return {
-    reply: `✅ 已切换到会话ID: ${arg}`,
-    handled: true
-  };
-}
+  async model(args, { accountId, db }) {
+    if (!args) {
+      const current = db.getUser(accountId)?.model || '默认';
+      return `🤖 当前模型: ${current}\n用法: /model <provider/model>，/model default 恢复默认\n发送 /models 查看可用模型`;
+    }
+    if (/^(default|reset)$/i.test(args)) {
+      db.setModel(accountId, null);
+      return '✅ 已恢复默认模型';
+    }
+    const ref = await resolveModelRef(args);
+    if (!ref) return `⚠️ 未找到模型: ${args}\n发送 /models 查看可用模型`;
+    const model = formatModelRef(ref);
+    db.setModel(accountId, model);
+    return `✅ 模型已切换为: ${model}\n从下一个任务开始生效`;
+  },
 
-export function handleUnknown(cmd: string, args: string): CommandResult {
-  return {
-    handled: true,
-    reply: `技能 ${cmd} 未找到\n使用 /skills 查看可用技能列表`,
-  };
-}
+  async models(_args, { accountId, db }) {
+    let models;
+    try {
+      models = await listModels();
+    } catch (err) {
+      return `⚠️ 获取模型列表失败: ${err instanceof Error ? err.message : String(err)}`;
+    }
+    if (!models.length) return '⚠️ 未找到可用的模型提供商';
+    const byProvider = new Map<string, string[]>();
+    for (const m of models) byProvider.set(m.providerID, [...(byProvider.get(m.providerID) ?? []), m.id]);
+    const lines = ['📋 可用模型（使用 /model <provider/model> 切换）：'];
+    for (const [provider, ids] of byProvider) lines.push('', `【${provider}】`, ...ids.map((id) => `  - ${id}`));
+    lines.push('', `当前模型: ${db.getUser(accountId)?.model || '默认'}`, '💡 示例: /model oneapi/DeepSeek-V4.1-Flash');
+    return lines.join('\n');
+  },
+  permission(args) {
+    const config = loadConfig();
+    const modes = Object.keys(PERMISSION_MODES) as PermissionMode[];
+    if (!args) {
+      return [
+        `🔒 当前权限模式: ${config.permissionMode ?? 'default'}`,
+        '',
+        '可用模式:',
+        ...modes.map((m) => `  ${m} — ${PERMISSION_MODES[m]}`),
+        '',
+        '用法: /permission <模式>',
+      ].join('\n');
+    }
+    const mode = modes.find((m) => m.toLowerCase() === args.toLowerCase());
+    if (!mode) return `未知模式: ${args}\n可用: ${modes.join(', ')}`;
+    saveConfig({ ...config, permissionMode: mode });
+    const warning = mode === 'auto' ? '\n\n⚠️ 已开启危险模式：所有需要审批的操作将自动批准，无需手动确认。' : '';
+    return `✅ 权限模式已切换为: ${mode}\n${PERMISSION_MODES[mode]}${warning}`;
+  },
+
+  version,
+  v: version,
+};

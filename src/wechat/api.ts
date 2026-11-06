@@ -14,6 +14,14 @@ function generateUin(): string {
   return Buffer.from(buf).toString('base64');
 }
 
+/** iLink answered with a non-zero ret/errcode. */
+export class ILinkError extends Error {
+  constructor(readonly code: number, message: string) {
+    super(message);
+    this.name = 'ILinkError';
+  }
+}
+
 export class WeChatApi {
   private readonly token: string;
   private readonly baseUrl: string;
@@ -95,9 +103,16 @@ export class WeChatApi {
     );
   }
 
-  /** Send a message to a user. */
+  /** Send a message to a user. iLink reports rejections (e.g. an expired context_token) in the body. */
   async sendMessage(req: SendMessageReq): Promise<void> {
-    await this.request('ilink/bot/sendmessage', req);
+    const resp = await this.request<{ ret?: number; errcode?: number; retmsg?: string; errmsg?: string }>(
+      'ilink/bot/sendmessage',
+      req,
+    );
+    const code = resp?.ret ?? resp?.errcode;
+    if (code !== undefined && code !== 0) {
+      throw new ILinkError(code, `sendmessage failed: ret=${code} ${resp.retmsg ?? resp.errmsg ?? ''}`.trim());
+    }
   }
 
   /** Get a presigned upload URL for media files. */

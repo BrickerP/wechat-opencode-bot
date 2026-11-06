@@ -1,46 +1,36 @@
+// Must stay first: provider.ts reads OPENCODE_SERVER_PASSWORD when it loads.
+import './env.js';
 import { createInterface } from 'node:readline';
-import process from 'node:process';
-import { join, dirname } from 'node:path';
-import { mkdirSync, existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
-import { execSync, spawn } from 'node:child_process';
+import { dirname, join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { execSync } from 'node:child_process';
 
-import { loadLatestAccount } from './wechat/accounts.js';
-import { startQrLogin, waitForQrScan, displayQrInTerminal } from './wechat/login.js';
-import { createMonitor, type MonitorCallbacks } from './wechat/monitor.js';
-import { createSender } from './wechat/send.js';
-import { extractText, extractFirstImageUrl } from './wechat/media.js';
-import { createSessionStore, type Session } from './session.js';
-import { createPermissionBroker } from './permission.js';
-import { routeCommand, type CommandContext, type CommandResult } from './commands/router.js';
-import { openCodeQuery, initOpenCode, getOpenCodeClient, type QueryOptions } from './opencode/provider.js';
+import { formatStatus, formatTasks, parseTaskLimit, type CommandContext } from './commands/handlers.js';
+import { isCommand, routeCommand } from './commands/router.js';
 import { loadConfig, saveConfig } from './config.js';
-import { logger } from './logger.js';
 import { DATA_DIR } from './constants.js';
-import { MessageType, type WeixinMessage } from './wechat/types.js';
+import { logger } from './logger.js';
+import { createNotifier, runNotify } from './notify.js';
+import { IMAGE_ONLY_INPUT, runTask, saveAttachment } from './orchestrator.js';
+import { initOpenCode, interruptSession } from './opencode/provider.js';
+import { createPermissionBroker } from './permission.js';
+import { routeMessage } from './projects.js';
+import { runSimulate, SIMULATE_ACCOUNT } from './simulate.js';
+import { openStateDb } from './tasks/db.js';
+import { createTaskQueue } from './tasks/queue.js';
+import { loadLatestAccount } from './wechat/accounts.js';
 import { WeChatApi } from './wechat/api.js';
-import { downloadImage } from './wechat/media.js';
-import type { AccountData } from './wechat/accounts.js';
+import { displayQrInTerminal, startQrLogin, waitForQrScan } from './wechat/login.js';
+import { downloadImage, extractFirstImageUrl, extractText } from './wechat/media.js';
+import { createMonitor } from './wechat/monitor.js';
+import { createSender } from './wechat/send.js';
+import { MessageType, type WeixinMessage } from './wechat/types.js';
 
-const MAX_MESSAGE_LENGTH = 2048;
-
-function splitMessage(text: string, maxLen: number = MAX_MESSAGE_LENGTH): string[] {
-  if (text.length <= maxLen) return [text];
-  const chunks: string[] = [];
-  let remaining = text;
-  while (remaining.length > 0) {
-    if (remaining.length <= maxLen) {
-      chunks.push(remaining);
-      break;
-    }
-    let splitIdx = remaining.lastIndexOf('\n', maxLen);
-    if (splitIdx < maxLen * 0.3) {
-      splitIdx = maxLen;
-    }
-    chunks.push(remaining.slice(0, splitIdx));
-    remaining = remaining.slice(splitIdx).replace(/^\n+/, '');
-  }
-  return chunks;
-}
+/** Replies that answer a pending permission request. */
+const ANSWERS = new Map<string, boolean>([
+  ['y', true], ['yes', true], ['ok', true], ['是', true], ['允许', true], ['同意', true],
+  ['n', false], ['no', false], ['否', false], ['拒绝', false],
+]);
 
 function promptUser(question: string, defaultValue?: string): Promise<string> {
   return new Promise((resolve) => {
@@ -87,8 +77,6 @@ async function runSetup(): Promise<void> {
   console.log('\n运行 npm run daemon 启动服务');
 }
 
-const processingMsgIds = new Set<string>();
-
 async function runDaemon(): Promise<void> {
   const config = loadConfig();
   const account = loadLatestAccount();
@@ -107,395 +95,132 @@ async function runDaemon(): Promise<void> {
     process.exit(1);
   }
 
+  const { accountId } = account;
+  const allowedIds = (process.env.WECHAT_ALLOWED_IDS || account.userId || '')
+    .split(',')
+    .map((id) => id.trim())
+    .filter(Boolean);
+  const db = openStateDb();
   const api = new WeChatApi(account.botToken, account.baseUrl);
-  const sessionStore = createSessionStore();
-  const session: Session = sessionStore.load(account.accountId);
+  const notifier = createNotifier(db, api, createSender(api, accountId));
+  const broker = createPermissionBroker(() => void notifier.reply(accountId, '⏰ 权限请求超时，已自动拒绝。'));
+  const queue = createTaskQueue(
+    db,
+    (task, signal) => runTask(db, task, notifier.taskIO(task.account_id, broker), signal),
+    (id) => void notifier.flush(id),
+  );
+  const ctx: CommandContext = { accountId, db, queue, broker };
 
-  // No query can survive a daemon restart: clear stale transient states so the
-  // next WeChat message is accepted instead of being rejected as "still running".
-  if (session.state !== 'idle') {
-    logger.warn('Resetting stale session state on startup', { state: session.state });
-    session.state = 'idle';
-    sessionStore.save(account.accountId, session);
+  // No task survives a restart: stop its session. Queued tasks still run unless they waited too long.
+  for (const task of db.interruptRunningTasks('bot 重启')) {
+    if (task.session_id) await interruptSession(task.session_id);
   }
+  for (const task of db.expireStaleQueued(accountId)) logger.warn('Queued task expired', { taskId: task.id, seq: task.seq });
+  // The outbox reports what the user has not seen: the tasks above, results finished right before
+  // a crash, and notices whose send failed.
+  void notifier.flush(accountId);
+  const stopQueue = queue.start(accountId);
 
-  if (config.workingDirectory && session.workingDirectory === process.cwd()) {
-    session.workingDirectory = config.workingDirectory;
-    sessionStore.save(account.accountId, session);
-  }
-
-  const sender = createSender(api, account.accountId);
-  const sharedCtx = { lastContextToken: '' };
-  const permissionBroker = createPermissionBroker(async () => {
-    try {
-      await sender.sendText(account.userId ?? '', sharedCtx.lastContextToken, '⏰ 权限请求超时，已自动拒绝。');
-    } catch {
-      logger.warn('Failed to send permission timeout message');
+  async function handleMessage(msg: WeixinMessage): Promise<void> {
+    if (msg.message_type !== MessageType.USER || !msg.from_user_id || !msg.item_list) return;
+    if (!allowedIds.includes(msg.from_user_id)) {
+      logger.warn('Ignoring message from unauthorized WeChat user');
+      return;
     }
-  });
+    // Results and notices can only go out on the latest token, so every inbound message refreshes it.
+    if (msg.context_token) db.saveContextToken(accountId, msg.from_user_id, msg.context_token);
+    else db.ensureUser(accountId, msg.from_user_id);
+    await notifier.flush(accountId);
 
-  const callbacks: MonitorCallbacks = {
-    onMessage: async (msg: WeixinMessage) => {
-      await handleMessage(msg, account, session, sessionStore, permissionBroker, sender, config, sharedCtx, api);
+    const text = msg.item_list.map(extractText).filter(Boolean).join('\n').trim();
+    const imageItem = extractFirstImageUrl(msg.item_list);
+
+    const answer = imageItem ? undefined : ANSWERS.get(text.toLowerCase());
+    if (answer !== undefined) {
+      if (broker.resolvePermission(accountId, answer)) {
+        await notifier.reply(accountId, answer ? '✅ 已允许' : '❌ 已拒绝');
+        return;
+      }
+      if (broker.isTimedOut(accountId)) {
+        broker.clearTimedOut(accountId);
+        await notifier.reply(accountId, '⏰ 权限请求已超时并自动拒绝。');
+        return;
+      }
+    }
+
+    if (isCommand(text)) {
+      await notifier.reply(accountId, await routeCommand(text, ctx));
+      return;
+    }
+    if (!text && !imageItem) {
+      await notifier.reply(accountId, '暂不支持此类型消息，请发送文字或图片');
+      return;
+    }
+    // Download before the task exists: the runner must never pick up a task whose image is still missing.
+    const image = imageItem
+      ? await downloadImage(imageItem).catch((err) => {
+          logger.warn('Image download failed', { error: String(err) });
+          return null;
+        })
+      : null;
+    if (imageItem && !image) {
+      await notifier.reply(accountId, '⚠️ 图片下载失败，请重新发送');
+      return;
+    }
+    const { input: body, project } = routeMessage(db, accountId, text);
+    const input = image ? (body ? `${IMAGE_ONLY_INPUT} ${body}` : IMAGE_ONLY_INPUT) : body;
+    const messageId = msg.message_id ? String(msg.message_id) : null;
+    const { task, created } = db.createTask(accountId, input, messageId, project);
+    if (!created) {
+      logger.debug('Duplicate message ignored', { messageId, taskId: task.id, seq: task.seq });
+      return;
+    }
+    if (image) saveAttachment(task.id, image);
+    const ahead = db.countAhead(accountId, task.id);
+    logger.info('Task queued', {
+      taskId: task.id,
+      seq: task.seq,
+      project: task.project_id,
+      inputLength: input.length,
+      image: Boolean(image),
+      ahead,
+    });
+    queue.kick(accountId);
+    // A task that starts right away is acknowledged by the typing indicator.
+    if (ahead > 0) await notifier.reply(accountId, `⏳ 已排队：任务 #${task.seq}（前面还有 ${ahead} 个任务）`);
+  }
+
+  // The monitor does not await onMessage; chaining keeps inbound messages in arrival order.
+  // Tasks run in the queue, so a y/n answer is handled while a task waits for it.
+  let inbound: Promise<void> = Promise.resolve();
+  const monitor = createMonitor(api, {
+    onMessage: (msg) => {
+      inbound = inbound
+        .then(() => handleMessage(msg))
+        .catch((err) => logger.error('Error processing message', { error: err instanceof Error ? err.message : String(err) }));
+      return inbound;
     },
     onSessionExpired: () => {
       logger.warn('Session expired, will keep retrying...');
       console.error('⚠️ 微信会话已过期，请重新运行 setup 扫码绑定');
     },
-  };
-
-  const monitor = createMonitor(api, callbacks);
+  });
 
   function shutdown(): void {
     logger.info('Shutting down...');
     monitor.stop();
+    stopQueue();
     process.exit(0);
   }
 
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 
-  logger.info('Daemon started', { accountId: account.accountId });
-  console.log(`已启动 (账号: ${account.accountId})`);
+  logger.info('Daemon started', { accountId });
+  console.log(`已启动 (账号: ${accountId})`);
 
   await monitor.run();
 }
-
-async function handleMessage(
-  msg: WeixinMessage,
-  account: AccountData,
-  session: Session,
-  sessionStore: ReturnType<typeof createSessionStore>,
-  permissionBroker: ReturnType<typeof createPermissionBroker>,
-  sender: ReturnType<typeof createSender>,
-  config: ReturnType<typeof loadConfig>,
-  sharedCtx: { lastContextToken: string },
-  api: WeChatApi,
-): Promise<void> {
-  if (msg.message_type !== MessageType.USER) return;
-  if (!msg.from_user_id || !msg.item_list) return;
-
-  const allowedIds = (process.env.WECHAT_ALLOWED_IDS || account.userId || '')
-    .split(',')
-    .map((id) => id.trim())
-    .filter(Boolean);
-  if (allowedIds.length === 0 || !allowedIds.includes(msg.from_user_id)) {
-    logger.warn('Ignoring message from unauthorized WeChat user', { fromUserId: msg.from_user_id });
-    return;
-  }
-
-  const msgId = `${msg.from_user_id}-${msg.context_token}`;
-  if (processingMsgIds.has(msgId)) {
-    logger.warn('Message already being processed, skipping', { msgId });
-    return;
-  }
-  processingMsgIds.add(msgId);
-  setTimeout(() => processingMsgIds.delete(msgId), 60000);
-
-  const contextToken = msg.context_token ?? '';
-  const fromUserId = msg.from_user_id;
-  sharedCtx.lastContextToken = contextToken;
-
-  const userText = extractTextFromItems(msg.item_list);
-  const imageItem = extractFirstImageUrl(msg.item_list);
-
-  if (session.state === 'processing') {
-    if (userText.startsWith('/clear')) {
-      await sender.sendText(fromUserId, contextToken, '⏳ 正在处理上一条消息，请稍后再清除会话');
-    } else if (!userText.startsWith('/')) {
-      await sender.sendText(fromUserId, contextToken, '⏳ 正在处理上一条消息，请稍后...');
-    }
-    if (!userText.startsWith('/status') && !userText.startsWith('/help')) return;
-  }
-
-  if (session.state === 'idle' && permissionBroker.isTimedOut(account.accountId)) {
-    const lower = userText.toLowerCase();
-    if (lower === 'y' || lower === 'yes' || lower === 'n' || lower === 'no') {
-      permissionBroker.clearTimedOut(account.accountId);
-      await sender.sendText(fromUserId, contextToken, '⏰ 权限请求已超时，请重新发送你的请求。');
-      return;
-    }
-  }
-
-  if (session.state === 'waiting_permission') {
-    const pendingPerm = permissionBroker.getPending(account.accountId);
-    if (!pendingPerm) {
-      session.state = 'idle';
-      sessionStore.save(account.accountId, session);
-      await sender.sendText(fromUserId, contextToken, '⚠️ 权限请求已失效（可能因服务重启），请重新发送你的请求。');
-      return;
-    }
-
-    const lower = userText.toLowerCase();
-    if (lower === 'y' || lower === 'yes') {
-      const resolved = permissionBroker.resolvePermission(account.accountId, true);
-      await sender.sendText(fromUserId, contextToken, resolved ? '✅ 已允许' : '⚠️ 权限请求处理失败，可能已超时');
-    } else if (lower === 'n' || lower === 'no') {
-      const resolved = permissionBroker.resolvePermission(account.accountId, false);
-      await sender.sendText(fromUserId, contextToken, resolved ? '❌ 已拒绝' : '⚠️ 权限请求处理失败，可能已超时');
-    } else {
-      await sender.sendText(fromUserId, contextToken, '正在等待权限审批，请回复 y 或 n。');
-    }
-    return;
-  }
-
-  if (userText.startsWith('/')) {
-    const updateSession = (partial: Partial<Session>) => {
-      Object.assign(session, partial);
-      sessionStore.save(account.accountId, session);
-    };
-
-    const ctx: CommandContext = {
-      accountId: account.accountId,
-      session,
-      updateSession,
-      clearSession: () => sessionStore.clear(account.accountId),
-      getChatHistoryText: (limit?: number) => sessionStore.getChatHistoryText(session, limit),
-      rejectPendingPermission: () => permissionBroker.rejectPending(account.accountId),
-      text: userText,
-      opencodeClient: getOpenCodeClient(),
-    };
-
-    const result: CommandResult = await routeCommand(ctx);
-
-    if (result.handled && result.reply) {
-      await sender.sendText(fromUserId, contextToken, result.reply);
-      return;
-    }
-
-    if (result.handled && result.claudePrompt) {
-      await sendToOpenCode(
-        result.claudePrompt,
-        imageItem,
-        fromUserId,
-        contextToken,
-        account,
-        session,
-        sessionStore,
-        permissionBroker,
-        sender,
-        config,
-        api,
-      );
-      return;
-    }
-
-    if (result.handled) {
-      return;
-    }
-  }
-
-  if (!userText && !imageItem) {
-    await sender.sendText(fromUserId, contextToken, '暂不支持此类型消息，请发送文字或图片');
-    return;
-  }
-
-  await sendToOpenCode(
-    userText,
-    imageItem,
-    fromUserId,
-    contextToken,
-    account,
-    session,
-    sessionStore,
-    permissionBroker,
-    sender,
-    config,
-    api,
-  );
-}
-
-function extractTextFromItems(items: NonNullable<WeixinMessage['item_list']>): string {
-  return items.map((item) => extractText(item)).filter(Boolean).join('\n');
-}
-
-async function sendToOpenCode(
-  userText: string,
-  imageItem: ReturnType<typeof extractFirstImageUrl>,
-  fromUserId: string,
-  contextToken: string,
-  account: AccountData,
-  session: Session,
-  sessionStore: ReturnType<typeof createSessionStore>,
-  permissionBroker: ReturnType<typeof createPermissionBroker>,
-  sender: ReturnType<typeof createSender>,
-  config: ReturnType<typeof loadConfig>,
-  api: WeChatApi,
-): Promise<void> {
-  session.state = 'processing';
-  sessionStore.save(account.accountId, session);
-
-  sessionStore.addChatMessage(session, 'user', userText || '(图片)');
-
-  let typingClientId: string | null = null;
-  let typingTicket = '';
-  
-  try {
-    const configResp = await api.getConfig(fromUserId, contextToken);
-    typingTicket = configResp.typing_ticket || '';
-  } catch (err) {
-    logger.warn('Failed to get typing ticket', { error: err });
-  }
-  
-  if (typingTicket) {
-    try {
-      typingClientId = await sender.sendTyping(fromUserId, typingTicket);
-    } catch (err) {
-      logger.warn('Failed to send typing indicator', { error: err });
-    }
-  }
-
-  let typingKeepalive: ReturnType<typeof setInterval> | null = null;
-  if (typingTicket) {
-    typingKeepalive = setInterval(async () => {
-      if (typingClientId) {
-        try {
-          await sender.sendTyping(fromUserId, typingTicket);
-          logger.debug('Typing keepalive sent');
-        } catch (err) {
-          logger.warn('Failed to send typing keepalive', { error: err });
-        }
-      }
-    }, 5000);
-  }
-
-  try {
-    const cwd = session.workingDirectory || config.workingDirectory;
-    let sessionId = session.sdkSessionId;
-
-    let sessionTitle: string | undefined;
-    if (!sessionId) {
-      const userMessage = userText || '(图片)';
-      const summary = userMessage.substring(0, 20) + (userMessage.length > 20 ? '...' : '');
-      sessionTitle = `微信: ${summary}`;
-    }
-
-    let images: QueryOptions['images'];
-    if (imageItem) {
-      const base64DataUri = await downloadImage(imageItem);
-      if (base64DataUri) {
-        const matches = base64DataUri.match(/^data:([^;]+);base64,(.+)$/);
-        if (matches) {
-          images = [
-            {
-              type: 'image',
-              source: {
-                type: 'base64',
-                media_type: matches[1],
-                data: matches[2],
-              },
-            },
-          ];
-        }
-      }
-    }
-
-    const effectivePermissionMode = session.permissionMode ?? config.permissionMode;
-
-    const queryOptions: QueryOptions = {
-      prompt: userText || '请分析这张图片',
-      cwd,
-      resume: sessionId,
-      model: session.model,
-      permissionMode: effectivePermissionMode,
-      images,
-      title: sessionTitle,
-      onSession: (newSessionId) => {
-        if (session.sdkSessionId !== newSessionId) {
-          session.sdkSessionId = newSessionId;
-          sessionStore.save(account.accountId, session);
-        }
-      },
-      onPermission: async (request) => {
-        const resources = request.resources.join(', ').slice(0, 800);
-        const text = [
-          '🔧 权限请求',
-          '',
-          `操作: ${request.action}`,
-          `资源: ${resources || '(无)'}`,
-          request.message ? `说明: ${request.message}` : '',
-          '',
-          '回复 y 允许，n 拒绝',
-          '(120秒未回复自动拒绝)',
-        ].filter(Boolean).join('\n');
-
-        session.state = 'waiting_permission';
-        sessionStore.save(account.accountId, session);
-
-        // Register the pending request before sending, so an immediate y/n reply
-        // cannot race ahead of the broker registration.
-        const pending = permissionBroker.createPending(
-          account.accountId,
-          request.action,
-          resources,
-        );
-        await sender.sendText(fromUserId, contextToken, text);
-        const allowed = await pending;
-
-        session.state = 'processing';
-        sessionStore.save(account.accountId, session);
-        return allowed ? 'once' : 'reject';
-      },
-    };
-
-    let result = await openCodeQuery(queryOptions);
-
-    if (typingClientId && typingTicket) {
-      try {
-        await sender.stopTyping(fromUserId, typingTicket, typingClientId);
-      } catch (err) {
-        logger.warn('Failed to stop typing indicator', { error: err });
-      }
-      typingClientId = null;
-    }
-    
-    if (typingKeepalive) {
-      clearInterval(typingKeepalive);
-      typingKeepalive = null;
-    }
-
-    if (result.error) {
-      logger.error('OpenCode query error', { error: result.error });
-      await sender.sendText(fromUserId, contextToken, '⚠️ OpenCode 处理请求时出错，请稍后重试。');
-    } else if (result.text) {
-      sessionStore.addChatMessage(session, 'assistant', result.text);
-
-      const chunks = splitMessage(result.text);
-      for (const chunk of chunks) {
-        await sender.sendText(fromUserId, contextToken, chunk);
-      }
-    } else {
-      await sender.sendText(fromUserId, contextToken, 'ℹ️ OpenCode 无返回内容');
-    }
-
-    if (result.sessionId) {
-      session.sdkSessionId = result.sessionId;
-    }
-
-    session.state = 'idle';
-    sessionStore.save(account.accountId, session);
-  } catch (err) {
-    if (typingClientId && typingTicket) {
-      try {
-        await sender.stopTyping(fromUserId, typingTicket, typingClientId);
-      } catch {}
-      typingClientId = null;
-    }
-    
-    if (typingKeepalive) {
-      clearInterval(typingKeepalive);
-      typingKeepalive = null;
-    }
-    
-    const errorMsg = err instanceof Error ? err.message : String(err);
-    logger.error('Error in sendToOpenCode', { error: errorMsg });
-    await sender.sendText(fromUserId, contextToken, '⚠️ 处理消息时出错，请稍后重试。');
-
-    session.state = 'idle';
-    sessionStore.save(account.accountId, session);
-  }
-}
-
 const command = process.argv[2];
 
 function showHelp(): void {
@@ -509,10 +234,13 @@ wechat-opencode-bot - 微信接入 OpenCode
   npm run daemon:status  查看状态
 
 或直接:
-  node dist/main.js --setup   扫码绑定微信
-  node dist/main.js --start   启动服务
-  node dist/main.js --stop    停止服务
-  node dist/main.js --status  查看状态
+  node dist/main.js --setup              扫码绑定微信
+  node dist/main.js --start              启动服务
+  node dist/main.js --stop               停止服务
+  node dist/main.js --status             查看状态
+  node dist/main.js --tasks [数量]       查看最近的任务
+  node dist/main.js --simulate "<内容>"  在本进程模拟一条微信消息（回复打印到终端）
+  node dist/main.js --notify "<内容>"    主动给微信发一条消息
 `);
 }
 
@@ -525,20 +253,14 @@ function getDaemonStatus(): { running: boolean; pid?: number } {
   if (!existsSync(pidFile)) {
     return { running: false };
   }
-  
+
   try {
-    const pidStr = readFileSync(pidFile, 'utf-8').trim();
-    const pid = parseInt(pidStr, 10);
+    const pid = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10);
     if (isNaN(pid)) {
       return { running: false };
     }
-    
-    try {
-      process.kill(pid, 0);
-      return { running: true, pid };
-    } catch {
-      return { running: false };
-    }
+    process.kill(pid, 0);
+    return { running: true, pid };
   } catch {
     return { running: false };
   }
@@ -548,8 +270,7 @@ function findProcessOnPort(port: number): number | null {
   try {
     if (process.platform === 'win32') {
       const output = execSync(`netstat -ano | findstr :${port}`, { encoding: 'utf-8' });
-      const lines = output.split('\n');
-      for (const line of lines) {
+      for (const line of output.split('\n')) {
         if (line.includes(`:${port}`) && line.includes('LISTENING')) {
           const parts = line.trim().split(/\s+/);
           const pid = parseInt(parts[parts.length - 1], 10);
@@ -565,10 +286,11 @@ function findProcessOnPort(port: number): number | null {
   return null;
 }
 
+const OPENCODE_PORT = 4096;
+
 function stopOpenCodeService(): void {
-  const OPENCODE_PORT = 4096;
   const pid = findProcessOnPort(OPENCODE_PORT);
-  
+
   if (pid) {
     try {
       process.kill(pid, 'SIGTERM');
@@ -584,21 +306,21 @@ function stopOpenCodeService(): void {
 function runStop(): void {
   // 先停止 OpenCode 服务（无论 bot 是否运行）
   stopOpenCodeService();
-  
+
   const status = getDaemonStatus();
-  
+
   if (!status.running) {
     console.log('wechat-opencode-bot 未在后台运行');
     return;
   }
-  
+
   try {
     process.kill(status.pid!, 'SIGTERM');
     console.log(`已停止 wechat-opencode-bot (PID: ${status.pid})`);
   } catch (err) {
     console.error(`停止 wechat-opencode-bot 失败: ${err}`);
   }
-  
+
   const pidFile = getPidFile();
   if (existsSync(pidFile)) {
     try {
@@ -607,22 +329,45 @@ function runStop(): void {
   }
 }
 
+/** --status and --tasks report on the bot account; before setup, on the --simulate account. */
+const cliAccountId = (): string => loadLatestAccount()?.accountId ?? SIMULATE_ACCOUNT;
+
 function runStatus(): void {
   const status = getDaemonStatus();
-  
+
   if (status.running) {
     console.log(`wechat-opencode-bot 运行中 (PID: ${status.pid})`);
   } else {
     console.log('wechat-opencode-bot 未运行');
   }
-  
-  const OPENCODE_PORT = 4096;
+
   const opencodePid = findProcessOnPort(OPENCODE_PORT);
   if (opencodePid) {
     console.log(`OpenCode 服务运行中 (端口: ${OPENCODE_PORT}, PID: ${opencodePid})`);
   } else {
     console.log(`OpenCode 服务未运行 (端口: ${OPENCODE_PORT})`);
   }
+
+  console.log(`\n${formatStatus(openStateDb(), cliAccountId())}`);
+}
+
+/** --simulate and --notify report their outcome through the exit code. */
+function runWithExitCode(run: (text: string) => Promise<number>): void {
+  const text = process.argv.slice(3).join(' ').trim();
+  if (!text) {
+    console.error(`用法: node dist/main.js ${command} "<内容>"`);
+    process.exit(1);
+  }
+  run(text).then(
+    (code) => {
+      process.exitCode = code;
+    },
+    (err) => {
+      logger.error('Command failed', { command, error: err instanceof Error ? err.message : String(err) });
+      console.error('运行失败:', err);
+      process.exitCode = 1;
+    },
+  );
 }
 
 if (command === '--setup' || command === 'setup') {
@@ -675,19 +420,19 @@ if (command === '--setup' || command === 'setup') {
   }
 } else if (command === '--daemon') {
   const pidFile = getPidFile();
-  
+
   const config = loadConfig();
   console.log(`工作目录: ${config.workingDirectory}`);
   console.log(`进程目录: ${process.cwd()}`);
   console.log(`PID: ${process.pid}`);
-  
+
   try {
     writeFileSync(pidFile, String(process.pid), 'utf-8');
     console.log(`wechat-opencode-bot 已启动 (PID: ${process.pid})`);
   } catch (err) {
     console.error('保存 PID 失败:', err);
   }
-  
+
   runDaemon().catch((err) => {
     logger.error('Daemon failed', { error: err instanceof Error ? err.message : String(err) });
     console.error('运行失败:', err);
@@ -700,6 +445,12 @@ if (command === '--setup' || command === 'setup') {
   runStop();
 } else if (command === '--status' || command === 'status') {
   runStatus();
+} else if (command === '--tasks' || command === 'tasks') {
+  console.log(formatTasks(openStateDb(), cliAccountId(), parseTaskLimit(process.argv[3] ?? '')));
+} else if (command === '--simulate') {
+  runWithExitCode(runSimulate);
+} else if (command === '--notify') {
+  runWithExitCode(runNotify);
 } else if (command === '--help' || command === '-h') {
   showHelp();
 } else {

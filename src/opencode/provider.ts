@@ -1,26 +1,29 @@
 import { logger } from "../logger.js";
 import { execSync, spawn } from "node:child_process";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { basename } from "node:path";
+import { pathToFileURL } from "node:url";
 
 export interface QueryOptions {
   prompt: string;
   cwd: string;
-  resume?: string;
+  /** OpenCode agent that owns the new session. */
+  agent?: string;
+  /** "provider/model" or "provider/model#variant"; omitted means the agent's own model. */
   model?: string;
-  permissionMode?: "default" | "acceptEdits" | "plan" | "auto";
-  images?: Array<{
-    type: "image";
-    source: { type: "base64"; media_type: string; data: string };
-  }>;
   title?: string;
+  /** Local files (images) attached to the prompt. */
+  files?: string[];
+  /** Aborting interrupts the session; the result then has interrupted=true. */
+  signal?: AbortSignal;
   onPermission?: (request: PermissionRequest) => Promise<PermissionDecision>;
+  /** Called once the session exists, before the prompt is sent. */
   onSession?: (sessionId: string) => void;
 }
 
 export interface PermissionRequest {
   id: string;
+  /** The session that asked: the orchestrator or one of its subagent sessions. */
+  sessionId: string;
   action: string;
   resources: string[];
   message?: string;
@@ -32,6 +35,9 @@ export interface QueryResult {
   text: string;
   sessionId: string;
   error?: string;
+  interrupted?: boolean;
+  /** The upstream model failed or went silent; another attempt may succeed. */
+  upstream?: boolean;
 }
 
 export interface ProviderModel {
@@ -39,15 +45,43 @@ export interface ProviderModel {
   modelID: string;
   providerID: string;
   name: string;
+  variants: string[];
 }
 
 const OPENCODE_URL = (process.env.OPENCODE_URL || "http://127.0.0.1:4096").replace(/\/+$/, "");
 const OPENCODE_PORT = Number(process.env.OPENCODE_PORT || 4096);
 const OPENCODE_PASSWORD = process.env.OPENCODE_SERVER_PASSWORD || "";
-const OPENCODE_AGENT = process.env.OPENCODE_AGENT || "";
 
 const TURN_TIMEOUT_MS = 30 * 60 * 1000;
+/** The model must show its first output (any content part) this soon after the prompt is admitted. */
+const FIRST_RESPONSE_TIMEOUT_MS = Number(process.env.OPENCODE_FIRST_RESPONSE_TIMEOUT_MS) || 120_000;
+/** Once it has answered, something in the session tree must change at least this often. */
+const STALL_TIMEOUT_MS = Number(process.env.OPENCODE_STALL_TIMEOUT_MS) || 180_000;
 const POLL_INTERVAL_MS = 1500;
+
+/** The turn was stopped (abort signal, /stop, or an interrupted idle outcome). */
+export class TurnInterrupted extends Error {
+  constructor(message = "任务已停止") {
+    super(message);
+    this.name = "TurnInterrupted";
+  }
+}
+
+/** The upstream model failed or stopped making progress; another attempt may succeed. */
+export class UpstreamError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UpstreamError";
+  }
+}
+
+/** A watchdog gave up on a silent upstream model. */
+export class TurnTimeout extends UpstreamError {
+  constructor(message: string) {
+    super(message);
+    this.name = "TurnTimeout";
+  }
+}
 
 function authHeaders(): Record<string, string> {
   if (!OPENCODE_PASSWORD) return {};
@@ -87,12 +121,7 @@ function checkOpenCodeInstalled(): boolean {
 
 async function waitForService(maxAttempts: number = 120): Promise<boolean> {
   for (let i = 0; i < maxAttempts; i++) {
-    try {
-      await api("/api/info");
-      return true;
-    } catch {
-      // not ready yet
-    }
+    if (await pingOpenCode()) return true;
     await sleep(1000);
   }
   return false;
@@ -119,28 +148,31 @@ function startOpenCodeService(cwd?: string): void {
   }
 }
 
-export async function initOpenCode(cwd?: string): Promise<void> {
+export async function pingOpenCode(): Promise<boolean> {
   try {
     await api("/api/info");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function initOpenCode(cwd?: string): Promise<void> {
+  if (await pingOpenCode()) {
     logger.info("OpenCode client connected", { url: OPENCODE_URL });
     return;
-  } catch {
-    logger.warn("Failed to connect to OpenCode, checking installation");
   }
+  logger.warn("Failed to connect to OpenCode, checking installation");
 
   if (!checkOpenCodeInstalled()) {
-    throw new Error(
-      `OpenCode 未安装。请先安装：\n` +
-        `npm install -g opencode-ai`,
-    );
+    throw new Error(`OpenCode 未安装。请先安装：\nnpm install -g opencode-ai`);
   }
 
   console.log("OpenCode 已安装，但服务未启动");
   startOpenCodeService(cwd);
 
   console.log("等待 OpenCode 服务启动...");
-  const started = await waitForService();
-  if (!started) {
+  if (!(await waitForService())) {
     throw new Error(
       `OpenCode 服务启动失败或超时。\n` +
         `请手动启动: OPENCODE_SERVER_PASSWORD=... opencode serve --hostname 127.0.0.1 --port ${OPENCODE_PORT}`,
@@ -151,7 +183,7 @@ export async function initOpenCode(cwd?: string): Promise<void> {
   logger.info("OpenCode service started successfully");
 }
 
-function parseModelRef(model: string): { providerID: string; id: string; variant?: string } | undefined {
+export function parseModelRef(model: string): { providerID: string; id: string; variant?: string } | undefined {
   const value = model.trim();
   if (!value) return undefined;
 
@@ -178,86 +210,73 @@ export async function listModels(): Promise<ProviderModel[]> {
     modelID: m.modelID || m.id,
     providerID: m.providerID,
     name: m.name || m.id,
+    variants: Array.isArray(m.variants)
+      ? m.variants.map((v: any) => String(v?.id ?? v))
+      : m.variants && typeof m.variants === "object"
+        ? Object.keys(m.variants)
+        : [],
   }));
 }
 
-async function resolveModelRef(model?: string): Promise<{ providerID: string; id: string; variant?: string } | undefined> {
-  if (!model) return undefined;
-  const direct = parseModelRef(model);
-  if (direct) return direct;
+export type ModelRef = { providerID: string; id: string; variant?: string };
 
+/** Validate a user-supplied model ("provider/model[#variant]" or a bare model id) against the server's model list. */
+export async function resolveModelRef(model: string): Promise<ModelRef | undefined> {
   const models = await listModels();
-  const hit = models.find((m) => m.id === model || m.modelID === model);
+  const ref = parseModelRef(model);
+  const bare = model.trim();
+  const hit = ref
+    ? models.find((m) => m.providerID === ref.providerID && (m.id === ref.id || m.modelID === ref.id))
+    : models.find((m) => m.id === bare || m.modelID === bare);
   if (!hit) return undefined;
-  return { providerID: hit.providerID, id: hit.id };
+  if (ref?.variant && hit.variants.length && !hit.variants.includes(ref.variant)) return undefined;
+  return { providerID: hit.providerID, id: hit.id, variant: ref?.variant };
 }
 
-export async function setSessionModel(sessionId: string, model: string): Promise<void> {
-  const ref = await resolveModelRef(model);
-  if (!ref) throw new Error(`未知模型: ${model}`);
-  await api(`/api/session/${sessionId}/model`, {
-    method: "POST",
-    body: JSON.stringify({ model: ref }),
-  });
+export function formatModelRef(ref: ModelRef): string {
+  return `${ref.providerID}/${ref.id}${ref.variant ? `#${ref.variant}` : ""}`;
 }
 
-export async function createSession(title: string, cwd?: string, model?: string): Promise<string> {
-  logger.info("Creating OpenCode session", { title, cwd, model });
-  const body: Record<string, unknown> = { title };
-  if (cwd) body.location = { directory: cwd };
-  if (OPENCODE_AGENT) body.agent = OPENCODE_AGENT;
-  const ref = await resolveModelRef(model);
-  if (ref) body.model = ref;
+async function createSession(title: string, cwd: string, agent?: string, model?: string): Promise<string> {
+  const body: Record<string, unknown> = { title, location: { directory: cwd } };
+  if (agent) body.agent = agent;
+  if (model) {
+    // Stored models were validated by /model, so a malformed one is a bug rather than something to guess around.
+    const ref = parseModelRef(model);
+    if (!ref) throw new Error(`无效的模型: ${model}`);
+    body.model = ref;
+  }
 
   const out = await api<{ data: { id: string } }>("/api/session", {
     method: "POST",
     body: JSON.stringify(body),
   });
-  logger.info("Session created", { id: out.data.id });
+  logger.info("Session created", { sessionId: out.data.id, agent, model });
   return out.data.id;
 }
 
-export async function listSessions(cwd?: string): Promise<
-  Array<{ id: string; title: string; directory: string; time: { created: number; updated: number } }>
-> {
-  const params = new URLSearchParams({ limit: "50", order: "desc" });
-  if (cwd) params.set("directory", cwd);
-
+/** Sessions spawned by the subagent tool carry parentID. */
+export async function listChildSessions(parentId: string): Promise<Array<{ id: string; title: string; agent?: string }>> {
+  const params = new URLSearchParams({ parentID: parentId, limit: "50" });
   const out = await api<{ data: any[] }>(`/api/session?${params.toString()}`);
-  return (out.data || []).map((s) => ({
-    id: s.id,
-    title: s.title || s.id,
-    directory: s.location?.directory || cwd || "",
-    time: {
-      created: s.time?.created ?? 0,
-      updated: s.time?.updated ?? s.time?.created ?? 0,
-    },
-  }));
+  return (out.data || []).map((s) => ({ id: s.id, title: s.title || s.id, agent: s.agent }));
 }
 
-function writeImages(images?: QueryOptions["images"]): { files: Array<{ uri: string; name: string }>; cleanup: () => void } {
-  if (!images?.length) return { files: [], cleanup: () => {} };
-
-  const dir = mkdtempSync(join(tmpdir(), "wechat-opencode-"));
-  const files: Array<{ uri: string; name: string }> = [];
-  for (const [index, image] of images.entries()) {
-    const ext = image.source.media_type.split("/")[1]?.replace(/[^a-z0-9]/gi, "") || "png";
-    const name = `image-${index + 1}.${ext}`;
-    const filePath = join(dir, name);
-    writeFileSync(filePath, Buffer.from(image.source.data, "base64"));
-    files.push({ uri: `file://${filePath}`, name });
+/** Best effort: stop the session and the subagent sessions it spawned. Idle sessions are a no-op. */
+export async function interruptSession(sessionId: string): Promise<void> {
+  const ids = [sessionId];
+  try {
+    ids.push(...(await listChildSessions(sessionId)).map((child) => child.id));
+  } catch (err) {
+    logger.warn("Failed to list child sessions", { sessionId, error: String(err) });
   }
-
-  return {
-    files,
-    cleanup: () => {
-      try {
-        rmSync(dir, { recursive: true, force: true });
-      } catch {
-        // best effort
-      }
-    },
-  };
+  await Promise.all(
+    ids.map((id) =>
+      api(`/api/session/${id}/interrupt`, { method: "POST" }).catch((err) =>
+        logger.warn("Failed to interrupt session", { sessionId: id, error: String(err) }),
+      ),
+    ),
+  );
 }
 
 async function listPendingPermissions(sessionId: string): Promise<PermissionRequest[]> {
@@ -265,6 +284,7 @@ async function listPendingPermissions(sessionId: string): Promise<PermissionRequ
     const out = await api<{ data: any[] }>(`/api/session/${sessionId}/permission`);
     return (out.data || []).map((p) => ({
       id: p.id,
+      sessionId,
       action: p.action,
       resources: Array.isArray(p.resources) ? p.resources : [],
       message: p.message,
@@ -282,16 +302,6 @@ async function replyPermission(sessionId: string, requestId: string, decision: P
   });
 }
 
-function decideWithoutHuman(
-  request: PermissionRequest,
-  mode: QueryOptions["permissionMode"],
-): PermissionDecision {
-  if (mode === "auto") return "once";
-  if (mode === "acceptEdits" && request.action === "edit") return "once";
-  if (mode === "plan") return "reject";
-  return "reject";
-}
-
 function extractAssistantText(message: any): string {
   const content = Array.isArray(message?.content) ? message.content : [];
   return content
@@ -301,55 +311,103 @@ function extractAssistantText(message: any): string {
     .trim();
 }
 
-async function waitForTurn(
-  sessionId: string,
-  since: number,
-  options: QueryOptions,
-): Promise<string> {
-  const deadline = Date.now() + TURN_TIMEOUT_MS;
+/** "provider.internal: control plan is unavailable" for structured errors, JSON otherwise. */
+function describeError(error: any): string {
+  if (!error) return "unknown error";
+  if (error.type || error.message) return [error.type, error.message].filter(Boolean).join(": ");
+  return JSON.stringify(error);
+}
+
+/** Names of the tool calls that are still executing. */
+function runningTools(messages: any[]): string[] {
+  return messages.flatMap((m) =>
+    (Array.isArray(m?.content) ? m.content : [])
+      .filter((part: any) => part?.type === "tool" && part.state?.status === "running")
+      .map((part: any) => String(part.name)),
+  );
+}
+
+/**
+ * What moves while a model works: new messages and parts, their timestamps and tool states.
+ * Part text only shows up once the part has finished streaming.
+ */
+function progressSignature(messages: any[]): string {
+  return JSON.stringify(
+    messages.map((m) => [
+      m?.id,
+      m?.time,
+      (Array.isArray(m?.content) ? m.content : []).map((part: any) => [part?.type, part?.state?.status, part?.time, part?.text?.length]),
+    ]),
+  );
+}
+
+/**
+ * Poll until the turn goes idle, answering permission requests on the way. Two watchdogs give up on a
+ * silent upstream model: no first output within FIRST_RESPONSE_TIMEOUT_MS, or no visible change in the
+ * session or its subagent sessions for STALL_TIMEOUT_MS.
+ */
+async function waitForTurn(sessionId: string, since: number, options: QueryOptions): Promise<string> {
+  const startedAt = Date.now();
+  const deadline = startedAt + TURN_TIMEOUT_MS;
   const handledPermissions = new Set<string>();
+  let progress = "";
+  let progressAt = startedAt;
 
   while (Date.now() < deadline) {
-    const pending = await listPendingPermissions(sessionId);
+    if (options.signal?.aborted) throw new TurnInterrupted();
+
+    // Real work runs in subagent sessions, and each of them asks for its own permissions.
+    const children = await listChildSessions(sessionId).catch(() => [] as Array<{ id: string }>);
+    const pending = (await Promise.all([sessionId, ...children.map((c) => c.id)].map(listPendingPermissions))).flat();
     for (const request of pending) {
       if (handledPermissions.has(request.id)) continue;
       handledPermissions.add(request.id);
 
-      let decision: PermissionDecision;
+      let decision: PermissionDecision = "reject";
       if (options.onPermission) {
         try {
           decision = await options.onPermission(request);
         } catch (err) {
-          logger.warn("Permission handler failed, rejecting", { error: String(err), request });
-          decision = "reject";
+          logger.warn("Permission handler failed, rejecting", { error: String(err), requestId: request.id });
         }
-      } else {
-        decision = decideWithoutHuman(request, options.permissionMode);
       }
 
       try {
-        await replyPermission(sessionId, request.id, decision);
-        logger.info("Permission replied", { requestId: request.id, decision });
+        await replyPermission(request.sessionId, request.id, decision);
+        logger.info("Permission replied", {
+          requestId: request.id,
+          sessionId: request.sessionId,
+          action: request.action,
+          decision,
+        });
       } catch (err) {
-        logger.warn("Failed to reply permission", { requestId: request.id, error: String(err) });
+        logger.warn("Failed to reply permission", {
+          requestId: request.id,
+          sessionId: request.sessionId,
+          error: String(err),
+        });
       }
     }
 
-    const out = await api<{ data: any[] }>(`/api/session/${sessionId}/message?limit=100&order=desc`);
-    const messages = out.data || [];
+    // A session waiting on the user is not a silent model, however long the answer takes.
+    if (pending.length) progressAt = Date.now();
 
-    const idle = messages.find((m) => m?.type === "idle" && (m?.time?.created ?? 0) >= since);
+    const out = await api<{ data: any[] }>(`/api/session/${sessionId}/message?limit=100&order=desc`);
+    const turn = (out.data || []).filter((m) => (m?.time?.created ?? 0) >= since);
+
+    const idle = turn.find((m) => m?.type === "idle");
     if (idle) {
       if (idle.outcome === "failed") {
-        const detail = idle.error ? JSON.stringify(idle.error).slice(0, 500) : "unknown error";
-        throw new Error(`OpenCode 执行失败: ${detail}`);
+        const message = `OpenCode 执行失败: ${describeError(idle.error).slice(0, 500)}`;
+        // provider.* errors come from the model's upstream; others (a rejected permission, a bad request) would fail again.
+        throw String(idle.error?.type).startsWith("provider.") ? new UpstreamError(message) : new Error(message);
       }
       if (idle.outcome === "interrupted") {
-        throw new Error("OpenCode 执行被中断");
+        throw new TurnInterrupted("OpenCode 执行被中断");
       }
 
-      const assistants = messages
-        .filter((m) => m?.type === "assistant" && (m?.time?.created ?? 0) >= since)
+      const assistants = turn
+        .filter((m) => m?.type === "assistant")
         .sort((a, b) => (a.time?.created ?? 0) - (b.time?.created ?? 0));
 
       for (let i = assistants.length - 1; i >= 0; i--) {
@@ -359,51 +417,49 @@ async function waitForTurn(
       return "";
     }
 
-    await sleep(POLL_INTERVAL_MS);
+    const childMessages = (
+      await Promise.all(
+        children.map((c) =>
+          api<{ data: any[] }>(`/api/session/${c.id}/message?limit=5&order=desc`).then((o) => o.data || [], () => []),
+        ),
+      )
+    ).flat();
+    // A running tool is local work (a build, a long command), not a silent model. The root's subagent calls
+    // are judged by their child sessions; a child's own subagent call runs in a session not watched here.
+    const working = runningTools(turn).some((name) => name !== "subagent") || runningTools(childMessages).length > 0;
+    const signature = progressSignature([...turn, ...childMessages]);
+    const now = Date.now();
+    if (working || signature !== progress) {
+      progress = signature;
+      progressAt = now;
+    }
+    const responded = turn.some((m) => m?.type === "assistant" && (m.content?.length || m.time?.streamed));
+    if (!responded && now - startedAt > FIRST_RESPONSE_TIMEOUT_MS) {
+      throw new TurnTimeout(`上游模型 ${FIRST_RESPONSE_TIMEOUT_MS / 1000} 秒无响应`);
+    }
+    if (responded && now - progressAt > STALL_TIMEOUT_MS) {
+      throw new TurnTimeout(`上游模型 ${STALL_TIMEOUT_MS / 1000} 秒无进展`);
+    }
+
+    await sleep(POLL_INTERVAL_MS, options.signal);
   }
 
   throw new Error("OpenCode 执行超时（30 分钟）");
 }
 
+/** Run one turn in a brand-new session. Sessions are never resumed: context lives outside OpenCode. */
 export async function openCodeQuery(options: QueryOptions): Promise<QueryResult> {
-  const { prompt, cwd, resume, model, images, title } = options;
+  const { prompt, cwd, agent, model, title, files, signal } = options;
+  logger.info("Starting OpenCode query", { cwd, agent, model, promptLength: prompt.length, files: files?.length ?? 0 });
 
-  logger.info("Starting OpenCode query", {
-    cwd,
-    model,
-    resume: Boolean(resume),
-    hasImages: Boolean(images?.length),
-    title,
-  });
-
-  const { files, cleanup } = writeImages(images);
-
+  let sessionId = "";
   try {
-    let sessionId = resume || "";
-    if (sessionId) {
-      // Sessions are bound to a location. If /cwd changed the working directory,
-      // resume would silently keep operating in the old one — start a fresh
-      // session at the new location instead.
-      try {
-        const info = await api<{ data: { location?: { directory?: string } } }>(`/api/session/${sessionId}`);
-        const sessionDir = info?.data?.location?.directory;
-        if (sessionDir && normalizeDir(sessionDir) !== normalizeDir(cwd)) {
-          logger.info("Working directory changed, starting a new session", { sessionId, sessionDir, cwd });
-          sessionId = "";
-        }
-      } catch {
-        sessionId = "";
-      }
-    }
-    if (!sessionId) {
-      sessionId = await createSession(title || "微信: 会话", cwd, model);
-    } else if (model) {
-      await setSessionModel(sessionId, model);
-    }
+    sessionId = await createSession(title || "微信任务", cwd, agent, model);
     options.onSession?.(sessionId);
+    if (signal?.aborted) throw new TurnInterrupted();
 
     const body: Record<string, unknown> = { text: prompt, delivery: "queue" };
-    if (files.length) body.files = files;
+    if (files?.length) body.files = files.map((p) => ({ uri: pathToFileURL(p).href, name: basename(p) }));
 
     const admitted = await api<{ data: { time?: { created?: number } } }>(
       `/api/session/${sessionId}/prompt`,
@@ -412,32 +468,29 @@ export async function openCodeQuery(options: QueryOptions): Promise<QueryResult>
     const since = admitted?.data?.time?.created ?? Date.now();
 
     const text = await waitForTurn(sessionId, since, options);
-
     logger.info("OpenCode query completed", { sessionId, textLength: text.length });
     return { text, sessionId };
   } catch (err) {
-    const errorMessage = err instanceof Error ? err.message : String(err);
-    logger.error("OpenCode query failed", {
-      error: errorMessage,
-      prompt: prompt?.substring(0, 100),
-      cwd,
-      resume: Boolean(resume),
-      model,
-    });
-    return { text: "", sessionId: "", error: errorMessage };
-  } finally {
-    cleanup();
+    const interrupted = err instanceof TurnInterrupted;
+    const upstream = err instanceof UpstreamError;
+    const error = err instanceof Error ? err.message : String(err);
+    // Timeouts, aborts and transport errors can leave the session executing on the server.
+    if (sessionId) await interruptSession(sessionId);
+    if (interrupted) logger.info("OpenCode query interrupted", { sessionId });
+    else logger.error("OpenCode query failed", { sessionId, error, upstream });
+    return { text: "", sessionId, error, interrupted, upstream };
   }
 }
 
-export function getOpenCodeClient(): null {
-  return null;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function normalizeDir(dir: string): string {
-  return dir.replace(/\\/g, "/").replace(/\/+$/, "");
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve();
+    const done = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener("abort", done, { once: true });
+  });
 }

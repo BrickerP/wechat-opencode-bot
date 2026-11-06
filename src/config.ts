@@ -2,10 +2,11 @@ import { readFileSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 
+export type PermissionMode = "default" | "acceptEdits" | "plan" | "auto";
+
 export interface Config {
   workingDirectory: string;
-  model?: string;
-  permissionMode?: "default" | "acceptEdits" | "plan" | "auto";
+  permissionMode?: PermissionMode;
 }
 
 const CONFIG_DIR = join(homedir(), ".wechat-opencode-bot");
@@ -31,9 +32,6 @@ function parseConfigFile(content: string): Config {
     switch (key) {
       case "workingDirectory":
         config.workingDirectory = value;
-        break;
-      case "model":
-        config.model = value;
         break;
       case "permissionMode":
         if (
@@ -64,9 +62,6 @@ export function saveConfig(config: Config): void {
   ensureConfigDir();
   const lines: string[] = [];
   lines.push(`workingDirectory=${config.workingDirectory}`);
-  if (config.model) {
-    lines.push(`model=${config.model}`);
-  }
   if (config.permissionMode) {
     lines.push(`permissionMode=${config.permissionMode}`);
   }

@@ -1,10 +1,13 @@
-// Project routing: the registry, alias detection, directory checks, and the v3 task columns.
+// Project routing: the registry, alias and follow-up detection, directory checks (also for /cwd),
+// the prompt's <project> block, routing together with "@bot" in either order, aliases a bot owns,
+// and the v3 task columns.
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { after, test } from 'node:test';
+import type { CommandContext } from '../commands/handlers.js';
 
 const tmp = mkdtempSync(join(tmpdir(), 'owb-projects-'));
 const base = join(tmp, 'work');
@@ -20,8 +23,12 @@ process.env.OWB_DATA_DIR = join(tmp, 'data');
 mkdirSync(join(tmp, '.wechat-opencode-bot'));
 writeFileSync(join(tmp, '.wechat-opencode-bot', 'config.env'), `workingDirectory=${base}\n`);
 
-const { detectProject, loadProjects, resolveProjectDir, routeMessage, stripProjectPrefix } = await import('../projects.js');
+const { detectProject, loadProjects, PROJECTS_PATH, resolveProjectDir, routeMessage, stripProjectPrefix } = await import(
+  '../projects.js'
+);
 const { openStateDb } = await import('../tasks/db.js');
+const { composePrompt } = await import('../orchestrator.js');
+const { handlers } = await import('../commands/handlers.js');
 
 const registry = join(tmp, 'registry', 'projects.json');
 const projects = loadProjects(base, registry);
@@ -34,7 +41,7 @@ test('a missing registry is generated once from the child directories, mode 0600
     { id: 'dumate', dir: 'dumate', aliases: ['dumate'] },
     { id: 'medo', dir: 'medo-discord-icafe-bot', aliases: ['medo', 'icafe', 'medo-discord', 'medo-discord-icafe-bot'] },
     { id: 'miaoda', dir: 'miaoda', aliases: ['miaoda', '秒哒'] },
-    { id: 'miaoda-ops', dir: 'miaoda-ops', aliases: ['ops', 'miaoda-ops'] },
+    { id: 'miaoda-ops', dir: 'miaoda-ops', aliases: ['miaoda-ops'] },
     { id: 'rh-layers', dir: 'rh-layers', aliases: ['rh', 'rh-layers'] },
   ]);
   assert.equal(statSync(registry).mode & 0o777, 0o600);
@@ -75,6 +82,15 @@ test('the longest alias wins', () => {
   assert.equal(stripProjectPrefix('@miaoda-ops 部署', ops!), '部署');
   assert.equal(detectProject('看下 miaoda-ops 的部署', projects)?.id, 'miaoda-ops');
   assert.equal(detectProject('@miaoda 部署', projects)?.id, 'miaoda');
+  // A Chinese alias has no word edge, so "秒哒" also matches "秒哒运维": only the length decides, in either registry order.
+  const short = { id: 'miaoda', dir: 'miaoda', aliases: ['秒哒'] };
+  const long = { id: 'miaoda-ops', dir: 'miaoda-ops', aliases: ['秒哒运维'] };
+  for (const order of [[short, long], [long, short]]) {
+    assert.equal(detectProject('@秒哒运维 部署', order)?.id, 'miaoda-ops');
+    assert.equal(detectProject('看下秒哒运维的部署', order)?.id, 'miaoda-ops');
+    assert.equal(detectProject('@秒哒 部署', order)?.id, 'miaoda');
+  }
+  assert.equal(stripProjectPrefix('@秒哒运维 部署', { ...short, aliases: ['秒哒', '秒哒运维'] }), '部署');
 });
 
 test('a follow-up stays in the last project; anything else goes to the base', () => {
@@ -85,6 +101,21 @@ test('a follow-up stays in the last project; anything else goes to the base', ()
   assert.equal(detectProject('继续', projects, null), null);
   assert.equal(detectProject('继续', projects, 'removed'), null);
   assert.equal(detectProject('@unknown 看看', projects), null);
+});
+
+test('a follow-up is a short message that opens with a cue; a cue inside other words or a long request does not count', () => {
+  for (const text of ['继续', ' 再改一下 ', '刚才那个', '看一下这个报错', '它们呢']) {
+    assert.equal(detectProject(text, projects, 'medo')?.id, 'medo', text);
+  }
+  for (const text of [
+    '再见',
+    '其它项目呢',
+    '你好',
+    '今天下午开会前帮我看一下明天北京的天气预报，再提醒我带伞，顺便把会议纪要模板也发我一份',
+    '看一下这个报错是怎么回事，然后把配置里的超时改成三十秒，再重新部署一遍测试环境',
+  ]) {
+    assert.equal(detectProject(text, projects, 'medo'), null, text);
+  }
 });
 
 test('a message that is only "@alias" keeps its text', () => {
@@ -117,22 +148,104 @@ test('a project directory must resolve inside the base', () => {
   assert.deepEqual(loadProjects(base, file), []);
 });
 
+test('/cwd only switches to a directory that is inside the base once symlinks are resolved', async () => {
+  const db = openStateDb(join(tmp, 'cwd.db'));
+  db.ensureUser('acc', 'wx');
+  const ctx = { accountId: 'acc', db } as CommandContext;
+  assert.match(await handlers.cwd('escape', ctx), /超出允许范围/, 'a symlink inside the base that points outside');
+  assert.match(await handlers.cwd('../outside', ctx), /超出允许范围/);
+  assert.match(await handlers.cwd('missing', ctx), /目录不存在/);
+  assert.equal(db.getUser('acc')?.workspace, null);
+  assert.match(await handlers.cwd('miaoda', ctx), /已切换/);
+  assert.equal(db.getUser('acc')?.workspace, join(base, 'miaoda'));
+});
+
+test('a project task tells the orchestrator its repo, and that the repo rules come first', () => {
+  const db = openStateDb(join(tmp, 'prompt.db'));
+  const medo = { id: 'medo', dir: join(base, 'medo-discord-icafe-bot') };
+  const none = { paths: [], carried: false };
+  const prompt = composePrompt(db, db.createTask('acc', '看下日志', null, medo).task, medo.dir, none);
+  const [id, dir, precedence] = /<project>\n([\s\S]*?)\n<\/project>/.exec(prompt)?.[1].split('\n') ?? [];
+  assert.equal(id, 'id: medo');
+  assert.equal(dir, `dir: ${medo.dir}`);
+  assert.match(precedence ?? '', /AGENTS\.md .*take precedence over <memory> and <recent_tasks>/);
+  assert.doesNotMatch(composePrompt(db, db.createTask('acc', '你好').task, base, none), /<project>/);
+});
+
 test('routeMessage stores the stripped input and the repo dir; follow-ups expire after 2 hours', () => {
   const file = join(tmp, 'state.db');
   const db = openStateDb(file);
   const medo = { id: 'medo', dir: join(base, 'medo-discord-icafe-bot') };
   const first = routeMessage(db, 'acc', '@medo 看下 AGENTS.md');
-  assert.deepEqual(first, { input: '看下 AGENTS.md', project: medo });
+  assert.deepEqual(first, { input: '看下 AGENTS.md', project: medo, botId: 'chief' });
   const { task } = db.createTask('acc', first.input, 'm1', first.project);
   assert.deepEqual([task.input, task.project_id, task.project_dir], ['看下 AGENTS.md', medo.id, medo.dir]);
-  assert.deepEqual(routeMessage(db, 'acc', '继续'), { input: '继续', project: medo });
-  assert.deepEqual(routeMessage(db, 'acc', '你好'), { input: '你好' });
+  assert.deepEqual(routeMessage(db, 'acc', '继续'), { input: '继续', project: medo, botId: 'chief' });
+  assert.deepEqual(routeMessage(db, 'acc', '你好'), { input: '你好', botId: 'chief' });
   assert.equal(db.startTaskNow('sim', '继续', medo)?.project_dir, medo.dir);
 
   const raw = new DatabaseSync(file);
   raw.prepare('UPDATE tasks SET created_at = ? WHERE id = ?').run(Date.now() - 2 * 60 * 60 * 1000 - 1000, task.id);
   raw.close();
-  assert.deepEqual(routeMessage(db, 'acc', '继续'), { input: '继续' });
+  assert.deepEqual(routeMessage(db, 'acc', '继续'), { input: '继续', botId: 'chief' });
+});
+
+test('"@bot" comes off first, then the project is routed from the rest', () => {
+  const db = openStateDb(join(tmp, 'bots.db'));
+  const at = (id: string, dir: string) => ({ id, dir: join(base, dir) });
+  assert.deepEqual(routeMessage(db, 'acc', '@research 在 miaoda 里看下发布流程'), {
+    input: '在 miaoda 里看下发布流程',
+    project: at('miaoda', 'miaoda'),
+    botId: 'research',
+  });
+  assert.deepEqual(routeMessage(db, 'acc', '@eng @medo 看下日志'), {
+    input: '看下日志',
+    project: at('medo', 'medo-discord-icafe-bot'),
+    botId: 'eng',
+  });
+  // "ops" is the Ops bot's alias, at the start and in the rest of the message; the project goes by "miaoda-ops".
+  assert.deepEqual(routeMessage(db, 'acc', '@ops 看下日志'), { input: '看下日志', botId: 'ops' });
+  assert.deepEqual(routeMessage(db, 'acc', '@miaoda-ops 看下部署'), {
+    input: '看下部署',
+    project: at('miaoda-ops', 'miaoda-ops'),
+    botId: 'chief',
+  });
+  assert.deepEqual(routeMessage(db, 'acc', '@all 让 ops 和 research 分头看下这个报错'), {
+    input: '让 ops 和 research 分头看下这个报错',
+    botId: 'all',
+  });
+  assert.deepEqual(routeMessage(db, 'acc', '@all 看看 rh'), { input: '看看 rh', project: at('rh-layers', 'rh-layers'), botId: 'all' });
+});
+
+test('"@project @bot" works too; an unknown "@name" stays in the text for the default bot', () => {
+  const db = openStateDb(join(tmp, 'order.db'));
+  const miaoda = { id: 'miaoda', dir: join(base, 'miaoda') };
+  assert.deepEqual(routeMessage(db, 'acc', '@miaoda @eng 看下日志'), { input: '看下日志', project: miaoda, botId: 'eng' });
+  assert.deepEqual(routeMessage(db, 'acc', '@秒哒：@研究，看下发布流程'), { input: '看下发布流程', project: miaoda, botId: 'research' });
+  assert.deepEqual(routeMessage(db, 'acc', '@miaoda @foo 看下日志'), { input: '@foo 看下日志', project: miaoda, botId: 'chief' });
+  assert.deepEqual(routeMessage(db, 'acc', '@foo 看下日志'), { input: '@foo 看下日志', botId: 'chief' });
+  // A message names one bot: the one that opens it.
+  assert.deepEqual(routeMessage(db, 'acc', '@eng @miaoda @research 看下'), { input: '@research 看下', project: miaoda, botId: 'eng' });
+});
+
+test('an alias a bot uses names only the bot: a project that lists it loses it, with a warning', () => {
+  // As in a registry generated before the bots, miaoda-ops also goes by the Ops bot's "ops".
+  const generated = readFileSync(PROJECTS_PATH, 'utf-8');
+  const stale = JSON.parse(generated);
+  stale.projects.find((p: { id: string }) => p.id === 'miaoda-ops').aliases.unshift('OPS', 'all');
+  writeFileSync(PROJECTS_PATH, JSON.stringify(stale));
+  assert.deepEqual(loadProjects(base).find((p) => p.id === 'miaoda-ops')?.aliases, ['miaoda-ops']);
+  const logs = join(tmp, '.wechat-opencode-bot', 'logs');
+  const log = readdirSync(logs).map((name) => readFileSync(join(logs, name), 'utf-8')).join('');
+  assert.match(log, /WARN Ignoring project aliases that name a bot \{"id":"miaoda-ops","aliases":\["OPS","all"\]\}/);
+  const db = openStateDb(join(tmp, 'stale.db'));
+  assert.deepEqual(routeMessage(db, 'acc', '@ops 看下日志'), { input: '看下日志', botId: 'ops' });
+  assert.deepEqual(routeMessage(db, 'acc', '@all 让 ops 和 research 分头看下这个报错'), {
+    input: '让 ops 和 research 分头看下这个报错',
+    botId: 'all',
+  });
+  assert.equal(routeMessage(db, 'acc', '@miaoda-ops 看下部署').project?.id, 'miaoda-ops');
+  writeFileSync(PROJECTS_PATH, generated);
 });
 
 test('a v2 database gains the project columns and keeps its rows', () => {
@@ -143,7 +256,7 @@ test('a v2 database gains the project columns and keeps its rows', () => {
   const migrated = openStateDb(file);
   const columns = raw.prepare("SELECT name FROM pragma_table_info('tasks')").all().map((c) => c.name);
   assert.ok(columns.includes('project_id') && columns.includes('project_dir'));
-  assert.equal((raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 3);
+  assert.equal((raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 4);
   assert.deepEqual([migrated.getTask(task.id)?.input, migrated.getTask(task.id)?.project_id], ['old task', null]);
   raw.close();
 });

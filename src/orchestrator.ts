@@ -1,9 +1,10 @@
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { defaultBot, loadBots, resolveBot, type Bot } from './bots.js';
 import { loadConfig } from './config.js';
 import { DATA_DIR } from './constants.js';
 import { logger } from './logger.js';
-import { appendMemory, readMemory } from './memory.js';
+import { appendMemory, memoryPath, readMemory } from './memory.js';
 import { openCodeQuery, type PermissionDecision, type PermissionRequest, type QueryResult } from './opencode/provider.js';
 import type { StateDb, TaskRow, TaskStatus } from './tasks/db.js';
 
@@ -118,6 +119,12 @@ const MAX_REPLY_CHARS = 1200;
 const REPLY_EXCERPTS = 2;
 const PROJECT_PRECEDENCE =
   "The repository's AGENTS.md and project config are loaded by OpenCode and take precedence over <memory> and <recent_tasks>.";
+const PERSONA_PRECEDENCE =
+  "The repository's AGENTS.md and opencode.json take precedence over this persona role, <memory> and <recent_tasks>.";
+const ALL_GUIDANCE =
+  'The user addressed everyone (@all): give independent parts to the specialists, at most 3 subagents at once, then merge them into one reply.';
+const SHARED_MEMORY_GUIDANCE =
+  'Your WECHAT_MEMORY bullets go to the shared memory that every persona reads: keep cross-persona user preferences there. Never store repo instructions.';
 
 export const STATUS_LABEL: Record<TaskStatus, string> = {
   queued: '排队中',
@@ -128,13 +135,15 @@ export const STATUS_LABEL: Record<TaskStatus, string> = {
 };
 
 /** Oldest first. */
-function formatRecentTasks(tasks: TaskRow[]): string {
+function formatRecentTasks(tasks: TaskRow[], defaultBotId: string): string {
   if (!tasks.length) return '(暂无)';
   return tasks
     .map((t, i) => {
       // The stored input has its "@alias" stripped; the project id keeps that part of the message.
       const project = t.project_id ? ` @${t.project_id}` : '';
-      const lines = [`#${t.seq} ${formatTime(t.created_at)} [${STATUS_LABEL[t.status]}]${project} 用户: ${clip(t.input, MAX_INPUT_CHARS)}`];
+      // Rows from before bots, like messages that named none, went to the default bot.
+      const to = t.bot_id && t.bot_id !== defaultBotId ? `（对 ${t.bot_id}）` : '';
+      const lines = [`#${t.seq} ${formatTime(t.created_at)} [${STATUS_LABEL[t.status]}]${project} 用户${to}: ${clip(t.input, MAX_INPUT_CHARS)}`];
       if (t.summary) lines.push(`摘要: ${t.summary}`);
       if (t.error) lines.push(`错误: ${clip(t.error, MAX_ERROR_CHARS)}`);
       if (t.result && i >= tasks.length - REPLY_EXCERPTS) lines.push(`回复: ${clip(t.result, MAX_REPLY_CHARS)}`);
@@ -143,11 +152,34 @@ function formatRecentTasks(tasks: TaskRow[]): string {
     .join('\n\n');
 }
 
+/** Who answers: the routed bot's role and, for the default bot, the specialists it can brief subagents as. */
+function formatPersona(bots: Bot[], bot: Bot, all: boolean): string {
+  const lines = [`id: ${bot.id}`, `name: ${bot.name}`, `role: ${bot.role}`];
+  if (bot.subagent) lines.push(`subagent: prefer ${bot.subagent} for this role's work`);
+  lines.push(`You are speaking as ${bot.name}. Match this role. ${PERSONA_PRECEDENCE}`);
+  const specialists = bot.default ? bots.filter((b) => b.id !== bot.id) : [];
+  if (specialists.length) {
+    lines.push(
+      'specialists (brief a subagent in the matching role):',
+      ...specialists.map((b) => `- ${b.id} (${b.name}): ${b.role}${b.subagent ? `; ${b.subagent}` : ''}`),
+    );
+    if (all) lines.push(ALL_GUIDANCE);
+  }
+  lines.push(
+    bot.default
+      ? SHARED_MEMORY_GUIDANCE
+      : `Your WECHAT_MEMORY bullets are kept for ${bot.name} only, under "${bot.name} 的记忆" in <memory>: keep facts about this role and its projects there. Never store repo instructions.`,
+  );
+  return `<persona>\n${lines.join('\n')}\n</persona>`;
+}
+
 /**
  * Each orchestrator session starts empty: everything it knows about the chat comes from this prompt.
  * retry: an earlier session for this task gave up, possibly after its subagents had changed something.
  */
 export function composePrompt(db: StateDb, task: TaskRow, workspace: string, attachments: Attachments, retry = false): string {
+  const bots = loadBots();
+  const { bot, all } = resolveBot(task.bot_id, bots);
   const context = [`workspace: ${workspace}`, `time: ${formatTime(Date.now())} (Asia/Shanghai)`, `task: #${task.seq}`];
   if (retry) {
     context.push('retry: an earlier attempt at this task stopped midway and may have made changes; check the current state before redoing anything that writes');
@@ -164,11 +196,15 @@ export function composePrompt(db: StateDb, task: TaskRow, workspace: string, att
   const project = task.project_id
     ? [`<project>\nid: ${task.project_id}\ndir: ${task.project_dir}\n${PROJECT_PRECEDENCE}\n</project>`]
     : [];
+  // Every bot reads the shared memory; any other bot's own facts follow, seen only by that bot.
+  const shared = readMemory(memoryPath(task.account_id)) || '(暂无)';
+  const own = bot.default ? '' : `\n\n${bot.name} 的记忆:\n${readMemory(memoryPath(task.account_id, bot)) || '(暂无)'}`;
   return [
     `<context>\n${context.join('\n')}\n</context>`,
+    formatPersona(bots, bot, all),
     ...project,
-    `<memory>\n${readMemory(task.account_id) || '(暂无)'}\n</memory>`,
-    `<recent_tasks>\n${formatRecentTasks(recent)}\n</recent_tasks>`,
+    `<memory>\n${shared}${own}\n</memory>`,
+    `<recent_tasks>\n${formatRecentTasks(recent, defaultBot(bots).id)}\n</recent_tasks>`,
     `<user_message>\n${input}\n</user_message>`,
   ].join('\n\n');
 }
@@ -226,7 +262,8 @@ async function decidePermission(request: PermissionRequest, io: TaskIO): Promise
 /** What the user is told when a task finishes. */
 export function resultText(task: TaskRow): string {
   const label = `任务 #${task.seq}`;
-  if (task.status === 'done') return task.result || 'ℹ️ 没有可回复的内容';
+  // The bridge, not the model, says which bot is speaking.
+  if (task.status === 'done') return task.result ? `${resolveBot(task.bot_id).bot.prefix}${task.result}` : 'ℹ️ 没有可回复的内容';
   if (task.status === 'failed') return `⚠️ ${label} 失败：${clip(task.error || '未知错误', MAX_ERROR_CHARS)}`;
   const reason = task.error ? `：${clip(task.error, MAX_ERROR_CHARS)}` : '';
   return `⏹ ${label} 已中断${reason}，需要的话请重新发送`;
@@ -286,13 +323,19 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
     const output = parseOrchestratorOutput(result.text);
     if (!db.finishTask(task.id, 'done', { result: output.reply, summary: output.summary })) return;
     try {
-      appendMemory(task.account_id, output.memory);
+      appendMemory(memoryPath(task.account_id, resolveBot(task.bot_id).bot), output.memory);
     } catch (err) {
       logger.warn('Failed to update memory', { taskId: task.id, error: String(err) });
     }
   }
 
   const finished = db.getTask(task.id)!;
-  logger.info('Task finished', { taskId: task.id, seq: task.seq, status: finished.status, sessionId: result.sessionId });
+  logger.info('Task finished', {
+    taskId: task.id,
+    seq: task.seq,
+    bot: task.bot_id,
+    status: finished.status,
+    sessionId: result.sessionId,
+  });
   await io.deliver(finished);
 }

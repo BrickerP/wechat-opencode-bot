@@ -4,4 +4,4 @@ set -a
 source "$HOME/.wechat-opencode-bot/env"
 set +a
 cd "$HOME/code/personal/wechat-opencode-bot"
-exec node dist-live/main.js --daemon
+exec node dist-roster/main.js --daemon

@@ -167,10 +167,10 @@ async function runDaemon(): Promise<void> {
       await notifier.reply(accountId, '⚠️ 图片下载失败，请重新发送');
       return;
     }
-    const { input: body, project } = routeMessage(db, accountId, text);
+    const { input: body, project, botId } = routeMessage(db, accountId, text);
     const input = image ? (body ? `${IMAGE_ONLY_INPUT} ${body}` : IMAGE_ONLY_INPUT) : body;
     const messageId = msg.message_id ? String(msg.message_id) : null;
-    const { task, created } = db.createTask(accountId, input, messageId, project);
+    const { task, created } = db.createTask(accountId, input, messageId, project, botId);
     if (!created) {
       logger.debug('Duplicate message ignored', { messageId, taskId: task.id, seq: task.seq });
       return;
@@ -181,6 +181,7 @@ async function runDaemon(): Promise<void> {
       taskId: task.id,
       seq: task.seq,
       project: task.project_id,
+      bot: task.bot_id,
       inputLength: input.length,
       image: Boolean(image),
       ahead,

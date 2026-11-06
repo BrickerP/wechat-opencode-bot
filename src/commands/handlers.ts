@@ -1,12 +1,13 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { BOTS_PATH, defaultBot, loadBots, type Bot } from '../bots.js';
 import { loadConfig, saveConfig, type PermissionMode } from '../config.js';
-import { memoryStats } from '../memory.js';
+import { memoryPath, memoryStats } from '../memory.js';
 import { clip, formatElapsed, formatTime, STATUS_LABEL } from '../orchestrator.js';
 import { formatModelRef, listModels, resolveModelRef } from '../opencode/provider.js';
 import type { PermissionBroker } from '../permission.js';
-import { isPathInside, loadProjects, PROJECTS_PATH } from '../projects.js';
+import { isRealPathInside, loadProjects, PROJECTS_PATH } from '../projects.js';
 import type { StateDb, TaskRow } from '../tasks/db.js';
 import type { TaskQueue } from '../tasks/queue.js';
 
@@ -36,8 +37,11 @@ const HELP_TEXT = `可用命令：
   /ls               显示工作目录内容
   /projects         查看项目列表
 
+Bot：
+  /bots             查看 bot 列表（id、别名、回复前缀、默认 bot）
+
 模型与权限：
-  /model [模型]     查看或切换模型（/model default 恢复默认）
+  /model [模型]     查看或切换模型，所有 bot 共用（/model default 恢复默认）
   /models           查看可用模型
   /permission [模式] 查看或设置权限模式
 
@@ -46,7 +50,9 @@ const HELP_TEXT = `可用命令：
   /version          查看版本
 
 直接发送文字或图片即创建任务；任务运行时新消息会排队，按顺序执行。
-以 @别名 开头或提到项目别名，任务就在该项目目录运行；“继续”这类追问沿用上一个任务的项目（2 小时内）。`;
+以 @bot 别名开头指定由哪个 bot 回复，@all 交给默认 bot 统筹，不指定时由默认 bot 回复（发送 /bots 查看）。
+以 @别名 开头或提到项目别名，任务就在该项目目录运行；可同时指定 bot 和项目，顺序不限，如 @research @miaoda 看下发布流程。
+以“继续”这类词开头的简短追问沿用上一个任务的项目（2 小时内）。`;
 
 const PERMISSION_MODES: Record<PermissionMode, string> = {
   default: '需要审批的操作发到微信，回复 y/n',
@@ -59,13 +65,30 @@ function workspaceOf(db: StateDb, accountId: string): string {
   return db.getUser(accountId)?.workspace || loadConfig().workingDirectory;
 }
 
-/** The input as the user sent it: the stored text has its "@alias" stripped. */
-const taskInput = (t: TaskRow, max: number): string => `${t.project_id ? `@${t.project_id} ` : ''}${clip(t.input, max)}`;
+/** The input as the user sent it: the stored text has its "@bot" and "@alias" stripped. */
+const taskInput = (t: TaskRow, max: number, defaultBotId: string): string =>
+  `${t.bot_id && t.bot_id !== defaultBotId ? `@${t.bot_id} ` : ''}${t.project_id ? `@${t.project_id} ` : ''}${clip(t.input, max)}`;
 
 /** The project of the latest task; a follow-up such as "继续" soon after it stays there. */
 function lastProject(db: StateDb, accountId: string): string {
   const [last] = db.recentTasks(accountId, 1);
   return last ? `${last.project_id ?? '工作目录'}（#${last.seq}）` : '无';
+}
+
+/** The bot of the latest task; rows from before bots went to the default bot. */
+function lastBot(db: StateDb, accountId: string, defaultBotId: string): string {
+  const [last] = db.recentTasks(accountId, 1);
+  return last ? `${last.bot_id ?? defaultBotId}（#${last.seq}）` : '无';
+}
+
+/** The shared memory, then each other bot's own memory that holds any facts. */
+function memoryCounts(accountId: string, bots: Bot[]): string {
+  const counts = [`共享 ${memoryStats(memoryPath(accountId)).bullets} 条`];
+  for (const bot of bots.filter((b) => !b.default)) {
+    const { bullets } = memoryStats(memoryPath(accountId, bot));
+    if (bullets) counts.push(`${bot.id} ${bullets} 条`);
+  }
+  return counts.join('，');
 }
 
 /** Shared by /status and --status. */
@@ -75,17 +98,21 @@ export function formatStatus(db: StateDb, accountId: string): string {
   const counts = db.statusCounts(accountId);
   const running = db.runningTask(accountId);
   const total = Object.values(counts).reduce((sum, n) => sum + n, 0);
+  const bots = loadBots();
+  const primary = defaultBot(bots);
   const lines = [
     `📂 工作目录: ${user?.workspace || config.workingDirectory}`,
     `📁 最近项目: ${lastProject(db, accountId)}`,
+    `🎭 默认 bot: ${primary.id}（${primary.name}）`,
+    `💬 最近 bot: ${lastBot(db, accountId, primary.id)}`,
     `🤖 模型: ${user?.model || '默认'}`,
     `🔒 权限模式: ${config.permissionMode ?? 'default'}`,
     running
-      ? `▶️ 运行中: #${running.seq} ${taskInput(running, 30)}（已运行 ${formatElapsed(running.started_at ?? running.created_at)}）`
+      ? `▶️ 运行中: #${running.seq} ${taskInput(running, 30, primary.id)}（已运行 ${formatElapsed(running.started_at ?? running.created_at)}）`
       : '▶️ 运行中: 无',
     `⏳ 排队: ${counts.queued} 个`,
     `📊 累计: ${total} 个任务（完成 ${counts.done}，失败 ${counts.failed}，中断 ${counts.interrupted}）`,
-    `🧠 记忆: ${memoryStats(accountId).bullets} 条`,
+    `🧠 记忆: ${memoryCounts(accountId, bots)}`,
   ];
   const pending = db.pendingNotices(accountId).length;
   if (pending) lines.push(`📮 待补发通知: ${pending} 条`);
@@ -96,9 +123,10 @@ export function formatStatus(db: StateDb, accountId: string): string {
 export function formatTasks(db: StateDb, accountId: string, limit: number): string {
   const tasks = db.recentTasks(accountId, limit);
   if (!tasks.length) return '暂无任务';
+  const defaultBotId = defaultBot(loadBots()).id;
   return tasks
     .map((t) => {
-      const head = `#${t.seq} ${formatTime(t.created_at)} [${STATUS_LABEL[t.status]}] ${taskInput(t, 40)}`;
+      const head = `#${t.seq} ${formatTime(t.created_at)} [${STATUS_LABEL[t.status]}] ${taskInput(t, 40, defaultBotId)}`;
       const detail = t.summary || t.error;
       return detail ? `${head}\n    ${clip(detail, 80)}` : head;
     })
@@ -149,8 +177,8 @@ export const handlers: Record<string, Handler> = {
     const current = workspaceOf(db, accountId);
     if (!args) return `当前工作目录: ${current}\n用法: /cwd <路径>`;
     const target = resolve(current, args);
-    if (!isPathInside(base, target)) return `⚠️ 目标目录超出允许范围\n允许范围: ${base}\n目标目录: ${target}`;
     if (!statSync(target, { throwIfNoEntry: false })?.isDirectory()) return `⚠️ 目录不存在: ${target}`;
+    if (!isRealPathInside(base, target)) return `⚠️ 目标目录超出允许范围\n允许范围: ${base}\n目标目录: ${target}`;
     db.setWorkspace(accountId, target);
     return `✅ 工作目录已切换为: ${target}`;
   },
@@ -179,10 +207,26 @@ export const handlers: Record<string, Handler> = {
     return lines.join('\n');
   },
 
+  bots() {
+    const bots = loadBots();
+    const lines = ['🎭 Bot（以 @别名 开头指定由谁回复）：'];
+    for (const bot of bots) {
+      const notes = [bot.default ? '默认' : '', bot.prefix ? `回复前缀「${bot.prefix}」` : '无回复前缀'].filter(Boolean);
+      lines.push(`- ${bot.id}: ${bot.name}（${bot.aliases.join(', ') || '无别名'}）${notes.join('，')}`);
+    }
+    lines.push(
+      `- all: @all 或 @everyone 交给 ${defaultBot(bots).name}，按需调用各专家，只回复一次`,
+      '',
+      '🤖 所有 bot 共用 /model 设置的模型',
+      `📝 配置: ${BOTS_PATH}`,
+    );
+    return lines.join('\n');
+  },
+
   async model(args, { accountId, db }) {
     if (!args) {
       const current = db.getUser(accountId)?.model || '默认';
-      return `🤖 当前模型: ${current}\n用法: /model <provider/model>，/model default 恢复默认\n发送 /models 查看可用模型`;
+      return `🤖 当前模型: ${current}（所有 bot 共用）\n用法: /model <provider/model>，/model default 恢复默认\n发送 /models 查看可用模型`;
     }
     if (/^(default|reset)$/i.test(args)) {
       db.setModel(accountId, null);

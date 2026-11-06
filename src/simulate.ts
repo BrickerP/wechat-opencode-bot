@@ -20,15 +20,15 @@ export async function runSimulate(text: string): Promise<number> {
   }
   const accountId = SIMULATE_ACCOUNT;
   const db = openStateDb();
-  const { input, project } = routeMessage(db, accountId, text);
+  const { input, project, botId } = routeMessage(db, accountId, text);
 
-  let task = db.startTaskNow(accountId, input, project);
+  let task = db.startTaskNow(accountId, input, project, botId);
   while (!task) {
     console.log('[simulate] 已有任务在运行，2 秒后重试...');
     await new Promise((resolve) => setTimeout(resolve, RETRY_MS));
-    task = db.startTaskNow(accountId, input, project);
+    task = db.startTaskNow(accountId, input, project, botId);
   }
-  console.log(`[simulate] task ${task.id} (#${task.seq}) project=${task.project_id ?? '-'}`);
+  console.log(`[simulate] task ${task.id} (#${task.seq}) bot=${task.bot_id ?? '-'} project=${task.project_id ?? '-'}`);
 
   const io: TaskIO = {
     async deliver(task) {

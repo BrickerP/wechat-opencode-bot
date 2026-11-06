@@ -37,6 +37,8 @@ export interface TaskRow {
   project_id: string | null;
   /** Absolute repo root of project_id when the task was created; the task's session opens there. */
   project_dir: string | null;
+  /** Bot the message was addressed to: a registry id, or "all" for "@all". Null (older rows) means the default bot. */
+  bot_id: string | null;
   /** 1-based position of the task in the account's history (computed). */
   seq: number;
 }
@@ -148,6 +150,11 @@ export function openStateDb(file: string = STATE_DB_PATH) {
       if (!hasColumn('tasks', 'project_dir')) db.exec('ALTER TABLE tasks ADD COLUMN project_dir TEXT');
       db.exec('PRAGMA user_version = 3');
     }
+    if (version < 4) {
+      // Each task speaks as the bot its message named.
+      if (!hasColumn('tasks', 'bot_id')) db.exec('ALTER TABLE tasks ADD COLUMN bot_id TEXT');
+      db.exec('PRAGMA user_version = 4');
+    }
   });
 
   const getTask = (id: string) => one<TaskRow>(`${TASK_SELECT} WHERE t.id = ?`, id);
@@ -160,13 +167,14 @@ export function openStateDb(file: string = STATE_DB_PATH) {
     status: 'queued' | 'running',
     messageId: string | null = null,
     project: TaskProject | null = null,
+    botId: string | null = null,
   ): TaskRow {
     const id = randomUUID();
     const now = Date.now();
     run(
-      `INSERT INTO tasks (id, account_id, input, status, created_at, started_at, message_id, project_id, project_dir)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      id, accountId, input, status, now, status === 'running' ? now : null, messageId, project?.id ?? null, project?.dir ?? null,
+      `INSERT INTO tasks (id, account_id, input, status, created_at, started_at, message_id, project_id, project_dir, bot_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      id, accountId, input, status, now, status === 'running' ? now : null, messageId, project?.id ?? null, project?.dir ?? null, botId,
     );
     return getTask(id)!;
   }
@@ -214,6 +222,7 @@ export function openStateDb(file: string = STATE_DB_PATH) {
       input: string,
       messageId: string | null = null,
       project?: TaskProject,
+      botId?: string,
     ): { task: TaskRow; created: boolean } {
       return immediate(() => {
         const existing =
@@ -221,13 +230,13 @@ export function openStateDb(file: string = STATE_DB_PATH) {
             ? undefined
             : one<TaskRow>(`${TASK_SELECT} WHERE t.account_id = ? AND t.message_id = ?`, accountId, messageId);
         if (existing) return { task: existing, created: false };
-        return { task: insertTask(accountId, input, 'queued', messageId, project), created: true };
+        return { task: insertTask(accountId, input, 'queued', messageId, project, botId), created: true };
       });
     },
 
     /** Insert a task directly as running (--simulate), unless the account already has a running task. */
-    startTaskNow(accountId: string, input: string, project?: TaskProject): TaskRow | null {
-      return immediate(() => (hasRunning(accountId) ? null : insertTask(accountId, input, 'running', null, project)));
+    startTaskNow(accountId: string, input: string, project?: TaskProject, botId?: string): TaskRow | null {
+      return immediate(() => (hasRunning(accountId) ? null : insertTask(accountId, input, 'running', null, project, botId)));
     },
 
     /** Atomically move the oldest queued task to running; null if busy or nothing queued. */

@@ -1,5 +1,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { longestFirst, mentionPattern, prefixPattern } from './aliases.js';
+import { botAliases, defaultBot, detectBot, loadBots, type Bot } from './bots.js';
 import { loadConfig } from './config.js';
 import { DATA_DIR } from './constants.js';
 import { logger } from './logger.js';
@@ -25,21 +27,32 @@ const KNOWN_PROJECTS: Record<string, { id: string; aliases: string[] }> = {
   'medo-discord-icafe-bot': { id: 'medo', aliases: ['medo', 'icafe', 'medo-discord'] },
   'rh-layers': { id: 'rh-layers', aliases: ['rh', 'rh-layers'] },
   dumate: { id: 'dumate', aliases: ['dumate'] },
-  'miaoda-ops': { id: 'miaoda-ops', aliases: ['ops', 'miaoda-ops'] },
+  'miaoda-ops': { id: 'miaoda-ops', aliases: ['miaoda-ops'] },
 };
 /** The base itself is a project when it is a repo. */
 const PROJECT_MARKERS = ['.git', 'AGENTS.md', 'opencode.json'];
 
 /** A follow-up stays in the previous task's project only if that task came this recently. */
 const FOLLOW_UP_MS = 2 * 60 * 60 * 1000;
-const FOLLOW_UP = /继续|再|然后|接着|这个|那个|上面|刚才|它|改一下|看一下|还有|第二个/;
+/** A follow-up opens with one of these cues; inside another word (其它, 再见) or later in a sentence they mean nothing. */
+const FOLLOW_UP = /^(继续|接着|然后|再(?!见)|那|这个|上面|刚才|它|还有|第二个|改一下|看一下)/;
+/** Longer messages are new requests: they name their project or run in the base. */
+const FOLLOW_UP_MAX_CHARS = 32;
 /** Shorter aliases only work as an explicit "@alias". */
 const MIN_MENTION_CHARS = 2;
-const WORD_CHAR = /[A-Za-z0-9_-]/;
 
-export function isPathInside(parent: string, child: string): boolean {
+function isPathInside(parent: string, child: string): boolean {
   const rel = relative(resolve(parent), resolve(child));
   return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+}
+
+/** isPathInside once symlinks are resolved, so a link inside parent cannot point out of it. False if either path is missing. */
+export function isRealPathInside(parent: string, child: string): boolean {
+  try {
+    return isPathInside(realpathSync(parent), realpathSync(child));
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -89,8 +102,19 @@ function toProject(entry: any, base: string): Project {
   return project;
 }
 
-/** The registry, read on every call so edits apply right away. Entries that fail validation are skipped. */
-export function loadProjects(base: string, file: string = PROJECTS_PATH): Project[] {
+/** "@ops" names the Ops bot, so an alias a bot uses is dropped from the project, with a warning. */
+function withoutBotAliases(project: Project, botNames: Set<string>): Project {
+  const taken = project.aliases.filter((alias) => botNames.has(alias.toLowerCase()));
+  if (!taken.length) return project;
+  logger.warn('Ignoring project aliases that name a bot', { id: project.id, aliases: taken });
+  return { ...project, aliases: project.aliases.filter((alias) => !taken.includes(alias)) };
+}
+
+/**
+ * The registry, read on every call so edits apply right away. Entries that fail validation are
+ * skipped, and so are aliases that a bot uses.
+ */
+export function loadProjects(base: string, file: string = PROJECTS_PATH, bots: Bot[] = loadBots()): Project[] {
   let entries: unknown[];
   try {
     const registry = existsSync(file) ? JSON.parse(readFileSync(file, 'utf-8')) : { projects: createRegistry(base, file) };
@@ -100,9 +124,10 @@ export function loadProjects(base: string, file: string = PROJECTS_PATH): Projec
     logger.warn('Failed to load project registry', { file, error: String(err) });
     return [];
   }
+  const botNames = new Set(botAliases(bots).map(({ alias }) => alias.toLowerCase()));
   return entries.flatMap((entry) => {
     try {
-      return [toProject(entry, base)];
+      return [withoutBotAliases(toProject(entry, base), botNames)];
     } catch (err) {
       logger.warn('Skipping project', { id: String((entry as any)?.id), error: String(err) });
       return [];
@@ -110,23 +135,17 @@ export function loadProjects(base: string, file: string = PROJECTS_PATH): Projec
   });
 }
 
-const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-/** An alias edge that is an ASCII word character must not touch another one; Chinese aliases match anywhere. */
-function aliasSource(alias: string): string {
-  const before = WORD_CHAR.test(alias[0]) ? '(?<![A-Za-z0-9_-])' : '';
-  const after = WORD_CHAR.test(alias.at(-1)!) ? '(?![A-Za-z0-9_-])' : '';
-  return `${before}${escapeRegExp(alias)}${after}`;
+/** An image without text, or a short message that opens with a follow-up cue. */
+function isFollowUp(text: string): boolean {
+  const message = text.trim();
+  return !message || (message.length <= FOLLOW_UP_MAX_CHARS && FOLLOW_UP.test(message));
 }
-
-const prefixPattern = (alias: string): RegExp => new RegExp(`^\\s*@${aliasSource(alias)}[\\s:：,，]*`, 'i');
-const mentionPattern = (alias: string): RegExp => new RegExp(aliasSource(alias), 'i');
-const longestFirst = <T extends { alias: string }>(items: T[]): T[] => items.sort((a, b) => b.alias.length - a.alias.length);
 
 /**
  * The project a message is about, in order: an "@alias" prefix, an alias mentioned anywhere, then
- * a follow-up ("继续", or an image without text) staying in the previous task's project. null runs
- * the task in the base workspace. Only registry entries count; a path in the message never does.
+ * a follow-up (a short message opening with "继续" and the like, or an image without text) staying
+ * in the previous task's project. null runs the task in the base workspace. Only registry entries
+ * count; a path in the message never does.
  */
 export function detectProject(text: string, projects: Project[], lastProjectId?: string | null): Project | null {
   const aliases = longestFirst(projects.flatMap((project) => project.aliases.map((alias) => ({ project, alias }))));
@@ -134,7 +153,7 @@ export function detectProject(text: string, projects: Project[], lastProjectId?:
     aliases.find(({ alias }) => prefixPattern(alias).test(text)) ??
     aliases.find(({ alias }) => alias.length >= MIN_MENTION_CHARS && mentionPattern(alias).test(text));
   if (named) return named.project;
-  if (lastProjectId && (!text.trim() || FOLLOW_UP.test(text))) return projects.find((p) => p.id === lastProjectId) ?? null;
+  if (lastProjectId && isFollowUp(text)) return projects.find((p) => p.id === lastProjectId) ?? null;
   return null;
 }
 
@@ -144,12 +163,27 @@ export function stripProjectPrefix(text: string, project: Project): string {
   return (prefix && text.replace(prefixPattern(prefix.alias), '').trim()) || text;
 }
 
-/** Where an inbound message runs, and the text to store for it. No project means the account's workspace. */
-export function routeMessage(db: StateDb, accountId: string, text: string): { input: string; project?: TaskProject } {
+/**
+ * Who answers an inbound message, where it runs, and the text to store for it. The "@bot" prefix
+ * comes off first and the project is found in the rest, so "@research 在 miaoda 里…" is both. A
+ * message that opens with "@project" may name its bot right after it: "@miaoda @eng …".
+ * No project means the account's workspace.
+ */
+export function routeMessage(
+  db: StateDb,
+  accountId: string,
+  text: string,
+): { input: string; project?: TaskProject; botId: string } {
+  const bots = loadBots();
+  const { botId, input: rest } = detectBot(text, bots);
   const base = loadConfig().workingDirectory;
   const [last] = db.recentTasks(accountId, 1);
   const lastProjectId = last && Date.now() - last.created_at <= FOLLOW_UP_MS ? last.project_id : null;
-  const project = detectProject(text, loadProjects(base), lastProjectId);
-  if (!project) return { input: text };
-  return { input: stripProjectPrefix(text, project), project: { id: project.id, dir: resolveProjectDir(base, project) } };
+  const project = detectProject(rest, loadProjects(base, PROJECTS_PATH, bots), lastProjectId);
+  if (!project) return { input: rest, botId };
+  const input = stripProjectPrefix(rest, project);
+  // Only a message that no "@bot" opened looks for one after the project; a message names one bot.
+  const opened = botId !== defaultBot(bots).id || rest !== text;
+  const routed = opened ? { botId, input } : detectBot(input, bots);
+  return { input: routed.input, project: { id: project.id, dir: resolveProjectDir(base, project) }, botId: routed.botId };
 }

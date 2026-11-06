@@ -1,26 +1,30 @@
-// runTask against a fake OpenCode server: the first-response and stall watchdogs, and the one-shot fallback.
+// runTask against a fake OpenCode server: the first-response and stall watchdogs, the one-shot fallback,
+// the directory each session opens in, and the bot a task speaks as.
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, beforeEach, test } from 'node:test';
-import type { TaskRow } from '../tasks/db.js';
+import type { TaskProject, TaskRow } from '../tasks/db.js';
 
 const FIRST_MS = 2000;
 const STALL_MS = 2500;
 /** Longer than STALL_MS plus a poll, so only the running-tool rule keeps the turn alive. */
 const TOOL_MS = 5000;
 const REPLY = '<<<WECHAT_REPLY>>>\nok\n<<<WECHAT_MEMORY>>>\n- 无\n<<<WECHAT_SUMMARY>>>\nok';
+const FACT = '用户喜欢简短的回复';
 
-type Script = 'silent' | 'answer' | 'provider-error' | 'rejected' | 'child-stall' | 'child-tool';
+type Script = 'silent' | 'answer' | 'remember' | 'provider-error' | 'rejected' | 'child-stall' | 'child-tool';
 
 interface FakeSession {
   id: string;
   parentID?: string;
   script?: Script;
   model?: unknown;
+  /** The location.directory the session was created with. */
+  directory?: string;
   prompt?: string;
   messages: any[];
   interrupted: boolean;
@@ -43,16 +47,17 @@ function addSession(fields: Partial<FakeSession> = {}): FakeSession {
   return session;
 }
 
-function answer(session: FakeSession): void {
+function answer(session: FakeSession, text = REPLY): void {
   const now = Date.now();
   const time = { created: now, streamed: now, completed: now };
-  session.messages.push(message('assistant', { time, content: [{ type: 'text', text: REPLY }] }), idle('succeeded'));
+  session.messages.push(message('assistant', { time, content: [{ type: 'text', text }] }), idle('succeeded'));
 }
 
 /** What a root session does once its prompt arrives. */
 const play: Record<Script, (session: FakeSession) => void> = {
   silent: () => {},
   answer: (s) => later(100, () => answer(s)),
+  remember: (s) => later(100, () => answer(s, REPLY.replace('- 无', `- ${FACT}`))),
   'provider-error': (s) =>
     later(100, () => s.messages.push(idle('failed', { type: 'provider.internal', message: 'control plan is unavailable' }))),
   rejected: (s) => later(100, () => s.messages.push(idle('failed', { type: 'permission.rejected', message: 'rejected' }))),
@@ -87,7 +92,8 @@ function handle(req: IncomingMessage, res: ServerResponse): void {
     const send = (data: unknown) => void res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ data }));
     if (url.pathname === '/api/session') {
       if (req.method === 'GET') return send(sessions.filter((s) => s.parentID === url.searchParams.get('parentID')));
-      return send({ id: addSession({ model: JSON.parse(body).model, script: scripts.shift() }).id });
+      const { model, location } = JSON.parse(body);
+      return send({ id: addSession({ model, directory: location?.directory, script: scripts.shift() }).id });
     }
     const [, , , id, action] = url.pathname.split('/');
     const session = sessions.find((s) => s.id === id);
@@ -123,14 +129,21 @@ await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
 process.env.OPENCODE_URL = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 
 // provider.ts reads its settings at module load, so the bot modules load after the fake server is up.
-const { runTask } = await import('../orchestrator.js');
+const { resultText, runTask } = await import('../orchestrator.js');
 const { openStateDb } = await import('../tasks/db.js');
 const db = openStateDb(join(tmp, 'state.db'));
 
-/** Run one task through the given session scripts; stopAfterMs does what /stop does. */
-async function run(plan: Script[], stopAfterMs?: number) {
+interface RunOptions {
+  /** Does what /stop does after this long. */
+  stopAfterMs?: number;
+  project?: TaskProject;
+  botId?: string;
+}
+
+/** Run one task through the given session scripts. */
+async function run(plan: Script[], { stopAfterMs, project, botId }: RunOptions = {}) {
   scripts.push(...plan);
-  const task = db.startTaskNow('test', 'hi')!;
+  const task = db.startTaskNow('test', 'hi', project, botId)!;
   const controller = new AbortController();
   if (stopAfterMs !== undefined) {
     later(stopAfterMs, () => {
@@ -202,10 +215,35 @@ test('other failures are not retried', async () => {
 });
 
 test('a stopped task is not retried', async () => {
-  const { task, delivered, roots } = await run(['silent', 'answer'], 500);
+  const { task, delivered, roots } = await run(['silent', 'answer'], { stopAfterMs: 500 });
   assert.equal(task.status, 'interrupted');
   assert.equal(task.error, '用户停止');
   assert.equal(roots.length, 1);
   assert.ok(roots[0].interrupted);
   assert.equal(delivered.length, 0);
+});
+
+test('a project task opens its sessions at the repo root, any other task in the account workspace', async () => {
+  const workspace = join(tmp, 'workspace');
+  db.ensureUser('test', 'wx');
+  db.setWorkspace('test', workspace);
+  const project = { id: 'medo', dir: join(tmp, 'medo') };
+  const { roots } = await run(['provider-error', 'answer'], { project });
+  assert.deepEqual(roots.map((s) => s.directory), [project.dir, project.dir], 'the retry stays in the repo');
+  sessions.length = 0;
+  assert.deepEqual((await run(['answer'])).roots.map((s) => s.directory), [workspace]);
+});
+
+test('a task speaks as its bot: the persona in the prompt, the reply prefix, and where its memory goes', async () => {
+  const memory = join(tmp, 'data', 'memory', 'test');
+  const research = await run(['remember'], { botId: 'research' });
+  assert.match(research.roots[0].prompt ?? '', /<persona>\nid: research\n/);
+  assert.equal(resultText(research.task), '研究：ok');
+  assert.match(readFileSync(join(memory, 'bots', 'research.md'), 'utf-8'), new RegExp(`^- \\[\\d{4}-\\d{2}-\\d{2}\\] ${FACT}$`, 'm'));
+  sessions.length = 0;
+  const chief = await run(['remember']);
+  assert.match(chief.roots[0].prompt ?? '', /<persona>\nid: chief\n/);
+  assert.doesNotMatch(chief.roots[0].prompt ?? '', new RegExp(FACT), "the default bot does not read another bot's memory");
+  assert.equal(resultText(chief.task), 'ok');
+  assert.match(readFileSync(join(memory, 'MEMORY.md'), 'utf-8'), new RegExp(FACT));
 });

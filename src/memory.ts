@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import type { Bot } from './bots.js';
 import { DATA_DIR } from './constants.js';
 
 const MEMORY_ROOT = join(DATA_DIR, 'memory');
@@ -23,13 +24,17 @@ function validateAccountId(accountId: string): void {
   }
 }
 
-export function memoryPath(accountId: string): string {
+/**
+ * The default bot keeps the account's shared memory, which every bot reads; any other bot keeps its
+ * own file under bots/ as well. Bot ids are plain file names (see bots.ts).
+ */
+export function memoryPath(accountId: string, bot?: Bot): string {
   validateAccountId(accountId);
-  return join(MEMORY_ROOT, accountId, 'MEMORY.md');
+  const dir = join(MEMORY_ROOT, accountId);
+  return !bot || bot.default ? join(dir, 'MEMORY.md') : join(dir, 'bots', `${bot.id}.md`);
 }
 
-function readBullets(accountId: string): string[] {
-  const file = memoryPath(accountId);
+function readBullets(file: string): string[] {
   if (!existsSync(file)) return [];
   return readFileSync(file, 'utf-8')
     .split('\n')
@@ -42,10 +47,10 @@ function bulletContent(bullet: string): string {
 }
 
 /** Newest memory bullets that fit in 8 KB, oldest first. Empty string if there are none. */
-export function readMemory(accountId: string): string {
+export function readMemory(file: string): string {
   const kept: string[] = [];
   let size = 0;
-  const bullets = readBullets(accountId);
+  const bullets = readBullets(file);
   for (let i = bullets.length - 1; i >= 0; i--) {
     size += Buffer.byteLength(bullets[i]) + 1;
     if (size > READ_LIMIT_BYTES) break;
@@ -54,14 +59,14 @@ export function readMemory(accountId: string): string {
   return kept.join('\n');
 }
 
-export function memoryStats(accountId: string): { bullets: number; bytes: number } {
-  const bullets = readBullets(accountId);
+export function memoryStats(file: string): { bullets: number; bytes: number } {
+  const bullets = readBullets(file);
   return { bullets: bullets.length, bytes: Buffer.byteLength(bullets.join('\n')) };
 }
 
 /** Append durable facts as dated bullets. Skips exact duplicates and drops the oldest past 16 KB. */
-export function appendMemory(accountId: string, facts: string[], date: Date = new Date()): number {
-  const bullets = readBullets(accountId);
+export function appendMemory(file: string, facts: string[], date: Date = new Date()): number {
+  const bullets = readBullets(file);
   const seen = new Set(bullets.map(bulletContent));
   const day = DAY_FORMAT.format(date);
 
@@ -79,8 +84,7 @@ export function appendMemory(accountId: string, facts: string[], date: Date = ne
     bullets.shift();
   }
 
-  const file = memoryPath(accountId);
-  mkdirSync(join(MEMORY_ROOT, accountId), { recursive: true, mode: 0o700 });
+  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
   const tmp = `${file}.tmp`;
   writeFileSync(tmp, HEADER + bullets.join('\n') + '\n', { encoding: 'utf-8', mode: 0o600 });
   renameSync(tmp, file);

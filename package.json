@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "postinstall": "npm run build",
+    "typecheck": "tsc --noEmit",
     "start": "node dist/main.js",
     "dev": "tsc --watch",
     "test": "node --test dist/tests/*.test.js",

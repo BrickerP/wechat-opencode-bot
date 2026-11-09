@@ -1,3 +1,4 @@
+import { isReadOnlyBot } from './bots.js';
 import { resultText, runTask, type TaskIO } from './orchestrator.js';
 import { pingOpenCode } from './opencode/provider.js';
 import { routeMessage } from './projects.js';
@@ -21,14 +22,16 @@ export async function runSimulate(text: string): Promise<number> {
   const accountId = SIMULATE_ACCOUNT;
   const db = openStateDb();
   const { input, project, botId } = routeMessage(db, accountId, text);
+  // As in the daemon: a read-only bot's task runs on the read agent.
+  const lane = isReadOnlyBot(botId) ? 'read' : 'write';
 
-  let task = db.startTaskNow(accountId, input, project, botId);
+  let task = db.startTaskNow(accountId, input, project, botId, lane);
   while (!task) {
     console.log('[simulate] 已有任务在运行，2 秒后重试...');
     await new Promise((resolve) => setTimeout(resolve, RETRY_MS));
-    task = db.startTaskNow(accountId, input, project, botId);
+    task = db.startTaskNow(accountId, input, project, botId, lane);
   }
-  console.log(`[simulate] task ${task.id} (#${task.seq}) bot=${task.bot_id ?? '-'} project=${task.project_id ?? '-'}`);
+  console.log(`[simulate] task ${task.id} (#${task.seq}) bot=${task.bot_id ?? '-'} project=${task.project_id ?? '-'} lane=${task.lane}`);
 
   const io: TaskIO = {
     async deliver(task) {

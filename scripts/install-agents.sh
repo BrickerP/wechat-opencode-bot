@@ -8,6 +8,12 @@ usage() { echo "Usage: scripts/install-agents.sh [--apply]"; }
 REPO="$(cd "$(dirname "$0")/.." && pwd -P)"
 DATA_DIR="${OWB_DATA_DIR:-$HOME/.wechat-opencode-bot}"
 SRC_DIR="$REPO/current/config/agents"
+# A source checkout has no release yet: link its config/agents. After a deploy, rerun this script so the
+# links follow current/config/agents and a release brings its own prompts.
+if [ ! -d "$SRC_DIR" ]; then
+  SRC_DIR="$REPO/config/agents"
+  echo "install-agents: no release under current/; linking the repo's config/agents" >&2
+fi
 AGENTS_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/agents"
 # Not inside AGENTS_DIR: OpenCode loads .md files in its subdirectories, hidden ones too, as agents.
 BACKUP="$DATA_DIR/backups/agents-$(date +%Y%m%d-%H%M%S)"
@@ -22,7 +28,7 @@ esac
 if [ $# -gt 1 ]; then usage >&2; exit 2; fi
 
 if [ ! -d "$SRC_DIR" ]; then
-  echo "install-agents: $SRC_DIR is missing; deploy a release first (docs/DEPLOY.md)" >&2
+  echo "install-agents: $SRC_DIR is missing; run this from the repository" >&2
   exit 1
 fi
 

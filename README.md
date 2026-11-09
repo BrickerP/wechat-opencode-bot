@@ -2,170 +2,210 @@
 
 English | [中文](README_zh.md)
 
-Run OpenCode tasks from WeChat. Each message you send from your phone becomes a task: the bot runs it on a local OpenCode server and sends the result back. It handles text, images and permission approvals, routes messages to bots and projects, and keeps a short memory per chat.
+Send a WeChat message from your phone, get it run as a task on your local OpenCode server, and get the result back in the chat.
 
-## How it works
+## Architecture
 
+```mermaid
+flowchart LR
+  W[WeChat app] <--> I[iLink bot API]
+  I <-->|long poll / send| D[bot daemon<br/>Node.js]
+  D --> R[router<br/>allowlist, commands, @bot, @project]
+  R --> Q[(state.db<br/>tasks, routines, outbox)]
+  Q --> L1[write lane]
+  Q --> L2[read lane]
+  L1 --> O[OpenCode server<br/>127.0.0.1:4096]
+  L2 --> O
+  O --> A1[wechat-orchestrator]
+  O --> A2[wechat-orchestrator-read]
+  A1 --> S1[wechat-general / wechat-explore]
+  A2 --> S2[wechat-explore only]
 ```
-WeChat (phone) ←→ ilink bot API ←→ bot daemon (Node.js) ←→ OpenCode server (127.0.0.1:4096)
-```
 
-- The daemon long-polls the WeChat ilink bot API. It only listens to the WeChat users in `WECHAT_ALLOWED_IDS`, by default the account that ran the setup.
-- A message that is not a command becomes a task. One write task and one read task (from a read-only bot such as @research) run at a time; new messages queue behind their lane (`⏳ 已排队：任务 #N（前面还有 X 个任务）`) and run in order. A task that waits more than 24 hours expires.
-- Each task runs in a new OpenCode session on the `wechat-orchestrator` agent; a read-only bot's task runs on `wechat-orchestrator-read`, which can only start the read-only subagent. Sessions are never resumed: the bot puts the context into the prompt, namely the last 8 tasks (with reply excerpts for the latest 2) and the chat's memory.
-- A model whose gateway fails or goes silent gets one retry behind a different gateway (`OPENCODE_FALLBACK_MODEL`, or the cross-gateway chain). Three upstream failures in a row open that gateway's breaker: later tasks start on the fallback, one notice tells you, and the gateway is tried again after 10 minutes (doubling up to an hour). You only hear the final outcome.
-- Replies go out in chunks of 2048 characters. WeChat takes a reply only on a recent message token, so a reply that cannot go out waits in an outbox and is sent after your next message.
-- Images are kept for 24 hours. A text-only task that comes within 10 minutes after a task with images reuses those images.
-- A bot restart interrupts the running task with a ⏹ notice; queued tasks still run.
+### Components
 
-## Bots and projects
+| Component | Code | Role |
+|---|---|---|
+| WeChat client | `src/wechat/` | iLink long polling, sending, CDN media, account credentials |
+| Daemon | `src/main.ts`, `src/lifecycle.ts` | Wires everything up; holds `daemon.lock` so only one instance runs |
+| Commands | `src/commands/` | `/status`, `/tasks`, `/routine`, … |
+| Routing | `src/bots.ts`, `src/projects.ts`, `src/aliases.ts` | Picks the bot and the project directory for a message |
+| Task queue | `src/tasks/` | SQLite schema and migrations, queue, lanes |
+| Orchestrator | `src/orchestrator.ts` | Builds the prompt, runs the task, parses output, sends progress |
+| OpenCode client | `src/opencode/provider.ts` | OpenCode HTTP API, watchdog, error classification |
+| Model routing | `src/model-routing.ts` | Cross-gateway fallback and per-gateway breaker |
+| Delivery | `src/notify.ts` | 2048-char chunks, outbox with backoff retries |
+| Ops | `src/routines.ts`, `src/retention.ts`, `src/backup.ts`, `src/alerts.ts` | Scheduled tasks, session cleanup, daily backup, failure alerts |
+| Agents | `config/agents/*.md` | Prompts and permissions of the four OpenCode agents |
 
-### Bots
+The bot does not fork or patch OpenCode. It only calls the OpenCode HTTP API, so model quality, tools, MCP, skills and context limits all come from OpenCode and its config.
 
-`~/.wechat-opencode-bot/bots.json` lists the bots that answer in the chat. The bot writes it on first use and re-reads it for every message; invalid entries are skipped. The default roster:
+### Task lifecycle
 
-| id | Name | Aliases | Reply prefix | Hands work to |
-|---|---|---|---|---|
-| `chief` (default) | Chief | chief, 总管 | none | — |
-| `research` | 研究 | research, 研究 | 研究： | `wechat-explore` |
-| `eng` | 工程 | eng, 工程, code | 工程： | `wechat-general` |
-| `ops` | Ops | ops, 运维 | Ops： | `wechat-general` |
+1. A message from a user in `WECHAT_ALLOWED_IDS` arrives. Commands run at once; anything else becomes a task.
+2. The task goes into `state.db` and waits in its lane. The reply says where it is: `⏳ 已排队：任务 #N（前面还有 X 个任务）`.
+3. The bot opens a **new** OpenCode session in the project directory. Sessions are never reused.
+4. The prompt carries the context: the last 8 tasks (reply excerpts for the latest 2), the chat memory, the bot persona.
+5. The bot waits for the session to go idle, sending up to 4 progress messages on long tasks.
+6. It parses the output (memory facts, reply), splits it into 2048-char chunks and puts them in the outbox.
 
-- Start a message with `@alias` to pick a bot. Without one, the default bot answers; the bot is never guessed from the text.
-- `@all` or `@everyone` goes to the default bot, which runs up to 3 subagents at once and sends one merged reply.
+A task that waits more than 24 hours expires. A daemon restart stops the running task with a ⏹ notice; queued tasks still run.
 
-### Projects
+### Routing
 
-`~/.wechat-opencode-bot/projects.json` maps aliases to project directories. The bot generates it from the child directories of the working directory, plus the working directory itself when it has `.git`, `AGENTS.md` or `opencode.json`. Directory names work as aliases too; `/projects` lists them.
-
-- Start a message with `@alias`, or mention an alias of 2 or more characters anywhere, and the task runs in that project's directory.
-- The session opens at the project root, so OpenCode loads the project's own `AGENTS.md` and `opencode.json`. Their rules take precedence over memory and recent tasks.
-- Bot and project combine in either order: `@research @miaoda 看下发布流程`.
-- A short follow-up keeps the last task's project and bot for 2 hours: 32 characters or fewer, starting with a word like 继续, 接着, 然后, 再, 还有, 改一下 or 看一下. An image without text counts as a follow-up too. Start with `新话题：` to follow neither; `@base` runs in the base workspace.
-- Create recurring tasks with `/routine add <name> <schedule> <prompt>`, using `dailyHH:MM` (Asia/Shanghai) or `everyNm` / `everyNh`.
-- A project alias that collides with a bot alias is dropped.
-
-## Commands
-
-| Command | What it does |
+| Message | Goes to |
 |---|---|
-| `/status` | Show the state: working directory, recent project, default and recent bot, model, permission mode, running and queued tasks, memory. Then health: the last 24 hours' outcomes and latest failure, open gateway breakers, the outbox backlog and the message token's age |
-| `/tasks [n]` | Show the last n tasks (default 5, at most 20) |
-| `/stop` | Stop the running task(s); `/stop all` also cancels the queued ones |
-| `/routine [add\|rm\|on\|off\|run] …` | List, create, remove, toggle or run a scheduled task. `add` takes `<name> <dailyHH:MM\|everyNm\|everyNh> <prompt>` |
-| `/cwd [path]` | Show or switch the working directory. The path must exist and stay inside the `workingDirectory` set up in `config.env` |
-| `/ls` | List the working directory (up to 100 entries) |
-| `/projects` | List the projects and their aliases |
-| `/bots` | List the bots: id, aliases, reply prefix, default bot |
-| `/model [model]` | Show or switch the model, shared by all bots; `/model default` goes back to the default |
-| `/models` | List the available models |
-| `/permission [mode]` | Show or set the permission mode |
-| `/help` | Show the help |
-| `/version` (`/v`) | Show the version |
+| `@research …` | The bot with that alias |
+| `@myproj …` or a project alias (2+ chars) anywhere | That project's directory |
+| `@research @myproj …` | Both, in either order |
+| `@all` / `@everyone` | Default bot, up to 3 subagents at once, one merged reply |
+| `继续…` / `接着…` / `再…` (≤ 32 chars, within 2 h) | Same bot and project as the last task |
+| `新话题：…` | No follow-up; `@base` runs in the base workspace |
 
-## Routines
+The session opens at the project root, so the project's own `AGENTS.md` and `opencode.json` load natively and take precedence over the injected memory. The bot is never guessed from the text.
 
-`/routine add 早报 daily09:00 汇总昨天的工作` queues the prompt as a normal task at 09:00 Asia/Shanghai. `everyNm` and `everyNh` repeat from the last slot (5 minutes to 24 hours); timestamps use the same fixed UTC+8 clock. A routine never runs two tasks at once, and the runs it misses while the bot is down are not made up. Its results go through the normal outbox, so without a recent message token they wait for your next message.
+### Concurrency lanes
 
-## Permission approval
+- Each WeChat account has one **write lane** and one **read lane**; each runs one task at a time.
+- Tasks for read-only bots (such as `research`) use the read lane and run on `wechat-orchestrator-read`, which can only start `wechat-explore`.
+- Read-only is an agent permission rule, not a sandbox.
 
-When OpenCode asks to do something that needs approval, the bot sends the request to WeChat, naming the task (`🔐 任务 #N（bot）请求权限：…`). Reply `y` to allow (also `yes`, `ok`, `是`, `允许`, `同意`) or `n` to deny (also `no`, `否`, `拒绝`). No reply within 120 seconds denies the request. When both lanes ask, the requests wait in order and each reply answers the oldest; a fourth waiting request is denied at once.
+### Model routing and resilience
+
+- Default model: `oneapi/DeepSeek-V4.1-Flash`; `/model` switches it for all bots.
+- Gateway errors (5xx, 429, timeout, no first response, stall) get **one** retry on another gateway (`OPENCODE_FALLBACK_MODEL` or the built-in chain). Auth, 4xx and permission denials are not retried.
+- Three upstream failures in a row open that gateway's breaker for 10 minutes, doubling up to 1 hour. Meanwhile new tasks start on the fallback.
+- Subagents without a `model:` inherit the parent's model, so a fallback moves the whole task tree.
+- Three failed tasks in 30 minutes send one alert to WeChat.
+
+### State and retention
+
+| Data | Where | Kept |
+|---|---|---|
+| Tasks, routines, chat settings, outbox | `state.db` (SQLite, WAL) | Backed up daily |
+| OpenCode sessions | OpenCode server | Deleted through the API after 7 days; newest 300 always kept |
+| Memory | `memory/<account>/MEMORY.md`, `memory/<account>/bots/<id>.md` | 16 KB cap per file, 8 KB per prompt |
+| Images | `attachments/` | 24 hours |
+
+Schema changes only add columns and tables, so an older release can read a newer `state.db`.
+
+### Permissions
+
+OpenCode permission requests go to WeChat as `🔐 任务 #N（bot）请求权限：…`. Reply `y` / `n`; no reply in 120 s denies. Requests from both lanes queue per account, oldest answered first; a fourth waiting request is denied at once.
 
 | Mode | Behavior |
 |---|---|
-| `default` | Each request goes to WeChat for a y/n reply |
-| `acceptEdits` | File edits are approved automatically; other requests go to WeChat |
-| `plan` | Every request is denied |
-| `auto` | Every request is approved (dangerous) |
+| `default` | Ask in WeChat |
+| `acceptEdits` | File edits auto-approved; the rest asked |
+| `plan` | Deny everything |
+| `auto` | Approve everything (dangerous) |
 
-The bot reads the mode for each request, so `/permission` also changes the task that is running. The mode is saved in `config.env`.
+With `auto`, a WeChat account becomes a remote shell. Keep the allowlist tight and switch to `plan` when idle.
 
-## Memory
+### Repo layout
 
-- `memory/<account>/MEMORY.md` in the data directory is the chat's shared memory. Every bot reads it; the default bot writes it.
-- Each other bot also keeps its own file, `memory/<account>/bots/<id>.md`.
-- A task can save up to 5 facts of up to 300 characters each, and the bot dates them.
-- Each file adds up to 8 KB to the prompt, and is capped at 16 KB.
+```
+src/            daemon, routing, orchestrator, queue, OpenCode and WeChat clients
+src/tests/      node:test suites (fake OpenCode server)
+config/agents/  OpenCode agent prompts
+config/launchd/ launchd jobs for the bot and the OpenCode server
+scripts/        release, deploy, rollback, healthcheck, install-agents, install-launchd
+docs/DEPLOY.md  release, deploy, rollback, migration
+```
 
-## Requirements
+## Usage
 
-- macOS for the always-on setup with launchd ([docs/DEPLOY.md](docs/DEPLOY.md)). The bot itself is plain Node.js.
-- Node.js 26. CI and the live bot use it; `node:sqlite` needs at least 22.13.
-- [OpenCode](https://opencode.ai), served with `opencode serve` on 127.0.0.1:4096.
-- A personal WeChat account, bound by QR code.
+### Requirements
 
-## Setup
+- Node.js 22.13+ (`node:sqlite`); CI uses Node 26.
+- [OpenCode](https://opencode.ai) running `opencode serve` on `127.0.0.1:4096`.
+- A personal WeChat account to bind by QR code.
+- macOS for the always-on launchd setup; the bot itself is plain Node.js.
+
+### Setup
 
 ```bash
-git clone <repo> wechat-opencode-bot
+git clone <repo-url> wechat-opencode-bot
 cd wechat-opencode-bot
 npm ci
 npm run build
-npm run setup     # scan the QR code with WeChat, then enter the working directory
+scripts/install-agents.sh --apply   # link the four agents into OpenCode (this checkout, or current/ after a deploy)
+npm run setup                        # scan the QR code, then choose the working directory
 ```
 
-Put the settings in `~/.wechat-opencode-bot/env` (mode 600). The bot loads it at startup, and the launchd wrappers source it.
+Put settings in `~/.wechat-opencode-bot/env` (mode 600). The bot loads it at startup and the launchd wrappers source it. After a release deploy, rerun `install-agents.sh` so the links follow `current/` and each release ships its own prompts.
+
+### Run
+
+| Goal | Command |
+|---|---|
+| Try one task without WeChat | `node dist/main.js --simulate "列出工作目录"` |
+| Run in the foreground | `node dist/main.js --daemon` |
+| Print status / recent tasks | `node dist/main.js --status` / `--tasks 10` |
+| Push a message to WeChat | `node dist/main.js --notify "text"` |
+| Always on (launchd), release, rollback | See [docs/DEPLOY.md](docs/DEPLOY.md) |
+
+### Commands
+
+| Command | What it does |
+|---|---|
+| `/status` | State and health: lanes, queue, model, permission mode, 24 h outcomes, breakers, outbox, token age |
+| `/tasks [n]` | Last n tasks (default 5, max 20) |
+| `/stop [all]` | Stop the running task; `all` also cancels the queue |
+| `/routine [add\|rm\|on\|off\|run]` | Manage scheduled tasks |
+| `/cwd [path]`, `/ls` | Show or switch the working directory, list it |
+| `/projects`, `/bots` | List project and bot aliases |
+| `/model [name\|default]`, `/models` | Show, switch or list models |
+| `/permission [mode]` | Show or set the permission mode |
+| `/help`, `/version` | Help, version |
+
+### Addressing examples
+
+```
+@eng 修一下登录页的报错
+@research @myproj 看下发布流程
+继续，把测试也补上
+新话题：查一下今天的天气
+```
+
+Bots live in `~/.wechat-opencode-bot/bots.json` (default roster: `chief`, `research`, `eng`, `ops`). Projects live in `projects.json`, generated from the working directory's child directories.
+
+### Routines
+
+```
+/routine add 早报 daily09:00 汇总昨天的工作
+/routine add 巡检 every30m 检查服务健康
+```
+
+`dailyHH:MM` uses Asia/Shanghai; `everyNm` / `everyNh` range from 5 minutes to 24 hours. A routine never overlaps itself and does not make up runs missed while the bot was down.
+
+### Environment
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OPENCODE_URL` | `http://127.0.0.1:4096` | The OpenCode server |
-| `OPENCODE_SERVER_PASSWORD` | empty | The server password, sent as Basic auth for the user `opencode` |
-| `WECHAT_ALLOWED_IDS` | the bound account | WeChat user ids the bot listens to, comma-separated |
-| `OPENCODE_FALLBACK_MODEL` | the cross-gateway chain (`oneapi-chat-gpt/gpt-6-astra`) | The model for the one retry; set it to override the chain |
-| `OPENCODE_DEFAULT_MODEL` | `oneapi/DeepSeek-V4.1-Flash` | The primary model routing assumes when `/model` is unset; such sessions still use the orchestrator agent's model |
-| `OWB_BREAKER_THRESHOLD`, `OWB_BREAKER_COOLDOWN_MS` | `3`, `600000` | Consecutive upstream failures that open a gateway's breaker, and its first cooldown; a failed probe doubles it, up to 1 hour |
-| `OWB_FAILURE_ALERT_COUNT`, `OWB_FAILURE_ALERT_WINDOW_MS`, `OWB_FAILURE_ALERT_COOLDOWN_MS` | `3`, `1800000`, `1800000` | Failed tasks within the window that send one alert to WeChat, the window, and how long the next alert waits |
-| `OWB_SESSION_TTL_DAYS`, `OWB_SESSION_KEEP` | `7`, `300` | Delete a finished task's OpenCode session after this many days through the API, always keeping the newest N sessions |
-| `OPENCODE_FIRST_RESPONSE_TIMEOUT_MS`, `OPENCODE_STALL_TIMEOUT_MS` | `120000`, `180000` | How long the model may take to start answering, and then between signs of progress |
+| `OPENCODE_URL` | `http://127.0.0.1:4096` | OpenCode server |
+| `OPENCODE_SERVER_PASSWORD` | empty | Basic auth password for user `opencode` |
+| `WECHAT_ALLOWED_IDS` | the bound account | Allowed WeChat user ids, comma-separated |
+| `OPENCODE_DEFAULT_MODEL` | `oneapi/DeepSeek-V4.1-Flash` | Primary model assumed for routing |
+| `OPENCODE_FALLBACK_MODEL` | built-in cross-gateway chain | Model for the one retry |
+| `OPENCODE_FIRST_RESPONSE_TIMEOUT_MS` / `OPENCODE_STALL_TIMEOUT_MS` | `120000` / `180000` | Watchdog limits |
+| `OWB_BREAKER_THRESHOLD` / `OWB_BREAKER_COOLDOWN_MS` | `3` / `600000` | Gateway breaker |
+| `OWB_FAILURE_ALERT_COUNT` / `_WINDOW_MS` / `_COOLDOWN_MS` | `3` / `1800000` / `1800000` | Failure alerts |
+| `OWB_SESSION_TTL_DAYS` / `OWB_SESSION_KEEP` | `7` / `300` | Session retention |
+| `OWB_LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn` or `error` |
+| `OWB_DATA_DIR` | `~/.wechat-opencode-bot` | Data directory (`accounts/`, `config.env`, `logs/` stay in the default) |
 
-Try one task without WeChat with `node dist/main.js --simulate "列出工作目录"`, or run the bot in the foreground with `node dist/main.js --daemon`. For the always-on setup with launchd, releases and rollback, follow [docs/DEPLOY.md](docs/DEPLOY.md).
+### Troubleshooting
 
-## CLI
-
-| `node dist/main.js …` | What it does |
+| Symptom | Check |
 |---|---|
-| `--setup` | Bind a WeChat account by QR code and set the working directory |
-| `--daemon` | Run the bot in the foreground; launchd runs this. It takes `daemon.lock`, so a second one prints `already running (pid N)` and exits |
-| `--status` | Print the bot's state, like `/status` |
-| `--tasks [n]` | Print the last n tasks |
-| `--simulate "<text>"` | Run one task in this process as if it came from WeChat, and print the reply. It needs the OpenCode server and keeps its own task history and memory under the account `simulate` |
-| `--notify "<text>"` | Send a message to WeChat. If it cannot go out now, it waits in the outbox |
-| `--help` | Show the help |
-
-The bot has no start or stop command of its own: launchd keeps it running. Restart it with `launchctl kickstart -k gui/$(id -u)/com.yupeng.opencode-wechat-bot` and stop it with `launchctl bootout gui/$(id -u)/com.yupeng.opencode-wechat-bot`, see [docs/DEPLOY.md](docs/DEPLOY.md#launchd). Stop a bot that runs in the foreground with Ctrl-C.
-
-## Data directory
-
-`~/.wechat-opencode-bot/`, or `$OWB_DATA_DIR` if set:
-
-```
-accounts/         WeChat account credentials
-attachments/      images, kept 24 hours
-backups/          written by the deploy scripts
-bots.json         the bot roster
-config.env        workingDirectory and permissionMode
-daemon.lock       held by the running bot: its pid, start time and entry
-env               settings for the bot and the OpenCode server (mode 600)
-get_updates_buf   WeChat polling cursor
-logs/             the bot's daily logs (3 kept) and the launchd logs
-memory/           memory per chat and bot
-projects.json     project aliases
-state.db          tasks, routines, chat settings and the outbox (SQLite)
-```
-
-`accounts/`, `config.env` and `logs/` always live in `~/.wechat-opencode-bot/`, even when `OWB_DATA_DIR` points elsewhere.
-
-## Development
-
-```bash
-npm run dev         # tsc --watch
-npm run typecheck   # tsc --noEmit
-npm run build
-npm test            # runs the compiled tests in dist/tests, so build first
-```
-
-CI runs typecheck, build, test and a gitleaks scan on every push and pull request to `main`. Releases and deploys are covered in [docs/DEPLOY.md](docs/DEPLOY.md).
+| No reply at all | `node dist/main.js --status`; logs in `~/.wechat-opencode-bot/logs/` |
+| `already running (pid N)` | Another daemon holds `daemon.lock`; stop it first |
+| Routine or `--notify` result never arrives | WeChat needs a recent message token; send any message and the outbox flushes |
+| Tasks fail with auth errors | Check `OPENCODE_SERVER_PASSWORD` matches the server |
+| Every task uses the fallback model | A breaker is open; `/status` shows which gateway and when it retries |
+| New agent not found | Re-run `scripts/install-agents.sh --apply`, then reload the server: `opencode reload --server http://127.0.0.1:4096` |
 
 ## License
 
-MIT
+MIT. Based on [zsxink/wechat-opencode-bot](https://github.com/zsxink/wechat-opencode-bot).

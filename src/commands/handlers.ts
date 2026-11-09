@@ -1,15 +1,17 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { BOTS_PATH, defaultBot, loadBots, type Bot } from '../bots.js';
+import { BOTS_PATH, defaultBot, detectBot, isReadOnlyBot, loadBots, type Bot } from '../bots.js';
 import { loadConfig, saveConfig, type PermissionMode } from '../config.js';
+import { logger } from '../logger.js';
 import { memoryPath, memoryStats } from '../memory.js';
 import { breaker } from '../model-routing.js';
 import { clip, formatElapsed, formatTime, STATUS_LABEL } from '../orchestrator.js';
 import { formatModelRef, listModels, resolveModelRef } from '../opencode/provider.js';
 import type { PermissionBroker } from '../permission.js';
-import { isRealPathInside, loadProjects, PROJECTS_PATH } from '../projects.js';
-import type { StateDb, TaskRow } from '../tasks/db.js';
+import { detectProject, isRealPathInside, loadProjects, PROJECTS_PATH, resolveProjectDir, stripProjectPrefix } from '../projects.js';
+import { formatSchedule, nextRunText, parseSchedule, type Schedule } from '../routines.js';
+import type { RoutineRow, StateDb, TaskRow } from '../tasks/db.js';
 import type { TaskQueue } from '../tasks/queue.js';
 
 export interface CommandContext {
@@ -25,6 +27,13 @@ const DEFAULT_TASKS = 5;
 const MAX_TASKS = 20;
 const MAX_LS_ENTRIES = 100;
 const DAY_MS = 24 * 60 * 60 * 1000;
+/** How often the daemon looks for due routines, so a routine runs up to this late. */
+export const ROUTINE_TICK_MS = 30_000;
+/** Typed in commands, so plain and short. Names are lowercased first: a phone keyboard capitalizes the first letter. */
+const ROUTINE_NAME = /^[a-z0-9_-]{1,24}$/;
+const ROUTINE_ADD_USAGE = '用法：/routine add <名称> <dailyHH:MM|everyNm> <内容>';
+const ROUTINE_USAGE = `${ROUTINE_ADD_USAGE}\n/routine rm|on|off|run <名称>：删除、启用、停用、立即运行`;
+const SCHEDULE_FORMS = 'daily09:00（每天，北京时间）、every30m（每 N 分钟，N ≥ 5）、every2h（每 N 小时，N ≤ 24）';
 
 const HELP_TEXT = `可用命令：
 
@@ -33,6 +42,11 @@ const HELP_TEXT = `可用命令：
   /tasks [数量]     查看最近的任务（默认 5 个）
   /stop             停止所有正在运行的任务
   /stop all         同时取消所有排队的任务
+
+定时任务（北京时间）：
+  /routine          查看定时任务
+  /routine add <名称> <时间> <内容>  时间如 daily09:00、every30m、every2h
+  /routine rm|on|off|run <名称>  删除、启用、停用、立即运行
 
 工作目录与项目：
   /cwd [路径]       查看或切换工作目录
@@ -54,7 +68,8 @@ Bot：
 直接发送文字或图片即创建任务；任务运行时新消息会排队，按顺序执行。只读 bot（如 @research）的任务单独排队，不等其他任务；它们只读不改，要改文件请发给其他 bot（如 @eng）。
 以 @bot 别名开头指定由哪个 bot 回复，@all 交给默认 bot 统筹，不指定时由默认 bot 回复（发送 /bots 查看）。
 以 @别名 开头或提到项目别名，任务就在该项目目录运行；可同时指定 bot 和项目，顺序不限，如 @research @miaoda 看下发布流程。
-以“继续”这类词开头的简短追问沿用上一个任务的项目和 bot（2 小时内）；以“新话题：”开头则都不沿用，以 @base 开头则在工作目录运行。`;
+以“继续”这类词开头的简短追问沿用上一个任务的项目和 bot（2 小时内）；以“新话题：”开头则都不沿用，以 @base 开头则在工作目录运行。
+定时任务到点创建普通任务，内容可以带 @bot 和 @项目；它的上一个任务还没结束就跳过这次，bot 停机期间错过的只补一次。结果发不出去时，会在你下一条消息后补发。`;
 
 const PERMISSION_MODES: Record<PermissionMode, string> = {
   default: '需要审批的操作发到微信，回复 y/n',
@@ -175,6 +190,97 @@ export function parseTaskLimit(args: string): number {
   const n = Number.parseInt(args, 10);
   return n > 0 ? Math.min(n, MAX_TASKS) : DEFAULT_TASKS;
 }
+
+/** One routine as /routine shows it: name, on or off, schedule and next run, then its input as the user wrote it. */
+function describeRoutine(r: RoutineRow, defaultBotId: string): string {
+  const when = r.enabled ? `${formatSchedule(r.schedule)}（下次 ${nextRunText(r.next_run_at)}）` : formatSchedule(r.schedule);
+  const input = `@${r.bot_id ?? defaultBotId} ${r.project_id ? `@${r.project_id} ` : ''}${clip(r.prompt, 30)}`;
+  return `${r.name} [${r.enabled ? '启用' : '停用'}] ${when} ${input}`;
+}
+
+/**
+ * Queue the routine's task the way its message would have been: its bot, its project, the bot's lane. The
+ * routine then counts as run at now. Shared by the scheduler and /routine run.
+ */
+function queueRoutine(db: StateDb, routine: RoutineRow, schedule: Schedule, now: number): { task: TaskRow; nextRunAt: number } {
+  const project = routine.project_id && routine.project_dir ? { id: routine.project_id, dir: routine.project_dir } : undefined;
+  const lane = isReadOnlyBot(routine.bot_id) ? 'read' : 'write';
+  const { task } = db.createTask(routine.account_id, routine.prompt, null, project, routine.bot_id ?? undefined, lane, routine.id);
+  const nextRunAt = schedule.nextRunAt(now, routine.next_run_at);
+  db.markRoutineRun(routine.id, nextRunAt, now);
+  // Not the prompt: it is the user's, like a message.
+  logger.info('Routine queued', { routineId: routine.id, name: routine.name, taskId: task.id, seq: task.seq, lane });
+  return { task, nextRunAt };
+}
+
+/**
+ * The scheduler, which the daemon runs every ROUTINE_TICK_MS: queue a task for each of the account's due
+ * routines, unless the routine's last task is still queued or running. Either way the routine moves on to its
+ * next slot, so neither a long task nor a stopped bot piles runs up. Never throws; returns the tasks it queued.
+ */
+export function tickRoutines(db: StateDb, accountId: string, kick: () => void, now: number = Date.now()): TaskRow[] {
+  const queued: TaskRow[] = [];
+  try {
+    // The queue runs the daemon's account only.
+    for (const routine of db.dueRoutines(now).filter((r) => r.account_id === accountId)) {
+      const fields = { routineId: routine.id, name: routine.name };
+      const schedule = parseSchedule(routine.schedule);
+      if (!schedule) {
+        // Only a hand edit stores one /routine add rejects; due on every tick, it would never run.
+        db.setRoutineEnabled(routine.id, false);
+        logger.warn('Routine disabled: unknown schedule', { ...fields, schedule: routine.schedule });
+        continue;
+      }
+      if (db.hasOpenRoutineTask(routine.id)) {
+        db.markRoutineRun(routine.id, schedule.nextRunAt(now, routine.next_run_at), routine.last_run_at);
+        logger.info('Routine skipped: its last task is still open', fields);
+        continue;
+      }
+      queued.push(queueRoutine(db, routine, schedule, now).task);
+      kick();
+    }
+  } catch (err) {
+    logger.warn('Routine tick failed', { error: String(err) });
+  }
+  return queued;
+}
+
+/** The first word and the rest, both trimmed; the rest keeps its line breaks. */
+function splitWord(text: string): [string, string] {
+  const [, word, rest] = /^(\S*)\s*([\s\S]*)$/.exec(text.trim())!;
+  return [word, rest];
+}
+
+/** /routine add <name> <schedule> <prompt>. The prompt is routed like a message, except that it never follows the last task. */
+function createRoutine(db: StateDb, accountId: string, args: string, now: number): string {
+  const [word, tail] = splitWord(args);
+  const [when, text] = splitWord(tail);
+  const name = word.toLowerCase();
+  if (!name || !when || !text) return `⚠️ ${ROUTINE_ADD_USAGE}`;
+  if (!ROUTINE_NAME.test(name)) return '⚠️ 名称只能用小写字母、数字、_ 和 -，最多 24 个字符';
+  const schedule = parseSchedule(when);
+  if (!schedule) return `⚠️ 无法识别的时间：${when}\n可用：${SCHEDULE_FORMS}`;
+  const bots = loadBots();
+  const defaultBotId = defaultBot(bots).id;
+  const first = detectBot(text, bots);
+  // As with a message, a prompt that no "@bot" opened may name its bot after "@project".
+  const opened = first.botId !== defaultBotId || first.input !== text;
+  const base = loadConfig().workingDirectory;
+  const project = detectProject(first.input, loadProjects(base, PROJECTS_PATH, bots), null);
+  const rest = project ? stripProjectPrefix(first.input, project) : first.input;
+  const { botId, input } = opened ? { botId: first.botId, input: rest } : detectBot(rest, bots);
+  const added = db.addRoutine(accountId, {
+    name,
+    prompt: input,
+    schedule: schedule.spec,
+    nextRunAt: schedule.nextRunAt(now),
+    botId,
+    project: project ? { id: project.id, dir: resolveProjectDir(base, project) } : undefined,
+  });
+  if (!added) return `⚠️ 已有名为 ${name} 的定时任务：先 /routine rm ${name}，或换个名称`;
+  return `✅ 已添加定时任务 ${describeRoutine(added, defaultBotId)}\n💡 结果发不出去时会进入待发队列，在你下一条消息后补发`;
+}
+
 const version: Handler = () => {
   try {
     const pkg = join(fileURLToPath(new URL('.', import.meta.url)), '..', '..', 'package.json');
@@ -210,6 +316,45 @@ export const handlers: Record<string, Handler> = {
     }
     if (lines.length) return lines.join('\n');
     return all ? '没有运行中或排队的任务' : '没有运行中的任务';
+  },
+
+  routine(args, { accountId, db, queue }) {
+    const [word, rest] = splitWord(args);
+    const action = word.toLowerCase() || 'list';
+    const now = Date.now();
+    if (action === 'add') return createRoutine(db, accountId, rest, now);
+    if (action === 'list') {
+      const routines = db.routines(accountId);
+      if (!routines.length) return `还没有定时任务。${ROUTINE_ADD_USAGE}`;
+      const defaultBotId = defaultBot(loadBots()).id;
+      return ['⏰ 定时任务（北京时间）：', ...routines.map((r) => `- ${describeRoutine(r, defaultBotId)}`)].join('\n');
+    }
+    const name = splitWord(rest)[0].toLowerCase();
+    if (!name || !['rm', 'on', 'off', 'run'].includes(action)) return ROUTINE_USAGE;
+    const found = db.routine(accountId, name);
+    if (!found) return `⚠️ 没有名为 ${name} 的定时任务，发送 /routine 查看`;
+    if (action === 'rm') {
+      db.removeRoutine(found.id);
+      return `🗑 已删除定时任务 ${name}${db.hasOpenRoutineTask(found.id) ? '；它已创建的任务照常运行' : ''}`;
+    }
+    if (action === 'off') {
+      db.setRoutineEnabled(found.id, false);
+      return `⏸ 已停用定时任务 ${name}`;
+    }
+    const schedule = parseSchedule(found.schedule);
+    if (!schedule) return `⚠️ 定时任务 ${name} 的时间无法识别：${found.schedule}，请删除后重新添加`;
+    if (action === 'on') {
+      const next = schedule.nextRunAt(now);
+      db.setRoutineEnabled(found.id, true, next);
+      return `✅ 已启用定时任务 ${name}，下次 ${nextRunText(next)}`;
+    }
+    // run: one task at a time, as on schedule.
+    if (db.hasOpenRoutineTask(found.id)) return `⏳ 定时任务 ${name} 的上一个任务还在排队或运行，这次不再创建`;
+    const { task, nextRunAt } = queueRoutine(db, found, schedule, now);
+    const ahead = db.countAhead(accountId, task.id);
+    queue.kick(accountId);
+    const waiting = ahead ? `（前面还有 ${ahead} 个任务）` : '';
+    return `▶️ 定时任务 ${name} 已创建任务 #${task.seq}${waiting}${found.enabled ? `，下次 ${nextRunText(nextRunAt)}` : ''}`;
   },
 
   cwd(args, { accountId, db }) {

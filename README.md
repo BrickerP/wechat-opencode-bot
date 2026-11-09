@@ -41,7 +41,8 @@ WeChat (phone) ←→ ilink bot API ←→ bot daemon (Node.js) ←→ OpenCode 
 - Start a message with `@alias`, or mention an alias of 2 or more characters anywhere, and the task runs in that project's directory.
 - The session opens at the project root, so OpenCode loads the project's own `AGENTS.md` and `opencode.json`. Their rules take precedence over memory and recent tasks.
 - Bot and project combine in either order: `@research @miaoda 看下发布流程`.
-- A short follow-up keeps the last task's project for 2 hours: 32 characters or fewer, starting with a word like 继续, 接着, 然后, 再, 还有, 改一下 or 看一下. An image without text counts as a follow-up too.
+- A short follow-up keeps the last task's project and bot for 2 hours: 32 characters or fewer, starting with a word like 继续, 接着, 然后, 再, 还有, 改一下 or 看一下. An image without text counts as a follow-up too. Start with `新话题：` to follow neither; `@base` runs in the base workspace.
+- Create recurring tasks with `/routine add <name> <schedule> <prompt>`, using `dailyHH:MM` (Asia/Shanghai) or `everyNm` / `everyNh`.
 - A project alias that collides with a bot alias is dropped.
 
 ## Commands
@@ -50,7 +51,8 @@ WeChat (phone) ←→ ilink bot API ←→ bot daemon (Node.js) ←→ OpenCode 
 |---|---|
 | `/status` | Show the state: working directory, recent project, default and recent bot, model, permission mode, running and queued tasks, memory. Then health: the last 24 hours' outcomes and latest failure, open gateway breakers, the outbox backlog and the message token's age |
 | `/tasks [n]` | Show the last n tasks (default 5, at most 20) |
-| `/stop` | Stop the running task; `/stop all` also cancels the queued ones |
+| `/stop` | Stop the running task(s); `/stop all` also cancels the queued ones |
+| `/routine [add\|rm\|on\|off\|run] …` | List, create, remove, toggle or run a scheduled task. `add` takes `<name> <dailyHH:MM\|everyNm\|everyNh> <prompt>` |
 | `/cwd [path]` | Show or switch the working directory. The path must exist and stay inside the `workingDirectory` set up in `config.env` |
 | `/ls` | List the working directory (up to 100 entries) |
 | `/projects` | List the projects and their aliases |
@@ -60,6 +62,10 @@ WeChat (phone) ←→ ilink bot API ←→ bot daemon (Node.js) ←→ OpenCode 
 | `/permission [mode]` | Show or set the permission mode |
 | `/help` | Show the help |
 | `/version` (`/v`) | Show the version |
+
+## Routines
+
+`/routine add 早报 daily09:00 汇总昨天的工作` queues the prompt as a normal task at 09:00 Asia/Shanghai. `everyNm` and `everyNh` repeat from the last slot (5 minutes to 24 hours); timestamps use the same fixed UTC+8 clock. A routine never runs two tasks at once, and the runs it misses while the bot is down are not made up. Its results go through the normal outbox, so without a recent message token they wait for your next message.
 
 ## Permission approval
 

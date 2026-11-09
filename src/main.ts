@@ -4,7 +4,7 @@ import { createInterface } from 'node:readline';
 import { mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-import { formatStatus, formatTasks, parseTaskLimit, type CommandContext } from './commands/handlers.js';
+import { formatStatus, formatTasks, parseTaskLimit, ROUTINE_TICK_MS, tickRoutines, type CommandContext } from './commands/handlers.js';
 import { isCommand, routeCommand } from './commands/router.js';
 import { loadConfig, saveConfig } from './config.js';
 import { DATA_DIR } from './constants.js';
@@ -152,6 +152,10 @@ async function runDaemon(): Promise<void> {
   // a crash, and notices whose send failed.
   void notifier.flush(accountId);
   queue.start(accountId);
+  // Only the daemon runs routines: --simulate, --status and --notify never queue their tasks. A tick never throws.
+  const tickRoutine = () => tickRoutines(db, accountId, () => queue.kick(accountId));
+  tickRoutine();
+  setInterval(tickRoutine, ROUTINE_TICK_MS).unref();
 
   async function handleMessage(msg: WeixinMessage): Promise<void> {
     if (msg.message_type !== MessageType.USER || !msg.from_user_id || !msg.item_list) return;

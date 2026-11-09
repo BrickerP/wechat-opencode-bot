@@ -45,6 +45,8 @@ export interface TaskRow {
   bot_id: string | null;
   /** read for a read-only bot's task; write for every other task, older rows included. */
   lane: TaskLane;
+  /** Routine that queued the task; null for a message's task, older rows included. */
+  routine_id: string | null;
   /** 1-based position of the task in the account's history (computed). */
   seq: number;
 }
@@ -67,6 +69,31 @@ export interface NoticeRow {
   attempts: number;
   /** Earliest time the next send may be attempted (epoch ms). */
   next_at: number;
+}
+
+/** A recurring task: when next_run_at comes, the daemon queues prompt as a task of the account (see routines.ts). */
+export interface RoutineRow {
+  id: string;
+  account_id: string;
+  /** What the user calls it in /routine; unique per account. */
+  name: string;
+  /** The task input, its "@bot" and "@alias" already stripped. */
+  prompt: string;
+  /** Bot its tasks speak as, routed when the routine was added. */
+  bot_id: string | null;
+  /** Registry project its tasks run in; null runs them in the account's workspace. */
+  project_id: string | null;
+  /** Absolute repo root of project_id when the routine was added. */
+  project_dir: string | null;
+  /** Canonical schedule, such as daily09:00 or every30m. */
+  schedule: string;
+  /** 1 while the scheduler runs it; /routine off sets 0. */
+  enabled: number;
+  /** When the routine is next due (epoch ms). */
+  next_run_at: number;
+  /** When it last queued a task; null before its first run. */
+  last_run_at: number | null;
+  created_at: number;
 }
 
 export const STATE_DB_PATH = join(DATA_DIR, 'state.db');
@@ -176,6 +203,26 @@ export function openStateDb(file: string = STATE_DB_PATH) {
       if (!hasColumn('tasks', 'lane')) db.exec("ALTER TABLE tasks ADD COLUMN lane TEXT NOT NULL DEFAULT 'write'");
       db.exec('PRAGMA user_version = 6');
     }
+    if (version < 7) {
+      // Routines queue a task on a schedule; the task points back at its routine. Older tasks came from messages.
+      db.exec(`CREATE TABLE IF NOT EXISTS routines (
+        id TEXT PRIMARY KEY,
+        account_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        bot_id TEXT,
+        project_id TEXT,
+        project_dir TEXT,
+        schedule TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        next_run_at INTEGER NOT NULL,
+        last_run_at INTEGER,
+        created_at INTEGER NOT NULL,
+        UNIQUE(account_id, name)
+      )`);
+      if (!hasColumn('tasks', 'routine_id')) db.exec('ALTER TABLE tasks ADD COLUMN routine_id TEXT');
+      db.exec('PRAGMA user_version = 7');
+    }
   });
 
   const getTask = (id: string) => one<TaskRow>(`${TASK_SELECT} WHERE t.id = ?`, id);
@@ -190,13 +237,15 @@ export function openStateDb(file: string = STATE_DB_PATH) {
     project: TaskProject | null = null,
     botId: string | null = null,
     lane: TaskLane = 'write',
+    routineId: string | null = null,
   ): TaskRow {
     const id = randomUUID();
     const now = Date.now();
     run(
-      `INSERT INTO tasks (id, account_id, input, status, created_at, started_at, message_id, project_id, project_dir, bot_id, lane)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO tasks (id, account_id, input, status, created_at, started_at, message_id, project_id, project_dir, bot_id, lane, routine_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       id, accountId, input, status, now, status === 'running' ? now : null, messageId, project?.id ?? null, project?.dir ?? null, botId, lane,
+      routineId,
     );
     return getTask(id)!;
   }
@@ -236,8 +285,9 @@ export function openStateDb(file: string = STATE_DB_PATH) {
     getTask,
 
     /**
-     * Queue a task for an inbound message. iLink can deliver a message again, and the monitor forgets
-     * what it saw on restart: the same message id returns the existing task with created: false.
+     * Queue a task for an inbound message, or for a routine (routineId, no message). iLink can deliver a message
+     * again, and the monitor forgets what it saw on restart: the same message id returns the existing task with
+     * created: false.
      */
     createTask(
       accountId: string,
@@ -246,6 +296,7 @@ export function openStateDb(file: string = STATE_DB_PATH) {
       project?: TaskProject,
       botId?: string,
       lane?: TaskLane,
+      routineId?: string,
     ): { task: TaskRow; created: boolean } {
       return immediate(() => {
         const existing =
@@ -253,7 +304,7 @@ export function openStateDb(file: string = STATE_DB_PATH) {
             ? undefined
             : one<TaskRow>(`${TASK_SELECT} WHERE t.account_id = ? AND t.message_id = ?`, accountId, messageId);
         if (existing) return { task: existing, created: false };
-        return { task: insertTask(accountId, input, 'queued', messageId, project, botId, lane), created: true };
+        return { task: insertTask(accountId, input, 'queued', messageId, project, botId, lane, routineId), created: true };
       });
     },
 
@@ -470,6 +521,52 @@ export function openStateDb(file: string = STATE_DB_PATH) {
     markNoticeFailed(id: number, attempts: number, nextAt: number): void {
       run('UPDATE pending_notices SET attempts = ?, next_at = ? WHERE id = ?', attempts, nextAt, id);
     },
+
+    // ── routines ─────────────────────────────────────────────────────────
+    /** Returns the new routine, or null when the account already has one of that name. */
+    addRoutine(
+      accountId: string,
+      routine: { name: string; prompt: string; schedule: string; nextRunAt: number; botId?: string; project?: TaskProject },
+    ): RoutineRow | null {
+      const id = randomUUID();
+      const out = run(
+        `INSERT INTO routines (id, account_id, name, prompt, bot_id, project_id, project_dir, schedule, next_run_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(account_id, name) DO NOTHING`,
+        id, accountId, routine.name, routine.prompt, routine.botId ?? null, routine.project?.id ?? null,
+        routine.project?.dir ?? null, routine.schedule, routine.nextRunAt, Date.now(),
+      );
+      return Number(out.changes) === 1 ? one<RoutineRow>('SELECT * FROM routines WHERE id = ?', id)! : null;
+    },
+
+    /** The account's routines, on or off, by name. */
+    routines: (accountId: string) => all<RoutineRow>('SELECT * FROM routines WHERE account_id = ? ORDER BY name', accountId),
+
+    routine: (accountId: string, name: string) =>
+      one<RoutineRow>('SELECT * FROM routines WHERE account_id = ? AND name = ?', accountId, name),
+
+    /** Its tasks stay, a queued one included. Returns false if it was gone already. */
+    removeRoutine: (id: string): boolean => Number(run('DELETE FROM routines WHERE id = ?', id).changes) === 1,
+
+    /** Enabling passes nextRunAt, so the routine counts from then; disabling keeps the stale one. */
+    setRoutineEnabled(id: string, enabled: boolean, nextRunAt?: number): void {
+      run(
+        'UPDATE routines SET enabled = ?, next_run_at = COALESCE(?, next_run_at) WHERE id = ?',
+        enabled ? 1 : 0, nextRunAt ?? null, id,
+      );
+    },
+
+    /** Enabled routines of every account whose time has come, the longest due first. */
+    dueRoutines: (now: number) =>
+      all<RoutineRow>('SELECT * FROM routines WHERE enabled = 1 AND next_run_at <= ? ORDER BY next_run_at, rowid', now),
+
+    /** lastRunAt stays as it was when the scheduler skipped the run. */
+    markRoutineRun(id: string, nextRunAt: number, lastRunAt: number | null): void {
+      run('UPDATE routines SET next_run_at = ?, last_run_at = ? WHERE id = ?', nextRunAt, lastRunAt, id);
+    },
+
+    /** A routine runs one task at a time: true while one of its tasks is queued or running. */
+    hasOpenRoutineTask: (routineId: string): boolean =>
+      one("SELECT 1 FROM tasks WHERE routine_id = ? AND status IN ('queued', 'running')", routineId) !== undefined,
   };
 }
 

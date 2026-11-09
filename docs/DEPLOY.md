@@ -178,6 +178,10 @@ It also prints the bot's command line, its working directory and where `current`
 
 Subagents have no `model:` in their agent files, so OpenCode runs them on the parent session's model and a task that fell back stays on one gateway from start to finish.
 
+## Routines
+
+The daemon checks for due routines every 30 seconds (`ROUTINE_TICK_MS` in `src/commands/handlers.ts`). A routine queues one task at a time; if its previous task is still queued or running, that slot is skipped, and runs missed while the bot was down are not made up. Schedules use Asia/Shanghai (UTC+8, no DST). Results are ordinary tasks: they reach the chat through the outbox, so without a recent `context_token` they wait for the next inbound message.
+
 ## CI
 
 `.github/workflows/ci.yml` runs on every push and pull request to `main`:

@@ -163,3 +163,12 @@ export function detectBot(text: string, bots: Bot[] = loadBots()): { botId: stri
 export function resolveBot(botId: string | null, bots: Bot[] = loadBots()): { bot: Bot; all: boolean } {
   return { bot: bots.find((bot) => bot.id === botId) ?? defaultBot(bots), all: botId === ALL_BOTS };
 }
+
+/**
+ * A read-only bot's tasks run in the read lane, beside a write task: a specialist that prefers wechat-explore.
+ * "@all", the default bot, removed bots and rows from before bots write.
+ */
+export function isReadOnlyBot(botId: string | null, bots: Bot[] = loadBots()): boolean {
+  const { bot } = resolveBot(botId, bots);
+  return !bot.default && bot.subagent === 'wechat-explore';
+}

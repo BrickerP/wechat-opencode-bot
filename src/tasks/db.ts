@@ -6,6 +6,9 @@ import { DATA_DIR } from '../constants.js';
 
 export type TaskStatus = 'queued' | 'running' | 'done' | 'failed' | 'interrupted';
 export type FinishedStatus = Exclude<TaskStatus, 'queued' | 'running'>;
+/** An account runs one task per lane at a time, so a read-only task does not wait for a write task. */
+export const TASK_LANES = ['write', 'read'] as const;
+export type TaskLane = (typeof TASK_LANES)[number];
 
 export interface UserRow {
   account_id: string;
@@ -39,6 +42,8 @@ export interface TaskRow {
   project_dir: string | null;
   /** Bot the message was addressed to: a registry id, or "all" for "@all". Null (older rows) means the default bot. */
   bot_id: string | null;
+  /** read for a read-only bot's task; write for every other task, older rows included. */
+  lane: TaskLane;
   /** 1-based position of the task in the account's history (computed). */
   seq: number;
 }
@@ -165,11 +170,16 @@ export function openStateDb(file: string = STATE_DB_PATH) {
       if (!hasColumn('pending_notices', 'next_at')) db.exec('ALTER TABLE pending_notices ADD COLUMN next_at INTEGER DEFAULT 0');
       db.exec('PRAGMA user_version = 5');
     }
+    if (version < 6) {
+      // Lanes: a read-only task runs beside a write task. Every older task was a write.
+      if (!hasColumn('tasks', 'lane')) db.exec("ALTER TABLE tasks ADD COLUMN lane TEXT NOT NULL DEFAULT 'write'");
+      db.exec('PRAGMA user_version = 6');
+    }
   });
 
   const getTask = (id: string) => one<TaskRow>(`${TASK_SELECT} WHERE t.id = ?`, id);
-  const hasRunning = (accountId: string) =>
-    one(`SELECT 1 FROM tasks WHERE account_id = ? AND status = 'running'`, accountId) !== undefined;
+  const hasRunning = (accountId: string, lane: TaskLane) =>
+    one(`SELECT 1 FROM tasks WHERE account_id = ? AND lane = ? AND status = 'running'`, accountId, lane) !== undefined;
 
   function insertTask(
     accountId: string,
@@ -178,13 +188,14 @@ export function openStateDb(file: string = STATE_DB_PATH) {
     messageId: string | null = null,
     project: TaskProject | null = null,
     botId: string | null = null,
+    lane: TaskLane = 'write',
   ): TaskRow {
     const id = randomUUID();
     const now = Date.now();
     run(
-      `INSERT INTO tasks (id, account_id, input, status, created_at, started_at, message_id, project_id, project_dir, bot_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      id, accountId, input, status, now, status === 'running' ? now : null, messageId, project?.id ?? null, project?.dir ?? null, botId,
+      `INSERT INTO tasks (id, account_id, input, status, created_at, started_at, message_id, project_id, project_dir, bot_id, lane)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      id, accountId, input, status, now, status === 'running' ? now : null, messageId, project?.id ?? null, project?.dir ?? null, botId, lane,
     );
     return getTask(id)!;
   }
@@ -233,6 +244,7 @@ export function openStateDb(file: string = STATE_DB_PATH) {
       messageId: string | null = null,
       project?: TaskProject,
       botId?: string,
+      lane?: TaskLane,
     ): { task: TaskRow; created: boolean } {
       return immediate(() => {
         const existing =
@@ -240,22 +252,24 @@ export function openStateDb(file: string = STATE_DB_PATH) {
             ? undefined
             : one<TaskRow>(`${TASK_SELECT} WHERE t.account_id = ? AND t.message_id = ?`, accountId, messageId);
         if (existing) return { task: existing, created: false };
-        return { task: insertTask(accountId, input, 'queued', messageId, project, botId), created: true };
+        return { task: insertTask(accountId, input, 'queued', messageId, project, botId, lane), created: true };
       });
     },
 
-    /** Insert a task directly as running (--simulate), unless the account already has a running task. */
-    startTaskNow(accountId: string, input: string, project?: TaskProject, botId?: string): TaskRow | null {
-      return immediate(() => (hasRunning(accountId) ? null : insertTask(accountId, input, 'running', null, project, botId)));
+    /** Insert a task directly as running (--simulate), unless its lane already has a running task. */
+    startTaskNow(accountId: string, input: string, project?: TaskProject, botId?: string, lane: TaskLane = 'write'): TaskRow | null {
+      return immediate(() =>
+        hasRunning(accountId, lane) ? null : insertTask(accountId, input, 'running', null, project, botId, lane),
+      );
     },
 
-    /** Atomically move the oldest queued task to running; null if busy or nothing queued. */
-    claimNextTask(accountId: string): TaskRow | null {
+    /** Atomically move the lane's oldest queued task to running; null if the lane is busy or has nothing queued. */
+    claimNextTask(accountId: string, lane: TaskLane): TaskRow | null {
       return immediate(() => {
-        if (hasRunning(accountId)) return null;
+        if (hasRunning(accountId, lane)) return null;
         const next = one<{ id: string }>(
-          "SELECT id FROM tasks WHERE account_id = ? AND status = 'queued' ORDER BY rowid LIMIT 1",
-          accountId,
+          "SELECT id FROM tasks WHERE account_id = ? AND lane = ? AND status = 'queued' ORDER BY rowid LIMIT 1",
+          accountId, lane,
         );
         if (!next) return null;
         run("UPDATE tasks SET status = 'running', started_at = ? WHERE id = ?", Date.now(), next.id);
@@ -263,15 +277,16 @@ export function openStateDb(file: string = STATE_DB_PATH) {
       });
     },
 
-    runningTask: (accountId: string) =>
-      one<TaskRow>(`${TASK_SELECT} WHERE t.account_id = ? AND t.status = 'running'`, accountId),
+    /** The running tasks, at most one per lane, oldest first. */
+    runningTasks: (accountId: string) =>
+      all<TaskRow>(`${TASK_SELECT} WHERE t.account_id = ? AND t.status = 'running' ORDER BY t.rowid`, accountId),
 
-    /** Tasks that will run before the given one: the running task plus older queued tasks. */
+    /** Tasks that will run before the given one: its lane's running task plus the lane's older queued tasks. */
     countAhead(accountId: string, taskId: string): number {
       return one<{ n: number }>(
-        `SELECT COUNT(*) AS n FROM tasks WHERE account_id = ? AND id != ?
+        `SELECT COUNT(*) AS n FROM tasks WHERE account_id = ? AND id != ? AND lane = (SELECT lane FROM tasks WHERE id = ?)
            AND (status = 'running' OR (status = 'queued' AND rowid < (SELECT rowid FROM tasks WHERE id = ?)))`,
-        accountId, taskId, taskId,
+        accountId, taskId, taskId, taskId,
       )!.n;
     },
 

@@ -1,5 +1,5 @@
-// /status health: the last 24 hours' outcomes and latest failure, the open breakers, the outbox backlog and
-// the message token's age, never the token itself.
+// /status: the running task of each lane, and its health: the last 24 hours' outcomes and latest failure, the
+// open breakers, the outbox backlog and the message token's age, never the token itself.
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -91,10 +91,25 @@ test('/status of a quiet account: nothing failed, no breaker open, no outbox lin
   resetModelRouting();
   db.ensureUser('quiet', 'wx-quiet');
   const status = await routeCommand('/status', { accountId: 'quiet', db } as CommandContext);
+  assert.match(status, /^▶️ 运行中: 无$/m);
   assert.match(status, /^🩺 24小时: 完成 0，失败 0，中断 0$/m);
   assert.match(status, /^🧯 熔断: 无$/m);
   assert.doesNotMatch(status, /📮/);
   assert.match(status, /^🔑 消息令牌: 无$/m);
+});
+
+test('/status shows the running task of each lane, oldest first, with its lane', () => {
+  const { task: write } = db.createTask('busy', '跑下测试', null, undefined, 'eng');
+  const { task: read } = db.createTask('busy', '看下日志', null, undefined, 'research', 'read');
+  assert.match(formatStatus(db, 'busy'), /^▶️ 运行中: 无$/m, 'queued tasks are not running');
+  db.claimNextTask('busy', 'read');
+  db.claimNextTask('busy', 'write');
+  raw.prepare('UPDATE tasks SET started_at = ? WHERE id = ?').run(Date.now() - 3 * MINUTE, write.id);
+  raw.prepare('UPDATE tasks SET started_at = ? WHERE id = ?').run(Date.now() - 40_000, read.id);
+  assert.match(
+    formatStatus(db, 'busy'),
+    /^▶️ 运行中: #1 @eng 跑下测试（write，已运行 3分钟）；#2 @research 看下日志（read，已运行 40秒）$/m,
+  );
 });
 
 test('--status has no breaker state to show, so it says where to look instead of "无"', () => {

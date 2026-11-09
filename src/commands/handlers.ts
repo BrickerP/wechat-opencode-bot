@@ -31,7 +31,7 @@ const HELP_TEXT = `可用命令：
 任务：
   /status           查看当前状态（含 24 小时统计、熔断、待补发通知和消息令牌更新时间）
   /tasks [数量]     查看最近的任务（默认 5 个）
-  /stop             停止正在运行的任务
+  /stop             停止所有正在运行的任务
   /stop all         同时取消所有排队的任务
 
 工作目录与项目：
@@ -51,7 +51,7 @@ Bot：
   /help             显示帮助
   /version          查看版本
 
-直接发送文字或图片即创建任务；任务运行时新消息会排队，按顺序执行。
+直接发送文字或图片即创建任务；任务运行时新消息会排队，按顺序执行。只读 bot（如 @research）的任务单独排队，不等其他任务。
 以 @bot 别名开头指定由哪个 bot 回复，@all 交给默认 bot 统筹，不指定时由默认 bot 回复（发送 /bots 查看）。
 以 @别名 开头或提到项目别名，任务就在该项目目录运行；可同时指定 bot 和项目，顺序不限，如 @research @miaoda 看下发布流程。
 以“继续”这类词开头的简短追问沿用上一个任务的项目和 bot（2 小时内）；以“新话题：”开头则都不沿用，以 @base 开头则在工作目录运行。`;
@@ -126,11 +126,13 @@ export function formatStatus(db: StateDb, accountId: string, gateways?: Gateway[
   const config = loadConfig();
   const user = db.getUser(accountId);
   const counts = db.statusCounts(accountId);
-  const running = db.runningTask(accountId);
   const total = Object.values(counts).reduce((sum, n) => sum + n, 0);
   const bots = loadBots();
   const primary = defaultBot(bots);
   const now = Date.now();
+  const running = db
+    .runningTasks(accountId)
+    .map((t) => `#${t.seq} ${taskInput(t, 30, primary.id)}（${t.lane}，已运行 ${formatElapsed(t.started_at ?? t.created_at, now)}）`);
   const lines = [
     `📂 工作目录: ${user?.workspace || config.workingDirectory}`,
     `📁 最近项目: ${lastProject(db, accountId)}`,
@@ -138,9 +140,7 @@ export function formatStatus(db: StateDb, accountId: string, gateways?: Gateway[
     `💬 最近 bot: ${lastBot(db, accountId, primary.id)}`,
     `🤖 模型: ${user?.model || '默认'}`,
     `🔒 权限模式: ${config.permissionMode ?? 'default'}`,
-    running
-      ? `▶️ 运行中: #${running.seq} ${taskInput(running, 30, primary.id)}（已运行 ${formatElapsed(running.started_at ?? running.created_at)}）`
-      : '▶️ 运行中: 无',
+    `▶️ 运行中: ${running.join('；') || '无'}`,
     `⏳ 排队: ${counts.queued} 个`,
     `📊 累计: ${total} 个任务（完成 ${counts.done}，失败 ${counts.failed}，中断 ${counts.interrupted}）`,
     `🧠 记忆: ${memoryCounts(accountId, bots)}`,
@@ -194,13 +194,15 @@ export const handlers: Record<string, Handler> = {
   stop(args, { accountId, db, queue, broker }) {
     const all = args.toLowerCase() === 'all';
     const lines: string[] = [];
-    const running = db.runningTask(accountId);
-    // Finish the row first: the runner then sees the task already finished and stays quiet.
-    // This reply is the user's notice, so the outbox skips the task.
-    if (running && db.finishTask(running.id, 'interrupted', { error: '用户停止', notified: true })) {
+    // Finish the rows first: the runners then see their tasks already finished and stay quiet.
+    // This reply is the user's notice, so the outbox skips the tasks.
+    const stopped = db
+      .runningTasks(accountId)
+      .filter((t) => db.finishTask(t.id, 'interrupted', { error: '用户停止', notified: true }));
+    if (stopped.length) {
       broker.rejectPending(accountId);
       queue.stop(accountId);
-      lines.push(`⏹ 已停止任务 #${running.seq}`);
+      lines.push(`⏹ 已停止：任务 ${stopped.map((t) => `#${t.seq}`).join('、')}`);
     }
     if (all) {
       const cancelled = db.cancelQueued(accountId, '用户取消');

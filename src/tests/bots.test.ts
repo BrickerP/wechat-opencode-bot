@@ -16,7 +16,7 @@ process.env.OWB_DATA_DIR = join(tmp, 'data');
 mkdirSync(join(tmp, '.wechat-opencode-bot'));
 writeFileSync(join(tmp, '.wechat-opencode-bot', 'config.env'), `workingDirectory=${tmp}\n`);
 
-const { BOTS_PATH, detectBot, loadBots, resolveBot } = await import('../bots.js');
+const { BOTS_PATH, detectBot, isReadOnlyBot, loadBots, resolveBot } = await import('../bots.js');
 const { appendMemory, memoryPath, readMemory } = await import('../memory.js');
 const { composePrompt, resultText } = await import('../orchestrator.js');
 const { openStateDb } = await import('../tasks/db.js');
@@ -121,6 +121,12 @@ test('"@all" tasks, rows from before bots and removed bots speak as the default 
   assert.deepEqual(resolveBot('removed', bots), { bot: chief, all: false });
 });
 
+test('only a specialist that prefers wechat-explore is read-only; everyone else writes', () => {
+  assert.equal(isReadOnlyBot('research', bots), true);
+  for (const botId of ['chief', 'eng', 'ops', 'all', null, 'removed']) assert.equal(isReadOnlyBot(botId, bots), false, String(botId));
+  assert.equal(isReadOnlyBot('research', [{ ...research, default: true }]), false, 'the default bot writes even if it prefers explore');
+});
+
 test('a v3 database gains bot_id and keeps its rows; new tasks store their bot', () => {
   const file = join(tmp, 'v3.db');
   const { task } = openStateDb(file).createTask('acc', 'old task');
@@ -128,7 +134,7 @@ test('a v3 database gains bot_id and keeps its rows; new tasks store their bot',
   raw.exec('ALTER TABLE tasks DROP COLUMN bot_id; PRAGMA user_version = 3;');
   const db = openStateDb(file);
   assert.ok(raw.prepare("SELECT name FROM pragma_table_info('tasks')").all().some((c) => c.name === 'bot_id'));
-  assert.equal((raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 5);
+  assert.equal((raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 6);
   raw.close();
   assert.deepEqual([db.getTask(task.id)?.input, db.getTask(task.id)?.bot_id], ['old task', null]);
   assert.equal(openStateDb(file).getTask(task.id)?.input, 'old task', 'opening again changes nothing');

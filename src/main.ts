@@ -9,6 +9,7 @@ import { isCommand, routeCommand } from './commands/router.js';
 import { loadConfig, saveConfig } from './config.js';
 import { DATA_DIR } from './constants.js';
 import { backupStateDb } from './backup.js';
+import { isReadOnlyBot } from './bots.js';
 import { acquireDaemonLock, lockHolder, releaseDaemonLock } from './lifecycle.js';
 import { logger } from './logger.js';
 import { createNotifier, runNotify } from './notify.js';
@@ -195,7 +196,9 @@ async function runDaemon(): Promise<void> {
     const { input: body, project, botId } = routeMessage(db, accountId, text);
     const input = image ? (body ? `${IMAGE_ONLY_INPUT} ${body}` : IMAGE_ONLY_INPUT) : body;
     const messageId = msg.message_id ? String(msg.message_id) : null;
-    const { task, created } = db.createTask(accountId, input, messageId, project, botId);
+    // A read-only bot's task runs in its own lane and does not wait for a running write task.
+    const lane = isReadOnlyBot(botId) ? 'read' : 'write';
+    const { task, created } = db.createTask(accountId, input, messageId, project, botId, lane);
     if (!created) {
       logger.debug('Duplicate message ignored', { messageId, taskId: task.id, seq: task.seq });
       return;
@@ -207,6 +210,7 @@ async function runDaemon(): Promise<void> {
       seq: task.seq,
       project: task.project_id,
       bot: task.bot_id,
+      lane: task.lane,
       inputLength: input.length,
       image: Boolean(image),
       ahead,

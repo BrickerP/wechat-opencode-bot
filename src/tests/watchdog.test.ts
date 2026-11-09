@@ -1,6 +1,6 @@
 // runTask against a fake OpenCode server: the first-response and stall watchdogs, the one-shot fallback to
 // another gateway and the breaker that skips a failing one, the progress notes of a long task, the directory
-// each session opens in, and the bot a task speaks as.
+// each session opens in, the bot a task speaks as, and the orchestrator agent of each lane.
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
@@ -8,7 +8,7 @@ import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, beforeEach, test } from 'node:test';
-import type { TaskProject, TaskRow } from '../tasks/db.js';
+import type { TaskLane, TaskProject, TaskRow } from '../tasks/db.js';
 
 const FIRST_MS = 2000;
 const STALL_MS = 2500;
@@ -37,6 +37,8 @@ interface FakeSession {
   parentID?: string;
   script?: Script;
   model?: unknown;
+  /** The agent the session was created with. */
+  agent?: string;
   /** The location.directory the session was created with. */
   directory?: string;
   prompt?: string;
@@ -110,8 +112,8 @@ function handle(req: IncomingMessage, res: ServerResponse): void {
     const send = (data: unknown) => void res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ data }));
     if (url.pathname === '/api/session') {
       if (req.method === 'GET') return send(sessions.filter((s) => s.parentID === url.searchParams.get('parentID')));
-      const { model, location } = JSON.parse(body);
-      return send({ id: addSession({ model, directory: location?.directory, script: scripts.shift() }).id });
+      const { model, agent, location } = JSON.parse(body);
+      return send({ id: addSession({ model, agent, directory: location?.directory, script: scripts.shift() }).id });
     }
     const [, , , id, action] = url.pathname.split('/');
     const session = sessions.find((s) => s.id === id);
@@ -164,14 +166,15 @@ interface RunOptions {
   stopAfterMs?: number;
   project?: TaskProject;
   botId?: string;
+  lane?: TaskLane;
   /** Every progress note fails to send, as a reply does while WeChat is unreachable. */
   progressFails?: boolean;
 }
 
 /** Run one task through the given session scripts. */
-async function run(plan: Script[], { stopAfterMs, project, botId, progressFails }: RunOptions = {}) {
+async function run(plan: Script[], { stopAfterMs, project, botId, lane, progressFails }: RunOptions = {}) {
   scripts.push(...plan);
-  const task = db.startTaskNow('test', 'hi', project, botId)!;
+  const task = db.startTaskNow('test', 'hi', project, botId, lane)!;
   const controller = new AbortController();
   if (stopAfterMs !== undefined) {
     later(stopAfterMs, () => {
@@ -346,4 +349,12 @@ test('a task speaks as its bot: the persona in the prompt, the reply prefix, and
   assert.doesNotMatch(chief.roots[0].prompt ?? '', new RegExp(FACT), "the default bot does not read another bot's memory");
   assert.equal(resultText(chief.task), 'ok');
   assert.match(readFileSync(join(memory, 'MEMORY.md'), 'utf-8'), new RegExp(FACT));
+});
+
+test('a read-lane task runs on the read-only orchestrator, its retry too; a write task on the full one', async () => {
+  const read = await run(['provider-error', 'answer'], { botId: 'research', lane: 'read' });
+  assert.equal(read.task.status, 'done');
+  assert.deepEqual(read.roots.map((s) => s.agent), ['wechat-orchestrator-read', 'wechat-orchestrator-read']);
+  sessions.length = 0;
+  assert.deepEqual((await run(['answer'])).roots.map((s) => s.agent), ['wechat-orchestrator']);
 });

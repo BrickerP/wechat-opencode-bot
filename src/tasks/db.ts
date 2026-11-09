@@ -300,12 +300,12 @@ export function openStateDb(file: string = STATE_DB_PATH) {
         : all<TaskRow>(`${TASK_SELECT} WHERE t.account_id = ? ORDER BY t.rowid DESC LIMIT ?`, accountId, limit);
     },
 
-    /** How long the newest done tasks ran (ms), newest first; the queue ack's ETA comes from them. */
-    recentDurations(accountId: string, limit = 10): number[] {
+    /** How long the newest done tasks (of the lane, if given) ran (ms), newest first; the queue ack's ETA comes from them. */
+    recentDurations(accountId: string, lane?: TaskLane, limit = 10): number[] {
       return all<{ ms: number }>(
-        `SELECT finished_at - started_at AS ms FROM tasks WHERE account_id = ? AND status = 'done'
+        `SELECT finished_at - started_at AS ms FROM tasks WHERE account_id = ? AND lane = COALESCE(?, lane) AND status = 'done'
            AND started_at IS NOT NULL AND finished_at IS NOT NULL AND finished_at >= started_at ORDER BY rowid DESC LIMIT ?`,
-        accountId, limit,
+        accountId, lane ?? null, limit,
       ).map((row) => row.ms);
     },
 

@@ -5,9 +5,9 @@ import { DATA_DIR } from './constants.js';
 import { logger } from './logger.js';
 
 /**
- * A persona the one WeChat bot speaks as. Personas only shape the orchestrator's prompt, its memory
- * and the reply prefix: every task still runs in the same orchestrator agent, and the repo's
- * AGENTS.md and opencode.json still come first.
+ * A persona the one WeChat bot speaks as. Personas shape the orchestrator's prompt, its memory and the
+ * reply prefix; a read-only bot's tasks also run in the read lane on the read-only orchestrator (see
+ * isReadOnlyBot). The repo's AGENTS.md and opencode.json still come first.
  */
 export interface Bot {
   /** Also names the bot's memory file, so it stays a plain lowercase file name. */

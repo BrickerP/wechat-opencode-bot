@@ -11,8 +11,8 @@ WeChat (phone) ←→ ilink bot API ←→ bot daemon (Node.js) ←→ OpenCode 
 ```
 
 - The daemon long-polls the WeChat ilink bot API. It only listens to the WeChat users in `WECHAT_ALLOWED_IDS`, by default the account that ran the setup.
-- A message that is not a command becomes a task. One task runs at a time; new messages queue (`⏳ 已排队：任务 #N（前面还有 X 个任务）`) and run in order. A task that waits more than 24 hours expires.
-- Each task runs in a new OpenCode session on the `wechat-orchestrator` agent. Sessions are never resumed: the bot puts the context into the prompt, namely the last 8 tasks (with reply excerpts for the latest 2) and the chat's memory.
+- A message that is not a command becomes a task. One write task and one read task (from a read-only bot such as @research) run at a time; new messages queue behind their lane (`⏳ 已排队：任务 #N（前面还有 X 个任务）`) and run in order. A task that waits more than 24 hours expires.
+- Each task runs in a new OpenCode session on the `wechat-orchestrator` agent; a read-only bot's task runs on `wechat-orchestrator-read`, which can only start the read-only subagent. Sessions are never resumed: the bot puts the context into the prompt, namely the last 8 tasks (with reply excerpts for the latest 2) and the chat's memory.
 - A model whose gateway fails or goes silent gets one retry behind a different gateway (`OPENCODE_FALLBACK_MODEL`, or the cross-gateway chain). Three upstream failures in a row open that gateway's breaker: later tasks start on the fallback, one notice tells you, and the gateway is tried again after 10 minutes (doubling up to an hour). You only hear the final outcome.
 - Replies go out in chunks of 2048 characters. WeChat takes a reply only on a recent message token, so a reply that cannot go out waits in an outbox and is sent after your next message.
 - Images are kept for 24 hours. A text-only task that comes within 10 minutes after a task with images reuses those images.
@@ -63,7 +63,7 @@ WeChat (phone) ←→ ilink bot API ←→ bot daemon (Node.js) ←→ OpenCode 
 
 ## Permission approval
 
-When OpenCode asks to do something that needs approval, the bot sends the request to WeChat. Reply `y` to allow (also `yes`, `ok`, `是`, `允许`, `同意`) or `n` to deny (also `no`, `否`, `拒绝`). No reply within 120 seconds denies the request.
+When OpenCode asks to do something that needs approval, the bot sends the request to WeChat, naming the task (`🔐 任务 #N（bot）请求权限：…`). Reply `y` to allow (also `yes`, `ok`, `是`, `允许`, `同意`) or `n` to deny (also `no`, `否`, `拒绝`). No reply within 120 seconds denies the request. When both lanes ask, the requests wait in order and each reply answers the oldest; a fourth waiting request is denied at once.
 
 | Mode | Behavior |
 |---|---|

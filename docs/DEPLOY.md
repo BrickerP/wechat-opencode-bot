@@ -107,8 +107,9 @@ Keep `dist-roster/` until the new setup has run for a while: the undo starts it.
 
 ## Agents
 
-The bot runs tasks on the `wechat-orchestrator` agent, which hands work to `wechat-general` and `wechat-explore`. OpenCode loads all three from `~/.config/opencode/agents/`. After `scripts/install-agents.sh --apply`, those files are links into `current/config/agents/`, so a deploy brings its release's prompts and a rollback brings the old ones back.
+The bot runs write tasks on the `wechat-orchestrator` agent, which hands work to `wechat-general` and `wechat-explore`, and the read lane's tasks (read-only bots) on `wechat-orchestrator-read`, which can only hand work to `wechat-explore`. OpenCode loads all four from `~/.config/opencode/agents/`. After `scripts/install-agents.sh --apply`, those files are links into `current/config/agents/`, so a deploy brings its release's prompts and a rollback brings the old ones back.
 
+- Both orchestrators ship together in every release. `deploy.sh` creates no links, so a release that adds a prompt, such as the first with `wechat-orchestrator-read.md`, needs `scripts/install-agents.sh --apply` and a reload right after its deploy; until then OpenCode does not know the agent a read-only bot's task asks for.
 - OpenCode caches agents until it reloads them. `deploy.sh` reloads them when a release changes a prompt, and again when it rolls back. To reload by hand:
 
   ```bash
@@ -167,7 +168,7 @@ It also prints the bot's command line, its working directory and where `current`
 
 ## Model routing
 
-- `/model` sets a chat's primary model; without it the session uses the orchestrator agent's model. `OPENCODE_DEFAULT_MODEL` is only what routing assumes in that case, so keep it equal to the `model:` in `config/agents/wechat-orchestrator.md`.
+- `/model` sets a chat's primary model; without it the session uses the orchestrator agent's model. `OPENCODE_DEFAULT_MODEL` is only what routing assumes in that case, so keep it equal to the `model:` of both orchestrators in `config/agents/`.
 - An upstream failure (5xx, 429, timeout, transport, `do request failed`) retries once on a model behind another gateway: `OPENCODE_FALLBACK_MODEL` when set, otherwise the first of `oneapi-chat-gpt/gpt-6-astra`, `oneapi/DeepSeek-V4.1-Flash`, `oneapi-gemini/Gemini 4 Argon` whose provider differs from the primary.
 - Auth errors, HTTP 4xx and permission rejections are not retried, and neither is an unreachable local OpenCode server: another gateway would fail the same way.
 - 3 upstream failures in a row open that gateway's breaker for 10 minutes (`OWB_BREAKER_THRESHOLD`, `OWB_BREAKER_COOLDOWN_MS`). Later tasks start on the fallback and the chat gets one notice. A failed probe doubles the cooldown, up to an hour; a success closes the breaker. The state is in memory, so a restart starts with every breaker closed.

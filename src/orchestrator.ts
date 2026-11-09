@@ -12,6 +12,8 @@ import type { StateDb, TaskRow, TaskStatus } from './tasks/db.js';
 
 /** OpenCode agent that plans each task and delegates the work to subagent sessions. */
 export const ORCHESTRATOR_AGENT = 'wechat-orchestrator';
+/** The read lane's orchestrator: it can only delegate to wechat-explore, so it cannot write beside a write task. */
+export const ORCHESTRATOR_READ_AGENT = 'wechat-orchestrator-read';
 
 const RECENT_TASKS = 8;
 const MAX_SUMMARY_CHARS = 100;
@@ -347,7 +349,7 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
       return openCodeQuery({
         prompt: composePrompt(db, task, workspace, attachments, retry),
         cwd: workspace,
-        agent: ORCHESTRATOR_AGENT,
+        agent: task.lane === 'read' ? ORCHESTRATOR_READ_AGENT : ORCHESTRATOR_AGENT,
         model: next,
         title: `微信 #${task.seq}${retry ? ' 重试' : ''}: ${clip(task.input, 20)}`,
         files: attachments.paths,

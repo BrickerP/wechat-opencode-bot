@@ -1,9 +1,10 @@
 import { setTimeout as sleep } from 'node:timers/promises';
+import { defaultBot, loadBots } from './bots.js';
 import { logger } from './logger.js';
 import { resultText, type TaskIO } from './orchestrator.js';
 import type { PermissionRequest } from './opencode/provider.js';
 import type { PermissionBroker } from './permission.js';
-import { openStateDb, type StateDb } from './tasks/db.js';
+import { openStateDb, type StateDb, type TaskRow } from './tasks/db.js';
 import { loadLatestAccount } from './wechat/accounts.js';
 import { WeChatApi } from './wechat/api.js';
 import { createSender } from './wechat/send.js';
@@ -32,10 +33,15 @@ export function splitMessage(text: string, maxLen: number = MAX_MESSAGE_CHARS): 
   return chunks;
 }
 
-function formatPermissionRequest(request: PermissionRequest): string {
-  const lines = ['🔧 权限请求', '', `操作: ${request.action}`, `资源: ${request.resources.join(', ').slice(0, 800) || '(无)'}`];
+/** The task as an ask names it, such as "任务 #3（eng）"; rows from before bots went to the default bot. */
+const taskLabel = (task: TaskRow): string => `任务 #${task.seq}（${task.bot_id ?? defaultBot(loadBots()).id}）`;
+
+/** `ahead` asks wait before this one: y/n answers them first, so the ask says so. */
+function formatPermissionRequest(request: PermissionRequest, label: string, ahead: number): string {
+  const lines = [`🔐 ${label}请求权限：`, `操作: ${request.action}`, `资源: ${request.resources.join(', ').slice(0, 800) || '(无)'}`];
   if (request.message) lines.push(`说明: ${request.message}`);
   lines.push('', '回复 y 允许，n 拒绝', '(120秒未回复自动拒绝)');
+  if (ahead) lines.push(`⚠️ 前面还有 ${ahead} 个权限请求未回复，y/n 先回复最早的那个`);
   return lines.join('\n');
 }
 
@@ -146,7 +152,8 @@ export function createNotifier(db: StateDb, api: WeChatApi, sender: Sender) {
   }
 
   /** Daemon IO: outcomes go out through the outbox, permission asks wait for the user's y/n. */
-  function taskIO(accountId: string, broker: PermissionBroker): TaskIO {
+  function taskIO(task: TaskRow, broker: PermissionBroker): TaskIO {
+    const accountId = task.account_id;
     return {
       async deliver() {
         await flush(accountId);
@@ -157,10 +164,15 @@ export function createNotifier(db: StateDb, api: WeChatApi, sender: Sender) {
         await reply(accountId, text);
       },
       async onPermission(request) {
+        const label = taskLabel(task);
         // Register before asking so a quick answer cannot arrive ahead of the pending entry.
-        const answer = broker.createPending(accountId, request.action, request.resources.join(', '));
-        if (!(await reply(accountId, formatPermissionRequest(request)))) {
-          broker.rejectPending(accountId);
+        const answer = broker.createPending(accountId, request.action, request.resources.join(', '), label);
+        const ahead = broker.asksAhead(accountId, answer);
+        // A full queue denied it already: showing it would only point the next y/n at another task's ask.
+        if (ahead < 0) return 'reject';
+        if (!(await reply(accountId, formatPermissionRequest(request, label, ahead)))) {
+          // Only this ask: the others were shown and still wait for their answers.
+          broker.rejectPending(accountId, answer);
           return 'reject';
         }
         return (await answer) ? 'once' : 'reject';

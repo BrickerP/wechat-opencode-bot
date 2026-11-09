@@ -129,10 +129,12 @@ async function runDaemon(): Promise<void> {
   }
   const api = new WeChatApi(account.botToken, account.baseUrl);
   const notifier = createNotifier(db, api, createSender(api, accountId));
-  const broker = createPermissionBroker(() => void notifier.reply(accountId, '⏰ 权限请求超时，已自动拒绝。'));
+  const broker = createPermissionBroker(
+    (ask) => void notifier.reply(accountId, `⏰ ${ask.label ? `${ask.label}的` : ''}权限请求超时，已自动拒绝。`),
+  );
   const queue = createTaskQueue(
     db,
-    (task, signal) => runTask(db, task, notifier.taskIO(task.account_id, broker), signal),
+    (task, signal) => runTask(db, task, notifier.taskIO(task, broker), signal),
     (id) => void notifier.flush(id),
   );
   const ctx: CommandContext = { accountId, db, queue, broker };
@@ -163,8 +165,10 @@ async function runDaemon(): Promise<void> {
 
     const answer = imageItem ? undefined : ANSWERS.get(text.toLowerCase());
     if (answer !== undefined) {
+      // y/n answers the oldest ask; with both lanes asking that may not be the latest shown, so the reply names its task.
+      const ask = broker.getPending(accountId);
       if (broker.resolvePermission(accountId, answer)) {
-        await notifier.reply(accountId, answer ? '✅ 已允许' : '❌ 已拒绝');
+        await notifier.reply(accountId, `${answer ? '✅ 已允许' : '❌ 已拒绝'}${ask?.label ? `：${ask.label}` : ''}`);
         return;
       }
       if (broker.isTimedOut(accountId)) {
@@ -218,10 +222,10 @@ async function runDaemon(): Promise<void> {
     queue.kick(accountId);
     // A task that starts right away is acknowledged by the typing indicator.
     if (ahead > 0) {
-      // The ETA is a nicety: without it the ack still goes out.
+      // The ETA is a nicety: without it the ack still goes out. Only the task's own lane holds it up.
       let durations: number[] = [];
       try {
-        durations = db.recentDurations(accountId);
+        durations = db.recentDurations(accountId, task.lane);
       } catch (err) {
         logger.warn('Queue ETA unavailable', { error: String(err) });
       }

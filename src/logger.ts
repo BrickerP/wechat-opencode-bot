@@ -4,6 +4,15 @@ import { homedir } from "node:os";
 
 const LOG_DIR = join(homedir(), ".wechat-opencode-bot", "logs");
 const MAX_LOG_FILES = 3;
+const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 } as const;
+type Level = keyof typeof LEVELS;
+
+function configuredLevel(): Level {
+  const raw = (process.env.OWB_LOG_LEVEL || "info").toLowerCase();
+  return raw === "debug" || raw === "info" || raw === "warn" || raw === "error" ? raw : "info";
+}
+
+const MIN_LEVEL = LEVELS[configuredLevel()];
 
 function getLocalDate(): string {
   const now = new Date();
@@ -59,6 +68,7 @@ function getLogFilePath(): string {
 }
 
 function writeLogLine(level: string, message: string, data?: unknown): void {
+  if (LEVELS[level.toLowerCase() as Level] < MIN_LEVEL) return;
   ensureLogDir();
   const timestamp = getLocalTimestamp();
   const parts = [timestamp, level, message];

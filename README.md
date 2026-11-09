@@ -15,7 +15,7 @@ WeChat (phone) ←→ ilink bot API ←→ bot daemon (Node.js) ←→ OpenCode 
 - Each task runs in a new OpenCode session on the `wechat-orchestrator` agent. Sessions are never resumed: the bot puts the context into the prompt, namely the last 8 tasks (with reply excerpts for the latest 2) and the chat's memory.
 - A model that fails or goes silent gets one retry on `OPENCODE_FALLBACK_MODEL`. You only hear the final outcome.
 - Replies go out in chunks of 2048 characters. WeChat takes a reply only on a recent message token, so a reply that cannot go out waits in an outbox and is sent after your next message.
-- Images are kept for 24 hours. A text-only task sent within 10 minutes of a task with images reuses those images.
+- Images are kept for 24 hours. A text-only task that comes within 10 minutes after a task with images reuses those images.
 - A bot restart interrupts the running task with a ⏹ notice; queued tasks still run.
 
 ## Bots and projects
@@ -115,14 +115,14 @@ Try one task without WeChat with `node dist/main.js --simulate "列出工作目�
 | `node dist/main.js …` | What it does |
 |---|---|
 | `--setup` | Bind a WeChat account by QR code and set the working directory |
-| `--daemon` | Run the bot in the foreground and write `daemon.pid`; launchd runs this |
+| `--daemon` | Run the bot in the foreground; launchd runs this. It takes `daemon.lock`, so a second one prints `already running (pid N)` and exits |
 | `--status` | Print the bot's state, like `/status` |
 | `--tasks [n]` | Print the last n tasks |
 | `--simulate "<text>"` | Run one task in this process as if it came from WeChat, and print the reply. It needs the OpenCode server and keeps its own task history and memory under the account `simulate` |
 | `--notify "<text>"` | Send a message to WeChat. If it cannot go out now, it waits in the outbox |
 | `--help` | Show the help |
 
-`--start`, `--stop` and `npm run daemon:*` run the bot in the background without launchd. Do not use them next to launchd: `--stop` also kills whatever listens on port 4096, which is the launchd OpenCode server.
+The bot has no start or stop command of its own: launchd keeps it running. Restart it with `launchctl kickstart -k gui/$(id -u)/com.yupeng.opencode-wechat-bot` and stop it with `launchctl bootout gui/$(id -u)/com.yupeng.opencode-wechat-bot`, see [docs/DEPLOY.md](docs/DEPLOY.md#launchd). Stop a bot that runs in the foreground with Ctrl-C.
 
 ## Data directory
 
@@ -134,7 +134,7 @@ attachments/      images, kept 24 hours
 backups/          written by the deploy scripts
 bots.json         the bot roster
 config.env        workingDirectory and permissionMode
-daemon.pid        pid of the running bot
+daemon.lock       held by the running bot: its pid, start time and entry
 env               settings for the bot and the OpenCode server (mode 600)
 get_updates_buf   WeChat polling cursor
 logs/             the bot's daily logs (3 kept) and the launchd logs
@@ -143,7 +143,7 @@ projects.json     project aliases
 state.db          tasks, chat settings and the outbox (SQLite)
 ```
 
-`config.env` is always read from `~/.wechat-opencode-bot/`, even when `OWB_DATA_DIR` points elsewhere.
+`accounts/`, `config.env` and `logs/` always live in `~/.wechat-opencode-bot/`, even when `OWB_DATA_DIR` points elsewhere.
 
 ## Development
 

@@ -57,6 +57,10 @@ export interface NoticeRow {
   delivered: number;
   /** Set when the notice carries a task's outcome. */
   task_id: string | null;
+  /** Failed send attempts; drives the backoff in next_at. */
+  attempts: number;
+  /** Earliest time the next send may be attempted (epoch ms). */
+  next_at: number;
 }
 
 export const STATE_DB_PATH = join(DATA_DIR, 'state.db');
@@ -154,6 +158,12 @@ export function openStateDb(file: string = STATE_DB_PATH) {
       // Each task speaks as the bot its message named.
       if (!hasColumn('tasks', 'bot_id')) db.exec('ALTER TABLE tasks ADD COLUMN bot_id TEXT');
       db.exec('PRAGMA user_version = 4');
+    }
+    if (version < 5) {
+      // Outbox retry: a failed notice waits for its next_at instead of blocking every later flush.
+      if (!hasColumn('pending_notices', 'attempts')) db.exec('ALTER TABLE pending_notices ADD COLUMN attempts INTEGER DEFAULT 0');
+      if (!hasColumn('pending_notices', 'next_at')) db.exec('ALTER TABLE pending_notices ADD COLUMN next_at INTEGER DEFAULT 0');
+      db.exec('PRAGMA user_version = 5');
     }
   });
 
@@ -377,8 +387,23 @@ export function openStateDb(file: string = STATE_DB_PATH) {
     pendingNotices: (accountId: string) =>
       all<NoticeRow>('SELECT * FROM pending_notices WHERE account_id = ? AND delivered = 0 ORDER BY id', accountId),
 
+    /** The oldest undelivered notice; later notices never overtake it. */
+    pendingHead: (accountId: string) =>
+      one<NoticeRow>('SELECT * FROM pending_notices WHERE account_id = ? AND delivered = 0 ORDER BY id LIMIT 1', accountId),
+
+    /** Undelivered notices whose backoff has elapsed, oldest first. */
+    dueNotices: (accountId: string, now: number = Date.now()) =>
+      all<NoticeRow>(
+        'SELECT * FROM pending_notices WHERE account_id = ? AND delivered = 0 AND COALESCE(next_at, 0) <= ? ORDER BY id',
+        accountId, now,
+      ),
+
     markNoticeDelivered(id: number): void {
       run('UPDATE pending_notices SET delivered = 1 WHERE id = ?', id);
+    },
+
+    markNoticeFailed(id: number, attempts: number, nextAt: number): void {
+      run('UPDATE pending_notices SET attempts = ?, next_at = ? WHERE id = ?', attempts, nextAt, id);
     },
   };
 }

@@ -79,4 +79,5 @@ echo "installed $changes plist(s)"
 if [ -d "$BACKUP" ]; then echo "backup: $BACKUP"; fi
 echo "launchd keeps running the old definitions. Load the new ones while no task is running:"
 printf '%s' "$commands"
-echo "To restart a job without reloading its definition: launchctl kickstart -k gui/$uid/<label>"
+echo "To restart a job without reloading its definition:"
+for label in $LABELS; do echo "  launchctl kickstart -k gui/$uid/$label"; done

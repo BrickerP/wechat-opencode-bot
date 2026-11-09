@@ -45,7 +45,7 @@ The dry run shows the release and its commit, where `current` points, what `run-
 4. Reload the OpenCode agents, if they link through `current` and the release changes a prompt.
 5. Restart the bot with `launchctl kickstart -k`, then wait for the health gate.
 
-Steps 4 and 5 need `run-bot.sh` to start `current/dist/main.js`. Until the [one-time migration](#one-time-migration), deploy stops after step 3 and prints a note, and the bot keeps running its old build.
+Steps 4 and 5 need `run-bot.sh` to start `current/dist/main.js`. Until the [one-time migration](#one-time-migration), deploy stops after step 3 and prints a note, and the bot keeps running its old build. If the agents already link through `current`, deploy refuses instead: moving `current` would give the old build another release's prompts.
 
 ### Health gate
 
@@ -61,7 +61,7 @@ Otherwise deploy undoes what this run changed. `current` goes back to the previo
 
 - The restart interrupts the running task, and its user gets a ⏹ notice. Queued tasks run after the restart. Check `/status` in WeChat first.
 - Deploy never restarts the OpenCode server, but the health gate checks it, so every deploy rolls back while the server is down. Restart the server first, see [launchd](#launchd).
-- Nothing checks health before the restart, so a fix can still reach a failing bot. Deploy only refuses when launchd has no bot job loaded.
+- Nothing checks health before the restart, so a fix can still reach a failing bot. The only check on the bot beforehand is that launchd has its job loaded.
 
 ## Roll back
 
@@ -92,7 +92,7 @@ Today `run-bot.sh` starts `dist-roster/main.js`, a build snapshot in the repo ch
 5. Link the agents through `current`: `scripts/install-agents.sh`, then `scripts/install-agents.sh --apply`. The v1.0.0 prompts are copies of the live ones, so it reports `same content` and needs no reload.
 6. Check the launchd jobs: `scripts/install-launchd.sh` should report both plists as `unchanged`.
 
-Keep step 5 after step 3. Before the switch, a deploy moves `current` without restarting the bot, so agents linked through `current` would change prompts under the old build.
+Keep step 5 after step 3. Until the switch, a deploy moves `current` without restarting the bot, so `deploy.sh` refuses to run while the agents link through `current`.
 
 To undo the switch, restore the wrapper and restart the bot:
 
@@ -102,6 +102,8 @@ launchctl kickstart -k gui/$(id -u)/com.yupeng.opencode-wechat-bot
 ```
 
 Keep `dist-roster/` until the new setup has run for a while: the undo starts it.
+
+`dist-roster/` predates `daemon.lock` and writes `daemon.pid` instead, so `scripts/healthcheck.sh` fails on the lock whenever that build runs: until the switch, after an undo, and after a failed switch, where deploy reports `unhealthy after the rollback too`. Check that build with `launchctl print gui/$(id -u)/com.yupeng.opencode-wechat-bot` and its logs. Nothing else reads `daemon.pid`; delete it once the switch holds.
 
 ## Agents
 
@@ -132,7 +134,15 @@ To restart a job without reloading its definition, for example the server (check
 launchctl kickstart -k gui/$(id -u)/com.yupeng.opencode-wechat-server
 ```
 
-Manage both jobs with `launchctl`, not with `--start`/`--stop` or `npm run daemon:*`: `--stop` also kills whatever listens on port 4096, which is the launchd OpenCode server, and launchd restarts both anyway.
+Manage both jobs with `launchctl`. The bot has no start or stop command of its own:
+
+| To | Run |
+|---|---|
+| Restart the bot | `launchctl kickstart -k gui/$(id -u)/com.yupeng.opencode-wechat-bot` |
+| Stop it until the next login | `launchctl bootout gui/$(id -u)/com.yupeng.opencode-wechat-bot` |
+| Start it again | `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.yupeng.opencode-wechat-bot.plist` |
+
+The bot takes `~/.wechat-opencode-bot/daemon.lock` before it connects to anything, and removes it when it exits. While one bot holds the lock, another `--daemon`, such as one started by hand in a terminal, prints `wechat-opencode-bot already running (pid N)` and exits 0. A lock whose process is gone, or that was written before the last boot, is stale: the next bot replaces it.
 
 Logs are in `~/.wechat-opencode-bot/logs/`. launchd writes `bot.out.log`, `bot.err.log`, `server.out.log` and `server.err.log`; the bot writes `wechat-opencode-bot-<date>.log` and keeps the 3 newest.
 
@@ -145,7 +155,7 @@ scripts/healthcheck.sh
 It changes nothing and exits 1 if any check fails:
 
 - the server job runs, and `/api/info` answers 200. The password from `~/.wechat-opencode-bot/env` reaches curl on stdin, so it never shows in the process list or the output;
-- the bot job runs, and `daemon.pid` holds its pid;
+- the bot job runs, and `daemon.lock` names its pid;
 - `main.js --status` succeeds when run with the bot's own node and entry. Its report is printed.
 
 It also prints the bot's command line, its working directory and where `current` points.

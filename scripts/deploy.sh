@@ -135,10 +135,13 @@ rollback() {  # undo what this run changed; the installed release and the backup
     reload_agents || echo "deploy: the agent reload failed; reload by hand (docs/DEPLOY.md#agents)" >&2
   fi
   if [ $restarted = 1 ]; then
+    # The restored run-bot.sh starts its old entry again, not current.
+    local was="${prev:-its previous build}"
+    if [ $migrated = 1 ]; then was=$entry; fi
     if restart_bot && wait_healthy; then
-      echo "deploy: rolled back; the bot is healthy on ${prev:-its previous build}" >&2
+      echo "deploy: rolled back; the bot is healthy on $was" >&2
     else
-      echo "deploy: the bot is unhealthy after the rollback too; see $DATA_DIR/logs" >&2
+      echo "deploy: the bot is unhealthy after the rollback too; see ~/.wechat-opencode-bot/logs" >&2
     fi
   fi
   exit 1
@@ -159,6 +162,10 @@ restart=0
 if [ "$entry" = "$ENTRY" ] || [ $migrate = 1 ]; then restart=1; fi
 if [ $restart = 1 ] && [ "$(job_info "$BOT_LABEL" | cut -d ' ' -f 2-)" = unloaded ]; then
   die "launchd has no $BOT_LABEL job to restart; load it first (docs/DEPLOY.md#launchd)"
+fi
+# Without a restart the old build keeps running, so it must not get another release's prompts.
+if [ $restart = 0 ] && agents_follow_current; then
+  die "the agents link through current but run-bot.sh does not start $ENTRY, so moving current would give the running build other prompts; add --migrate-wrapper (docs/DEPLOY.md#one-time-migration)"
 fi
 
 if [ -d "$DEST" ]; then
@@ -202,8 +209,8 @@ if [ $restart = 1 ]; then
   if agents_follow_current; then step "reload the OpenCode agents if this release changes a prompt"; fi
   step "restart the bot, run scripts/healthcheck.sh after ${STABLE_SECONDS}s, roll all of it back on failure"
   echo "  The restart interrupts a running task, whose user gets a ⏹ notice: check /status first."
-else
-  migration_note
+elif [ $apply = 0 ]; then
+  migration_note  # --apply prints it after moving current
 fi
 if [ $apply = 0 ]; then
   echo "dry run; rerun with --apply"

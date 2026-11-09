@@ -15,7 +15,7 @@
 - 每个任务都在新的 OpenCode 会话里运行，使用 `wechat-orchestrator` agent。会话从不复用：上下文由 bot 写进提示词，包括最近 8 个任务（其中最近 2 个带回复摘录）和这个聊天的记忆。
 - 模型出错或长时间没有输出时，会用 `OPENCODE_FALLBACK_MODEL` 重试一次，你只会收到最终结果。
 - 回复按 2048 字符分段发送。微信只接受基于最近一条消息 token 的回复，发不出去的回复会进入待发队列，在你发下一条消息后补发。
-- 图片保留 24 小时。在带图片的任务之后 10 分钟内发出的纯文字任务，会沿用那些图片。
+- 图片保留 24 小时。紧跟在带图片的任务之后、10 分钟内发出的纯文字任务，会沿用那些图片。
 - bot 重启会中断正在运行的任务并发出 ⏹ 通知，排队的任务照常执行。
 
 ## Bot 与项目
@@ -115,14 +115,14 @@ npm run setup     # 用微信扫码，然后输入工作目录
 | `node dist/main.js …` | 作用 |
 |---|---|
 | `--setup` | 扫码绑定微信账号并设置工作目录 |
-| `--daemon` | 在前台运行 bot 并写入 `daemon.pid`；launchd 运行的就是它 |
+| `--daemon` | 在前台运行 bot；launchd 运行的就是它。它持有 `daemon.lock`，所以第二个实例会打印 `already running (pid N)` 并退出 |
 | `--status` | 打印 bot 状态，与 `/status` 相同 |
 | `--tasks [数量]` | 打印最近的任务 |
 | `--simulate "<内容>"` | 在本进程模拟一条微信消息并打印回复。需要 OpenCode 服务；任务历史和记忆单独记在 `simulate` 账号下 |
 | `--notify "<内容>"` | 主动给微信发一条消息；暂时发不出去就进入待发队列 |
 | `--help` | 显示帮助 |
 
-`--start`、`--stop` 和 `npm run daemon:*` 不经过 launchd 在后台运行 bot。用 launchd 时不要用它们：`--stop` 还会杀掉监听 4096 端口的进程，也就是 launchd 管理的 OpenCode 服务。
+bot 没有自己的启动和停止命令，由 launchd 保持运行。重启用 `launchctl kickstart -k gui/$(id -u)/com.yupeng.opencode-wechat-bot`，停止用 `launchctl bootout gui/$(id -u)/com.yupeng.opencode-wechat-bot`，见 [docs/DEPLOY.md](docs/DEPLOY.md#launchd)。在前台运行的 bot 用 Ctrl-C 停止。
 
 ## 数据目录
 
@@ -134,7 +134,7 @@ attachments/      图片，保留 24 小时
 backups/          部署脚本写入的备份
 bots.json         bot 名单
 config.env        workingDirectory 和 permissionMode
-daemon.pid        运行中 bot 的 PID
+daemon.lock       运行中 bot 持有的锁：PID、启动时间和入口
 env               bot 和 OpenCode 服务的配置（权限 600）
 get_updates_buf   微信消息轮询游标
 logs/             bot 的每日日志（保留 3 个）和 launchd 日志
@@ -143,7 +143,7 @@ projects.json     项目别名
 state.db          任务、聊天设置和待发队列（SQLite）
 ```
 
-`config.env` 始终从 `~/.wechat-opencode-bot/` 读取，即使 `OWB_DATA_DIR` 指向别处。
+`accounts/`、`config.env` 和 `logs/` 始终在 `~/.wechat-opencode-bot/` 下，即使 `OWB_DATA_DIR` 指向别处。
 
 ## 开发
 

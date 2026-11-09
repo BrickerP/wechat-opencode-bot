@@ -4,7 +4,7 @@ dist/
 .DS_Store
 dist-*/
 coverage/
-# scripts/release.sh and scripts/deploy.sh; current is a symlink, so no trailing slash
+# Written by scripts/release.sh and scripts/deploy.sh. current is a symlink, so no trailing slash.
 releases/
 /current
 *.pre-*

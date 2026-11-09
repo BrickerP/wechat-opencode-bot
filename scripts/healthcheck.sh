@@ -52,8 +52,8 @@ if [ "$bot_state" = running ]; then
     echo "        no current symlink in $cwd"
   fi
 
-  pidfile=$(cat "$DATA_DIR/daemon.pid" 2>/dev/null || true)
-  if [ "$pidfile" = "$bot_pid" ]; then ok "daemon.pid matches"; else fail "daemon.pid says ${pidfile:-nothing}, launchd runs $bot_pid"; fi
+  lock_pid=$(sed -n 's/^pid=//p' "$DATA_DIR/daemon.lock" 2>/dev/null || true)
+  if [ "$lock_pid" = "$bot_pid" ]; then ok "daemon.lock matches"; else fail "daemon.lock names ${lock_pid:-no pid}, launchd runs $bot_pid"; fi
 
   # The bot's own node and entry, so the report comes from the code that is running.
   node_bin=$(lsof_name "$bot_pid" txt || true)

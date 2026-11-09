@@ -14,6 +14,9 @@ const MAX_MESSAGE_CHARS = 2048;
 /** Pause between the chunks of one send, so WeChat keeps them in order. */
 const CHUNK_GAP_MS = 200;
 const TYPING_KEEPALIVE_MS = 5000;
+/** Failed-send backoff: 30s, 2m, 10m, then 1h. */
+const BACKOFF_MS = [30_000, 120_000, 600_000, 3_600_000] as const;
+const backoffMs = (attempts: number): number => BACKOFF_MS[Math.min(Math.max(attempts, 1) - 1, BACKOFF_MS.length - 1)];
 
 /** WeChat caps message length; split on a line break when one is not too far back. */
 export function splitMessage(text: string, maxLen: number = MAX_MESSAGE_CHARS): string[] {
@@ -68,18 +71,28 @@ export function createNotifier(db: StateDb, api: WeChatApi, sender: Sender) {
   }
 
   /**
-   * The outbox: queue the outcome of finished tasks not yet reported, then send pending notices
-   * oldest first, stopping at the first failure. True when nothing is left.
+   * The outbox: queue the outcome of finished tasks not yet reported, then send due notices
+   * oldest first. A failed notice gets an exponential backoff and blocks later notices, so a
+   * broken token does not hot-loop the iLink API.
    */
   function flush(accountId: string): Promise<boolean> {
     return serial(accountId, async () => {
       try {
         db.queueUnnotified(accountId, (task) => splitMessage(resultText(task)));
-        const notices = db.pendingNotices(accountId);
-        return await sendChunks(
-          accountId,
-          notices.map((notice) => ({ text: notice.text, onSent: () => db.markNoticeDelivered(notice.id) })),
-        );
+        for (;;) {
+          const notice = db.pendingHead(accountId);
+          if (!notice) return true;
+          // A notice in backoff blocks later notices, so chunks never overtake each other.
+          if ((notice.next_at ?? 0) > Date.now()) return false;
+          const delivered = await sendChunks(accountId, [
+            { text: notice.text, onSent: () => db.markNoticeDelivered(notice.id) },
+          ]);
+          if (!delivered) {
+            const attempts = (notice.attempts ?? 0) + 1;
+            db.markNoticeFailed(notice.id, attempts, Date.now() + backoffMs(attempts));
+            return false;
+          }
+        }
       } catch (err) {
         // Callers fire and forget; a database error must not become an unhandled rejection.
         logger.warn('Outbox flush failed', { accountId, error: String(err) });

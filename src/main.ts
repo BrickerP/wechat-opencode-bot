@@ -1,14 +1,15 @@
 // Must stay first: provider.ts reads OPENCODE_SERVER_PASSWORD when it loads.
 import './env.js';
 import { createInterface } from 'node:readline';
-import { dirname, join } from 'node:path';
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
-import { execSync } from 'node:child_process';
+import { mkdirSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 import { formatStatus, formatTasks, parseTaskLimit, type CommandContext } from './commands/handlers.js';
 import { isCommand, routeCommand } from './commands/router.js';
 import { loadConfig, saveConfig } from './config.js';
 import { DATA_DIR } from './constants.js';
+import { backupStateDb } from './backup.js';
+import { acquireDaemonLock, lockHolder, releaseDaemonLock } from './lifecycle.js';
 import { logger } from './logger.js';
 import { createNotifier, runNotify } from './notify.js';
 import { IMAGE_ONLY_INPUT, runTask, saveAttachment } from './orchestrator.js';
@@ -74,11 +75,29 @@ async function runSetup(): Promise<void> {
   config.workingDirectory = workingDir;
   saveConfig(config);
 
-  console.log('\n运行 npm run daemon 启动服务');
+  console.log('\n前台运行: node dist/main.js --daemon；常驻运行见 docs/DEPLOY.md');
 }
 
 async function runDaemon(): Promise<void> {
+  // Before OpenCode, the database and the queue: a second bot must not touch any of them.
+  const holder = acquireDaemonLock(fileURLToPath(import.meta.url));
+  if (holder) {
+    console.log(`wechat-opencode-bot already running (pid ${holder.pid})`);
+    return;
+  }
+  // Every way out releases the lock. A signal's default action skips 'exit' handlers, so signals exit here.
+  process.on('exit', releaseDaemonLock);
+  for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+    process.on(signal, () => {
+      logger.info('Shutting down', { signal });
+      process.exit(0);
+    });
+  }
+
   const config = loadConfig();
+  console.log(`工作目录: ${config.workingDirectory}`);
+  console.log(`进程目录: ${process.cwd()}`);
+  console.log(`wechat-opencode-bot 已启动 (PID: ${process.pid})`);
   const account = loadLatestAccount();
 
   if (!account) {
@@ -101,6 +120,12 @@ async function runDaemon(): Promise<void> {
     .map((id) => id.trim())
     .filter(Boolean);
   const db = openStateDb();
+  try {
+    const backup = backupStateDb();
+    if (backup) logger.info('State backup created', { file: backup });
+  } catch (err) {
+    logger.warn('State backup failed', { error: String(err) });
+  }
   const api = new WeChatApi(account.botToken, account.baseUrl);
   const notifier = createNotifier(db, api, createSender(api, accountId));
   const broker = createPermissionBroker(() => void notifier.reply(accountId, '⏰ 权限请求超时，已自动拒绝。'));
@@ -119,7 +144,7 @@ async function runDaemon(): Promise<void> {
   // The outbox reports what the user has not seen: the tasks above, results finished right before
   // a crash, and notices whose send failed.
   void notifier.flush(accountId);
-  const stopQueue = queue.start(accountId);
+  queue.start(accountId);
 
   async function handleMessage(msg: WeixinMessage): Promise<void> {
     if (msg.message_type !== MessageType.USER || !msg.from_user_id || !msg.item_list) return;
@@ -207,16 +232,6 @@ async function runDaemon(): Promise<void> {
     },
   });
 
-  function shutdown(): void {
-    logger.info('Shutting down...');
-    monitor.stop();
-    stopQueue();
-    process.exit(0);
-  }
-
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
-
   logger.info('Daemon started', { accountId });
   console.log(`已启动 (账号: ${accountId})`);
 
@@ -228,125 +243,30 @@ function showHelp(): void {
   console.log(`
 wechat-opencode-bot - 微信接入 OpenCode
 
-用法:
-  npm run setup          扫码绑定微信
-  npm run daemon:start   启动服务
-  npm run daemon:stop    停止服务
-  npm run daemon:status  查看状态
+用法: node dist/main.js <命令>
+  --setup              扫码绑定微信，设置工作目录（也可以 npm run setup）
+  --daemon             在前台运行 bot，launchd 运行的就是它；已有 bot 在运行时直接退出
+  --status             查看状态
+  --tasks [数量]       查看最近的任务
+  --simulate "<内容>"  在本进程模拟一条微信消息（回复打印到终端）
+  --notify "<内容>"    主动给微信发一条消息
 
-或直接:
-  node dist/main.js --setup              扫码绑定微信
-  node dist/main.js --start              启动服务
-  node dist/main.js --stop               停止服务
-  node dist/main.js --status             查看状态
-  node dist/main.js --tasks [数量]       查看最近的任务
-  node dist/main.js --simulate "<内容>"  在本进程模拟一条微信消息（回复打印到终端）
-  node dist/main.js --notify "<内容>"    主动给微信发一条消息
+常驻运行由 launchd 管理（docs/DEPLOY.md）:
+  重启  launchctl kickstart -k gui/$(id -u)/com.yupeng.opencode-wechat-bot
+  停止  launchctl bootout gui/$(id -u)/com.yupeng.opencode-wechat-bot
 `);
-}
-
-function getPidFile(): string {
-  return join(DATA_DIR, 'daemon.pid');
-}
-
-function getDaemonStatus(): { running: boolean; pid?: number } {
-  const pidFile = getPidFile();
-  if (!existsSync(pidFile)) {
-    return { running: false };
-  }
-
-  try {
-    const pid = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10);
-    if (isNaN(pid)) {
-      return { running: false };
-    }
-    process.kill(pid, 0);
-    return { running: true, pid };
-  } catch {
-    return { running: false };
-  }
-}
-
-function findProcessOnPort(port: number): number | null {
-  try {
-    if (process.platform === 'win32') {
-      const output = execSync(`netstat -ano | findstr :${port}`, { encoding: 'utf-8' });
-      for (const line of output.split('\n')) {
-        if (line.includes(`:${port}`) && line.includes('LISTENING')) {
-          const parts = line.trim().split(/\s+/);
-          const pid = parseInt(parts[parts.length - 1], 10);
-          if (!isNaN(pid)) return pid;
-        }
-      }
-    } else {
-      const output = execSync(`lsof -ti:${port}`, { encoding: 'utf-8' });
-      const pid = parseInt(output.trim(), 10);
-      if (!isNaN(pid)) return pid;
-    }
-  } catch {}
-  return null;
-}
-
-const OPENCODE_PORT = 4096;
-
-function stopOpenCodeService(): void {
-  const pid = findProcessOnPort(OPENCODE_PORT);
-
-  if (pid) {
-    try {
-      process.kill(pid, 'SIGTERM');
-      console.log(`已停止 OpenCode 服务 (端口: ${OPENCODE_PORT}, PID: ${pid})`);
-    } catch (err) {
-      console.error(`停止 OpenCode 服务失败: ${err}`);
-    }
-  } else {
-    console.log(`未发现运行在端口 ${OPENCODE_PORT} 的 OpenCode 服务`);
-  }
-}
-
-function runStop(): void {
-  // 先停止 OpenCode 服务（无论 bot 是否运行）
-  stopOpenCodeService();
-
-  const status = getDaemonStatus();
-
-  if (!status.running) {
-    console.log('wechat-opencode-bot 未在后台运行');
-    return;
-  }
-
-  try {
-    process.kill(status.pid!, 'SIGTERM');
-    console.log(`已停止 wechat-opencode-bot (PID: ${status.pid})`);
-  } catch (err) {
-    console.error(`停止 wechat-opencode-bot 失败: ${err}`);
-  }
-
-  const pidFile = getPidFile();
-  if (existsSync(pidFile)) {
-    try {
-      unlinkSync(pidFile);
-    } catch {}
-  }
 }
 
 /** --status and --tasks report on the bot account; before setup, on the --simulate account. */
 const cliAccountId = (): string => loadLatestAccount()?.accountId ?? SIMULATE_ACCOUNT;
 
 function runStatus(): void {
-  const status = getDaemonStatus();
-
-  if (status.running) {
-    console.log(`wechat-opencode-bot 运行中 (PID: ${status.pid})`);
+  const holder = lockHolder();
+  if (holder) {
+    console.log(`wechat-opencode-bot 运行中 (PID: ${holder.pid}, 启动于 ${holder.startedAt})`);
+    console.log(`入口: ${holder.entry}`);
   } else {
     console.log('wechat-opencode-bot 未运行');
-  }
-
-  const opencodePid = findProcessOnPort(OPENCODE_PORT);
-  if (opencodePid) {
-    console.log(`OpenCode 服务运行中 (端口: ${OPENCODE_PORT}, PID: ${opencodePid})`);
-  } else {
-    console.log(`OpenCode 服务未运行 (端口: ${OPENCODE_PORT})`);
   }
 
   console.log(`\n${formatStatus(openStateDb(), cliAccountId())}`);
@@ -377,73 +297,12 @@ if (command === '--setup' || command === 'setup') {
     console.error('设置失败:', err);
     process.exit(1);
   });
-} else if (command === '--start' || command === 'start' || !command) {
-  const status = getDaemonStatus();
-  if (status.running) {
-    console.log(`wechat-opencode-bot 已在后台运行 (PID: ${status.pid})`);
-    process.exit(0);
-  }
-
-  if (process.platform === 'win32') {
-    try {
-      const command = `Start-Process -FilePath "node" -ArgumentList "dist/main.js","--daemon" -WorkingDirectory "${process.cwd()}" -WindowStyle Hidden`;
-      execSync(`powershell.exe -Command "${command}"`, {
-        stdio: 'ignore',
-        shell: 'powershell.exe'
-      });
-      console.log('wechat-opencode-bot 已在后台启动');
-      process.exit(0);
-    } catch (e) {
-      console.error('启动失败:', e);
-    }
-  } else {
-    const pidFile = getPidFile();
-    const logFile = join(dirname(pidFile), 'logs', 'stdout.log');
-
-    try {
-      const nodeBin = process.execPath;
-      const mainJs = join(process.cwd(), 'dist', 'main.js');
-
-      execSync(`mkdir -p "${dirname(logFile)}"`);
-
-      const startCmd = `nohup "${nodeBin}" "${mainJs}" --daemon >> "${logFile}" 2>&1 &`;
-      execSync(startCmd, { stdio: 'ignore', shell: '/bin/sh' });
-
-      const pid = execSync(`echo $!`, { shell: '/bin/sh' }).toString().trim();
-      writeFileSync(pidFile, pid, 'utf-8');
-
-      console.log('wechat-opencode-bot 已在后台启动');
-      process.exit(0);
-    } catch (e) {
-      console.error('启动失败:', e);
-      process.exit(1);
-    }
-  }
 } else if (command === '--daemon') {
-  const pidFile = getPidFile();
-
-  const config = loadConfig();
-  console.log(`工作目录: ${config.workingDirectory}`);
-  console.log(`进程目录: ${process.cwd()}`);
-  console.log(`PID: ${process.pid}`);
-
-  try {
-    writeFileSync(pidFile, String(process.pid), 'utf-8');
-    console.log(`wechat-opencode-bot 已启动 (PID: ${process.pid})`);
-  } catch (err) {
-    console.error('保存 PID 失败:', err);
-  }
-
   runDaemon().catch((err) => {
     logger.error('Daemon failed', { error: err instanceof Error ? err.message : String(err) });
     console.error('运行失败:', err);
-    if (existsSync(pidFile)) {
-      unlinkSync(pidFile);
-    }
     process.exit(1);
   });
-} else if (command === '--stop' || command === 'stop') {
-  runStop();
 } else if (command === '--status' || command === 'status') {
   runStatus();
 } else if (command === '--tasks' || command === 'tasks') {
@@ -452,7 +311,7 @@ if (command === '--setup' || command === 'setup') {
   runWithExitCode(runSimulate);
 } else if (command === '--notify') {
   runWithExitCode(runNotify);
-} else if (command === '--help' || command === '-h') {
+} else if (!command || command === '--help' || command === '-h') {
   showHelp();
 } else {
   console.error(`未知命令: ${command}`);

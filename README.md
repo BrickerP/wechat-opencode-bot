@@ -150,7 +150,7 @@ get_updates_buf   WeChat polling cursor
 logs/             the bot's daily logs (3 kept) and the launchd logs
 memory/           memory per chat and bot
 projects.json     project aliases
-state.db          tasks, chat settings and the outbox (SQLite)
+state.db          tasks, routines, chat settings and the outbox (SQLite)
 ```
 
 `accounts/`, `config.env` and `logs/` always live in `~/.wechat-opencode-bot/`, even when `OWB_DATA_DIR` points elsewhere.

@@ -29,8 +29,11 @@ const MAX_LS_ENTRIES = 100;
 const DAY_MS = 24 * 60 * 60 * 1000;
 /** How often the daemon looks for due routines, so a routine runs up to this late. */
 export const ROUTINE_TICK_MS = 30_000;
-/** Typed in commands, so plain and short. Names are lowercased first: a phone keyboard capitalizes the first letter. */
-const ROUTINE_NAME = /^[a-z0-9_-]{1,24}$/;
+/**
+ * One word of up to 24 characters, Chinese included, lowercased first: a phone keyboard capitalizes the first letter.
+ * A name that starts with "@" is a bot, so the name was left out.
+ */
+const ROUTINE_NAME = /^[^@]\S{0,23}$/u;
 const ROUTINE_ADD_USAGE = '用法：/routine add <名称> <dailyHH:MM|everyNm> <内容>';
 const ROUTINE_USAGE = `${ROUTINE_ADD_USAGE}\n/routine rm|on|off|run <名称>：删除、启用、停用、立即运行`;
 const SCHEDULE_FORMS = 'daily09:00（每天，北京时间）、every30m（每 N 分钟，N ≥ 5）、every2h（每 N 小时，N ≤ 24）';
@@ -221,23 +224,27 @@ function queueRoutine(db: StateDb, routine: RoutineRow, schedule: Schedule, now:
 export function tickRoutines(db: StateDb, accountId: string, kick: () => void, now: number = Date.now()): TaskRow[] {
   const queued: TaskRow[] = [];
   try {
-    // The queue runs the daemon's account only.
+    // The queue runs the daemon's account only. One bad routine must not hold up the rest.
     for (const routine of db.dueRoutines(now).filter((r) => r.account_id === accountId)) {
       const fields = { routineId: routine.id, name: routine.name };
-      const schedule = parseSchedule(routine.schedule);
-      if (!schedule) {
-        // Only a hand edit stores one /routine add rejects; due on every tick, it would never run.
-        db.setRoutineEnabled(routine.id, false);
-        logger.warn('Routine disabled: unknown schedule', { ...fields, schedule: routine.schedule });
-        continue;
+      try {
+        const schedule = parseSchedule(routine.schedule);
+        if (!schedule) {
+          // Only a hand edit stores one /routine add rejects; due on every tick, it would never run.
+          db.setRoutineEnabled(routine.id, false);
+          logger.warn('Routine disabled: unknown schedule', { ...fields, schedule: routine.schedule });
+          continue;
+        }
+        if (db.hasOpenRoutineTask(routine.id)) {
+          db.markRoutineRun(routine.id, schedule.nextRunAt(now, routine.next_run_at), routine.last_run_at);
+          logger.info('Routine skipped: its last task is still open', fields);
+          continue;
+        }
+        queued.push(queueRoutine(db, routine, schedule, now).task);
+        kick();
+      } catch (err) {
+        logger.warn('Routine skipped after an error', { ...fields, error: String(err) });
       }
-      if (db.hasOpenRoutineTask(routine.id)) {
-        db.markRoutineRun(routine.id, schedule.nextRunAt(now, routine.next_run_at), routine.last_run_at);
-        logger.info('Routine skipped: its last task is still open', fields);
-        continue;
-      }
-      queued.push(queueRoutine(db, routine, schedule, now).task);
-      kick();
     }
   } catch (err) {
     logger.warn('Routine tick failed', { error: String(err) });
@@ -257,7 +264,7 @@ function createRoutine(db: StateDb, accountId: string, args: string, now: number
   const [when, text] = splitWord(tail);
   const name = word.toLowerCase();
   if (!name || !when || !text) return `⚠️ ${ROUTINE_ADD_USAGE}`;
-  if (!ROUTINE_NAME.test(name)) return '⚠️ 名称只能用小写字母、数字、_ 和 -，最多 24 个字符';
+  if (!ROUTINE_NAME.test(name)) return '⚠️ 名称最多 24 个字符，不能以 @ 开头';
   const schedule = parseSchedule(when);
   if (!schedule) return `⚠️ 无法识别的时间：${when}\n可用：${SCHEDULE_FORMS}`;
   const bots = loadBots();

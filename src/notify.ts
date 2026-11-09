@@ -169,7 +169,10 @@ export function createNotifier(db: StateDb, api: WeChatApi, sender: Sender) {
         const answer = broker.createPending(accountId, request.action, request.resources.join(', '), label);
         const ahead = broker.asksAhead(accountId, answer);
         // A full queue denied it already: showing it would only point the next y/n at another task's ask.
-        if (ahead < 0) return 'reject';
+        if (ahead < 0) {
+          await reply(accountId, `⚠️ ${label}的权限请求过多（已有 3 个在等），这次已自动拒绝。`);
+          return 'reject';
+        }
         if (!(await reply(accountId, formatPermissionRequest(request, label, ahead)))) {
           // Only this ask: the others were shown and still wait for their answers.
           broker.rejectPending(accountId, answer);

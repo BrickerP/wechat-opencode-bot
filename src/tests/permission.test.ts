@@ -146,11 +146,13 @@ test('an ask that cannot be sent is rejected, and the ask already shown still wa
   assert.equal(broker.getPending('acc'), undefined, 'the unsent ask is gone too');
 });
 
-test('an ask the full queue denied is never shown', async () => {
+test('an ask the full queue denied is reported, not shown for answering', async () => {
   const broker = createPermissionBroker();
   for (const label of ['A', 'B', 'C']) broker.createPending('acc', 'bash', label, label);
   sent.length = 0;
   assert.equal(await notifier.taskIO(eng, broker).onPermission!(request('bash')), 'reject');
-  assert.deepEqual(sent, []);
+  assert.equal(sent.length, 1, 'the user hears why it was denied without a y/n prompt');
+  assert.match(sent[0], /过多/);
+  assert.match(sent[0], new RegExp(`任务 #${eng.seq}`));
   broker.rejectPending('acc');
 });

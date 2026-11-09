@@ -150,7 +150,7 @@ get_updates_buf   微信消息轮询游标
 logs/             bot 的每日日志（保留 3 个）和 launchd 日志
 memory/           按聊天和 bot 存放的记忆
 projects.json     项目别名
-state.db          任务、聊天设置和待发队列（SQLite）
+state.db          任务、定时任务、聊天设置和待发队列（SQLite）
 ```
 
 `accounts/`、`config.env` 和 `logs/` 始终在 `~/.wechat-opencode-bot/` 下，即使 `OWB_DATA_DIR` 指向别处。

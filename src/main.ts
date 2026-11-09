@@ -173,15 +173,22 @@ async function runDaemon(): Promise<void> {
 
     const answer = imageItem ? undefined : ANSWERS.get(text.toLowerCase());
     if (answer !== undefined) {
+      // A timeout is answered before the next ask: a late y/n must not approve the other lane's request.
+      if (broker.isTimedOut(accountId)) {
+        broker.clearTimedOut(accountId);
+        const waiting = broker.getPending(accountId);
+        await notifier.reply(
+          accountId,
+          waiting
+            ? `⏰ 上一个权限请求已超时；现在待回复的是${waiting.label ? ` ${waiting.label}` : '另一个请求'}，请再回复一次 y/n。`
+            : '⏰ 权限请求已超时并自动拒绝。',
+        );
+        return;
+      }
       // y/n answers the oldest ask; with both lanes asking that may not be the latest shown, so the reply names its task.
       const ask = broker.getPending(accountId);
       if (broker.resolvePermission(accountId, answer)) {
         await notifier.reply(accountId, `${answer ? '✅ 已允许' : '❌ 已拒绝'}${ask?.label ? `：${ask.label}` : ''}`);
-        return;
-      }
-      if (broker.isTimedOut(accountId)) {
-        broker.clearTimedOut(accountId);
-        await notifier.reply(accountId, '⏰ 权限请求已超时并自动拒绝。');
         return;
       }
     }

@@ -247,8 +247,10 @@ test('/routine add says what is wrong: a taken or bad name, an unknown schedule,
   await send('/routine add watch every30m 看下发布流程');
   assert.equal(await send('/routine add watch every5m 别的'), '⚠️ 已有名为 watch 的定时任务：先 /routine rm watch，或换个名称');
   assert.equal(db.routine('acc', 'watch')?.prompt, '看下发布流程');
-  for (const name of ['日报', 'a'.repeat(25)]) {
-    assert.equal(await send(`/routine add ${name} daily09:00 总结`), '⚠️ 名称只能用小写字母、数字、_ 和 -，最多 24 个字符', name);
+  // The README's example: a Chinese name works. A leading "@" means the name was left out.
+  assert.match(await send('/routine add 早报 daily09:00 汇总昨天的工作'), /^✅ 已添加定时任务 早报 \[启用\] 每天 09:00（下次 /);
+  for (const name of ['@research', 'a'.repeat(25), '早'.repeat(25)]) {
+    assert.equal(await send(`/routine add ${name} daily09:00 总结`), '⚠️ 名称最多 24 个字符，不能以 @ 开头', name);
   }
   assert.equal(
     await send('/routine add x 9am 总结'),
@@ -257,7 +259,7 @@ test('/routine add says what is wrong: a taken or bad name, an unknown schedule,
   for (const text of ['/routine add x daily09:00', '/routine add x', '/routine add']) {
     assert.equal(await send(text), '⚠️ 用法：/routine add <名称> <dailyHH:MM|everyNm> <内容>', text);
   }
-  assert.deepEqual(db.routines('acc').map((r) => r.name), ['watch']);
+  assert.deepEqual(db.routines('acc').map((r) => r.name), ['watch', '早报']);
 });
 
 test('/routine off, on, run and rm manage a routine by its name, in any case', async () => {

@@ -1,4 +1,5 @@
 import { logger } from "../logger.js";
+import type { ErrorKind } from "../model-routing.js";
 import { execSync, spawn } from "node:child_process";
 import { basename } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -38,6 +39,8 @@ export interface QueryResult {
   interrupted?: boolean;
   /** The upstream model failed or went silent; another attempt may succeed. */
   upstream?: boolean;
+  /** Set when OpenCode or a watchdog ended the turn, not for local failures such as an unreachable server. */
+  errorKind?: ErrorKind;
 }
 
 export interface ProviderModel {
@@ -67,10 +70,21 @@ export class TurnInterrupted extends Error {
   }
 }
 
-/** The upstream model failed or stopped making progress; another attempt may succeed. */
-export class UpstreamError extends Error {
-  constructor(message: string) {
+/** OpenCode ended the turn with a failure, or a watchdog ended it. */
+export class TurnFailed extends Error {
+  readonly errorKind: ErrorKind;
+
+  constructor(message: string, errorKind: ErrorKind = "unknown") {
     super(message);
+    this.name = "TurnFailed";
+    this.errorKind = errorKind;
+  }
+}
+
+/** The upstream model failed or stopped making progress; another attempt may succeed. */
+export class UpstreamError extends TurnFailed {
+  constructor(message: string, errorKind: ErrorKind = "server") {
+    super(message, errorKind);
     this.name = "UpstreamError";
   }
 }
@@ -78,7 +92,7 @@ export class UpstreamError extends Error {
 /** A watchdog gave up on a silent upstream model. */
 export class TurnTimeout extends UpstreamError {
   constructor(message: string) {
-    super(message);
+    super(message, "timeout");
     this.name = "TurnTimeout";
   }
 }
@@ -318,6 +332,50 @@ function describeError(error: any): string {
   return JSON.stringify(error);
 }
 
+/** provider.* types by their last segment; any other provider failure counts as a server error. */
+const PROVIDER_KINDS = new Map<string, ErrorKind>([
+  ["auth", "auth"],
+  ["quota", "quota"],
+  ["timeout", "timeout"],
+  ["transport", "transport"],
+  ["connect", "transport"],
+]);
+
+/**
+ * Errors OpenCode did not map to a provider.* type, by their text. The first match wins, so
+ * "do request failed: HTTP 502" is a server error rather than a transport one.
+ */
+const UPSTREAM_TEXT: Array<[ErrorKind, RegExp]> = [
+  ["quota", /HTTP 429|status(?:Code)?\D{0,3}429|rate.?limit|quota/i],
+  ["server", /HTTP 5\d\d|status(?:Code)?\D{0,3}5\d\d|overloaded/i],
+  ["timeout", /ETIMEDOUT|timed out|request timeout/i],
+  ["transport", /do request failed|fetch failed|ECONNRESET|ECONNREFUSED|socket hang up/i],
+];
+
+/**
+ * What a failed idle outcome means. Upstream failures (the gateway or its model) may pass on another
+ * gateway; the rest (auth, a rejected permission, a bad request) would fail again.
+ */
+export function classifyIdleError(error: any): { message: string; kind: ErrorKind; upstream: boolean } {
+  const message = `OpenCode 执行失败: ${describeError(error).slice(0, 500)}`;
+  const type = String(error?.type ?? "");
+  if (type.startsWith("provider.")) {
+    // The first segment after "provider.": provider.auth.expired still counts as auth.
+    const suffix = type.slice("provider.".length).split(".")[0];
+    // "limit" covers rate-limit, free-limit, budget-limit and model-budget-limit; a context limit is not quota.
+    const kind = PROVIDER_KINDS.get(suffix) ?? (suffix.includes("limit") && !suffix.includes("context") ? "quota" : "server");
+    return { message, kind, upstream: kind !== "auth" };
+  }
+  // A rejection's message can be the user's own feedback, which says nothing about the model.
+  if (type.startsWith("permission.")) return { message, kind: "unknown", upstream: false };
+
+  const text = typeof error === "string" ? error : JSON.stringify(error ?? null);
+  const match = UPSTREAM_TEXT.find(([, pattern]) => pattern.test(text));
+  if (match) return { message, kind: match[0], upstream: true };
+  const kind = /HTTP 4\d\d|invalid|unsupported|not found/i.test(text) ? "bad_request" : "unknown";
+  return { message, kind, upstream: false };
+}
+
 /** Names of the tool calls that are still executing. */
 function runningTools(messages: any[]): string[] {
   return messages.flatMap((m) =>
@@ -398,9 +456,8 @@ async function waitForTurn(sessionId: string, since: number, options: QueryOptio
     const idle = turn.find((m) => m?.type === "idle");
     if (idle) {
       if (idle.outcome === "failed") {
-        const message = `OpenCode 执行失败: ${describeError(idle.error).slice(0, 500)}`;
-        // provider.* errors come from the model's upstream; others (a rejected permission, a bad request) would fail again.
-        throw String(idle.error?.type).startsWith("provider.") ? new UpstreamError(message) : new Error(message);
+        const { message, kind, upstream } = classifyIdleError(idle.error);
+        throw upstream ? new UpstreamError(message, kind) : new TurnFailed(message, kind);
       }
       if (idle.outcome === "interrupted") {
         throw new TurnInterrupted("OpenCode 执行被中断");
@@ -473,12 +530,14 @@ export async function openCodeQuery(options: QueryOptions): Promise<QueryResult>
   } catch (err) {
     const interrupted = err instanceof TurnInterrupted;
     const upstream = err instanceof UpstreamError;
+    // Errors from the local OpenCode server itself (unreachable, HTTP errors) have no kind and are never upstream.
+    const errorKind = err instanceof TurnFailed ? err.errorKind : undefined;
     const error = err instanceof Error ? err.message : String(err);
     // Timeouts, aborts and transport errors can leave the session executing on the server.
     if (sessionId) await interruptSession(sessionId);
     if (interrupted) logger.info("OpenCode query interrupted", { sessionId });
-    else logger.error("OpenCode query failed", { sessionId, error, upstream });
-    return { text: "", sessionId, error, interrupted, upstream };
+    else logger.error("OpenCode query failed", { sessionId, error, upstream, errorKind });
+    return { text: "", sessionId, error, interrupted, upstream, errorKind };
   }
 }
 

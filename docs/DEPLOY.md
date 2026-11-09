@@ -165,6 +165,16 @@ It also prints the bot's command line, its working directory and where `current`
 - `~/.wechat-opencode-bot/backups/` collects `state.db.pre-<tag>-<time>`, `run-bot.sh.pre-<tag>-<time>`, `agents-<time>/` and `launchd-<time>/`. Nothing prunes it.
 - Installed releases stay in `releases/`, so a rollback needs no tarball. Delete old releases and their tarballs by hand, never the one `current` points at (`readlink current`).
 
+## Model routing
+
+- `/model` sets a chat's primary model; without it the session uses the orchestrator agent's model. `OPENCODE_DEFAULT_MODEL` is only what routing assumes in that case, so keep it equal to the `model:` in `config/agents/wechat-orchestrator.md`.
+- An upstream failure (5xx, 429, timeout, transport, `do request failed`) retries once on a model behind another gateway: `OPENCODE_FALLBACK_MODEL` when set, otherwise the first of `oneapi-chat-gpt/gpt-6-astra`, `oneapi/DeepSeek-V4.1-Flash`, `oneapi-gemini/Gemini 4 Argon` whose provider differs from the primary.
+- Auth errors, HTTP 4xx and permission rejections are not retried, and neither is an unreachable local OpenCode server: another gateway would fail the same way.
+- 3 upstream failures in a row open that gateway's breaker for 10 minutes (`OWB_BREAKER_THRESHOLD`, `OWB_BREAKER_COOLDOWN_MS`). Later tasks start on the fallback and the chat gets one notice. A failed probe doubles the cooldown, up to an hour; a success closes the breaker. The state is in memory, so a restart starts with every breaker closed.
+- `Task finished` lines carry `model`, `attempts`, `fallback` and `errorKind`.
+
+Subagents have no `model:` in their agent files, so OpenCode runs them on the parent session's model and a task that fell back stays on one gateway from start to finish.
+
 ## CI
 
 `.github/workflows/ci.yml` runs on every push and pull request to `main`:

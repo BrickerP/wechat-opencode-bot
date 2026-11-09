@@ -5,13 +5,12 @@ import { loadConfig } from './config.js';
 import { DATA_DIR } from './constants.js';
 import { logger } from './logger.js';
 import { appendMemory, memoryPath, readMemory } from './memory.js';
+import { breaker, DEFAULT_MODEL, fallbackModel, providerOf } from './model-routing.js';
 import { openCodeQuery, type PermissionDecision, type PermissionRequest, type QueryResult } from './opencode/provider.js';
 import type { StateDb, TaskRow, TaskStatus } from './tasks/db.js';
 
 /** OpenCode agent that plans each task and delegates the work to subagent sessions. */
 export const ORCHESTRATOR_AGENT = 'wechat-orchestrator';
-/** A task whose model fails or goes silent gets one more attempt, in a new session, on this model. */
-const FALLBACK_MODEL = process.env.OPENCODE_FALLBACK_MODEL || 'oneapi/DeepSeek-V4.1-Flash';
 
 const RECENT_TASKS = 8;
 const MAX_SUMMARY_CHARS = 100;
@@ -270,44 +269,87 @@ export function resultText(task: TaskRow): string {
 }
 
 /**
- * Run one task in a fresh orchestrator session and report the outcome. A model that fails or goes
- * silent gets one retry on FALLBACK_MODEL, and the user hears only the final outcome.
+ * Run one task in a fresh orchestrator session and report the outcome. A model whose gateway fails or goes
+ * silent gets one retry on fallbackModel, behind another gateway, and the user hears only the final outcome.
+ * Repeated upstream failures open that gateway's breaker: later tasks start on the fallback until the
+ * cooldown is over, and the user gets one notice when that begins.
  * A task that was finished elsewhere meanwhile (/stop, restart) is not reported again.
  */
 export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: AbortSignal): Promise<void> {
   const stopTyping = io.typing?.();
   let result: QueryResult;
+  // The last attempt's model; undefined runs the orchestrator agent's own model, taken to be DEFAULT_MODEL.
+  let model: string | undefined;
+  let attempts = 0;
+  let usedFallback = false;
+  let notice = '';
   try {
     pruneAttachments();
     const user = db.getUser(task.account_id);
     // A project task opens at the repo root, so OpenCode loads that repo's AGENTS.md and opencode.json.
     const workspace = task.project_dir || user?.workspace || loadConfig().workingDirectory;
     const attachments = resolveAttachments(db, task);
-    const attempt = (model: string | undefined, retry: boolean) =>
-      openCodeQuery({
+    const attempt = (next: string | undefined, retry: boolean) => {
+      model = next;
+      attempts++;
+      return openCodeQuery({
         prompt: composePrompt(db, task, workspace, attachments, retry),
         cwd: workspace,
         agent: ORCHESTRATOR_AGENT,
-        model,
+        model: next,
         title: `微信 #${task.seq}${retry ? ' 重试' : ''}: ${clip(task.input, 20)}`,
         files: attachments.paths,
         signal,
         onPermission: (request) => decidePermission(request, io),
         onSession: (sessionId) => db.setTaskSession(task.id, sessionId),
       });
-    result = await attempt(user?.model ?? undefined, false);
+    };
     // /stop and restarts finish the task elsewhere; only a failing or silent model is worth a second try.
-    if (result.upstream && !signal.aborted && db.getTask(task.id)?.status === 'running') {
-      logger.warn('retry with fallback model', {
+    const running = () => !signal.aborted && db.getTask(task.id)?.status === 'running';
+    /** Counts the last attempt's upstream failure against its gateway; true when that opens the breaker. */
+    const recordFailure = (): boolean => {
+      const provider = providerOf(model ?? DEFAULT_MODEL);
+      const opened = breaker.recordFailure(provider);
+      if (opened) {
+        logger.warn('Gateway breaker opened', { taskId: task.id, seq: task.seq, provider, threshold: breaker.threshold });
+      }
+      return opened;
+    };
+
+    const primary = user?.model ?? undefined;
+    const primaryProvider = providerOf(primary ?? DEFAULT_MODEL);
+    const fallback = fallbackModel(primary ?? DEFAULT_MODEL);
+    // While the primary's breaker is open, tasks start on the fallback; after the cooldown they try the primary again.
+    usedFallback = fallback !== undefined && breaker.isOpen(primaryProvider);
+    if (usedFallback) {
+      logger.warn('Gateway breaker open, skipping primary model', {
         taskId: task.id,
         seq: task.seq,
-        sessionId: result.sessionId,
-        model: FALLBACK_MODEL,
-        error: result.error,
+        provider: primaryProvider,
+        model: fallback,
       });
-      result = await attempt(FALLBACK_MODEL, true);
-      if (result.error && !result.interrupted) result.error = `备用模型重试后仍失败：${result.error}`;
     }
+    result = await attempt(usedFallback ? fallback : primary, false);
+    if (result.upstream && running()) {
+      const opened = recordFailure();
+      if (!usedFallback && fallback) {
+        logger.warn('retry with fallback model', {
+          taskId: task.id,
+          seq: task.seq,
+          sessionId: result.sessionId,
+          model: fallback,
+          errorKind: result.errorKind,
+          error: result.error,
+        });
+        // Only the failure that opens the breaker carries the notice, so the user hears it once per outage.
+        if (opened) notice = `⚠️ ${primaryProvider} 连续 ${breaker.threshold} 次失败，已切到备用模型 ${fallback}（后续任务自动跳过该网关，稍后自动恢复）`;
+        usedFallback = true;
+        result = await attempt(fallback, true);
+        if (result.upstream && running()) recordFailure();
+        if (result.error && !result.interrupted) result.error = `备用模型重试后仍失败：${result.error}`;
+      }
+    }
+    if (!result.error) breaker.recordSuccess(providerOf(model ?? DEFAULT_MODEL));
   } catch (err) {
     // openCodeQuery reports its own failures; this covers preparing the prompt.
     result = { text: '', sessionId: '', error: err instanceof Error ? err.message : String(err) };
@@ -315,6 +357,8 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
     stopTyping?.();
   }
 
+  // Queued ahead of the outcome, so the user reads the notice before the answer.
+  if (notice) db.addNotice(task.account_id, notice);
   if (result.interrupted) {
     if (!db.finishTask(task.id, 'interrupted', { error: result.error })) return;
   } else if (result.error) {
@@ -336,6 +380,10 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
     bot: task.bot_id,
     status: finished.status,
     sessionId: result.sessionId,
+    model: model ?? DEFAULT_MODEL,
+    attempts,
+    fallback: usedFallback,
+    errorKind: result.errorKind,
   });
   await io.deliver(finished);
 }

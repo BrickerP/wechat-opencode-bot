@@ -13,7 +13,7 @@ WeChat (phone) ←→ ilink bot API ←→ bot daemon (Node.js) ←→ OpenCode 
 - The daemon long-polls the WeChat ilink bot API. It only listens to the WeChat users in `WECHAT_ALLOWED_IDS`, by default the account that ran the setup.
 - A message that is not a command becomes a task. One task runs at a time; new messages queue (`⏳ 已排队：任务 #N（前面还有 X 个任务）`) and run in order. A task that waits more than 24 hours expires.
 - Each task runs in a new OpenCode session on the `wechat-orchestrator` agent. Sessions are never resumed: the bot puts the context into the prompt, namely the last 8 tasks (with reply excerpts for the latest 2) and the chat's memory.
-- A model that fails or goes silent gets one retry on `OPENCODE_FALLBACK_MODEL`. You only hear the final outcome.
+- A model whose gateway fails or goes silent gets one retry behind a different gateway (`OPENCODE_FALLBACK_MODEL`, or the cross-gateway chain). Three upstream failures in a row open that gateway's breaker: later tasks start on the fallback, one notice tells you, and the gateway is tried again after 10 minutes (doubling up to an hour). You only hear the final outcome.
 - Replies go out in chunks of 2048 characters. WeChat takes a reply only on a recent message token, so a reply that cannot go out waits in an outbox and is sent after your next message.
 - Images are kept for 24 hours. A text-only task that comes within 10 minutes after a task with images reuses those images.
 - A bot restart interrupts the running task with a ⏹ notice; queued tasks still run.
@@ -105,7 +105,9 @@ Put the settings in `~/.wechat-opencode-bot/env` (mode 600). The bot loads it at
 | `OPENCODE_URL` | `http://127.0.0.1:4096` | The OpenCode server |
 | `OPENCODE_SERVER_PASSWORD` | empty | The server password, sent as Basic auth for the user `opencode` |
 | `WECHAT_ALLOWED_IDS` | the bound account | WeChat user ids the bot listens to, comma-separated |
-| `OPENCODE_FALLBACK_MODEL` | `oneapi/DeepSeek-V4.1-Flash` | The model for the one retry |
+| `OPENCODE_FALLBACK_MODEL` | the cross-gateway chain (`oneapi-chat-gpt/gpt-6-astra`) | The model for the one retry; set it to override the chain |
+| `OPENCODE_DEFAULT_MODEL` | `oneapi/DeepSeek-V4.1-Flash` | The primary model routing assumes when `/model` is unset; such sessions still use the orchestrator agent's model |
+| `OWB_BREAKER_THRESHOLD`, `OWB_BREAKER_COOLDOWN_MS` | `3`, `600000` | Consecutive upstream failures that open a gateway's breaker, and its first cooldown; a failed probe doubles it, up to 1 hour |
 | `OPENCODE_FIRST_RESPONSE_TIMEOUT_MS`, `OPENCODE_STALL_TIMEOUT_MS` | `120000`, `180000` | How long the model may take to start answering, and then between signs of progress |
 
 Try one task without WeChat with `node dist/main.js --simulate "列出工作目录"`, or run the bot in the foreground with `node dist/main.js --daemon`. For the always-on setup with launchd, releases and rollback, follow [docs/DEPLOY.md](docs/DEPLOY.md).

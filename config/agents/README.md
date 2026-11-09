@@ -8,6 +8,8 @@ The prompts the bot's tasks run with. `src/orchestrator.ts` parses the markers t
 | `wechat-explore.md` | subagent | Read-only exploration |
 | `wechat-general.md` | subagent | Implementation with full access |
 
+The two subagents have no `model:` line on purpose: OpenCode then runs them on the parent session's model, so a task that fell back to another gateway keeps its whole session tree on that gateway. `wechat-orchestrator.md` pins the default primary model; `/model` overrides it per chat. Keep that pinned model equal to `OPENCODE_DEFAULT_MODEL` (default `oneapi/DeepSeek-V4.1-Flash`): routing assumes this gateway when a chat has not picked a model, and the two disagreeing would charge failures to the wrong gateway.
+
 `wechat-ducc.md` in the live agents directory is not kept here: no agent is allowed to delegate to it.
 
 ## How they are deployed

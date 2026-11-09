@@ -13,7 +13,7 @@
 - 守护进程长轮询微信 ilink bot API，只处理 `WECHAT_ALLOWED_IDS` 里的微信用户，默认是执行 setup 的那个账号。
 - 不是命令的消息都会创建任务。同一时间只运行一个任务，新消息排队（`⏳ 已排队：任务 #N（前面还有 X 个任务）`）并按顺序执行；排队超过 24 小时的任务会过期。
 - 每个任务都在新的 OpenCode 会话里运行，使用 `wechat-orchestrator` agent。会话从不复用：上下文由 bot 写进提示词，包括最近 8 个任务（其中最近 2 个带回复摘录）和这个聊天的记忆。
-- 模型出错或长时间没有输出时，会用 `OPENCODE_FALLBACK_MODEL` 重试一次，你只会收到最终结果。
+- 模型所在网关出错或长时间没有输出时，会换到另一条网关重试一次（`OPENCODE_FALLBACK_MODEL`，或默认的跨网关链）。同一网关连续 3 次上游失败会熔断：后续任务直接走备用模型，只发一条通知；10 分钟后自动重试该网关，再失败则等待时间翻倍，最长 1 小时。你只会收到最终结果。
 - 回复按 2048 字符分段发送。微信只接受基于最近一条消息 token 的回复，发不出去的回复会进入待发队列，在你发下一条消息后补发。
 - 图片保留 24 小时。紧跟在带图片的任务之后、10 分钟内发出的纯文字任务，会沿用那些图片。
 - bot 重启会中断正在运行的任务并发出 ⏹ 通知，排队的任务照常执行。
@@ -105,7 +105,9 @@ npm run setup     # 用微信扫码，然后输入工作目录
 | `OPENCODE_URL` | `http://127.0.0.1:4096` | OpenCode 服务地址 |
 | `OPENCODE_SERVER_PASSWORD` | 空 | 服务密码，以用户名 `opencode` 走 Basic 认证 |
 | `WECHAT_ALLOWED_IDS` | 绑定的账号 | 允许发任务的微信用户 id，逗号分隔 |
-| `OPENCODE_FALLBACK_MODEL` | `oneapi/DeepSeek-V4.1-Flash` | 重试那一次使用的模型 |
+| `OPENCODE_FALLBACK_MODEL` | 跨网关链（`oneapi-chat-gpt/gpt-6-astra`） | 重试那一次使用的模型；设置后覆盖默认链 |
+| `OPENCODE_DEFAULT_MODEL` | `oneapi/DeepSeek-V4.1-Flash` | 未设置 `/model` 时路由假定的主模型；这类会话实际仍使用 orchestrator agent 自己的模型 |
+| `OWB_BREAKER_THRESHOLD`、`OWB_BREAKER_COOLDOWN_MS` | `3`、`600000` | 同一网关连续多少次上游失败后熔断，以及第一次冷却时间；探测再失败则翻倍，最长 1 小时 |
 | `OPENCODE_FIRST_RESPONSE_TIMEOUT_MS`、`OPENCODE_STALL_TIMEOUT_MS` | `120000`、`180000` | 模型开始输出的等待上限，以及之后两次进展之间的等待上限 |
 
 不接微信也能先试一个任务：`node dist/main.js --simulate "列出工作目录"`；或者用 `node dist/main.js --daemon` 在前台运行 bot。常驻运行（launchd、发布、回滚）请按 [docs/DEPLOY.md](docs/DEPLOY.md) 操作。

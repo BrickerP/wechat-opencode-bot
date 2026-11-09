@@ -1,5 +1,6 @@
-// runTask against a fake OpenCode server: the first-response and stall watchdogs, the one-shot fallback,
-// the directory each session opens in, and the bot a task speaks as.
+// runTask against a fake OpenCode server: the first-response and stall watchdogs, the one-shot fallback to
+// another gateway and the breaker that skips a failing one, the directory each session opens in, and the
+// bot a task speaks as.
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
@@ -15,8 +16,19 @@ const STALL_MS = 2500;
 const TOOL_MS = 5000;
 const REPLY = '<<<WECHAT_REPLY>>>\nok\n<<<WECHAT_MEMORY>>>\n- 无\n<<<WECHAT_SUMMARY>>>\nok';
 const FACT = '用户喜欢简短的回复';
+/** The session model of the fallback for the default oneapi/DeepSeek-V4.1-Flash. */
+const GPT = { providerID: 'oneapi-chat-gpt', id: 'gpt-6-astra' };
 
-type Script = 'silent' | 'answer' | 'remember' | 'provider-error' | 'rejected' | 'child-stall' | 'child-tool';
+type Script =
+  | 'silent'
+  | 'answer'
+  | 'remember'
+  | 'provider-error'
+  | 'quota'
+  | 'gateway-502'
+  | 'rejected'
+  | 'child-stall'
+  | 'child-tool';
 
 interface FakeSession {
   id: string;
@@ -60,6 +72,10 @@ const play: Record<Script, (session: FakeSession) => void> = {
   remember: (s) => later(100, () => answer(s, REPLY.replace('- 无', `- ${FACT}`))),
   'provider-error': (s) =>
     later(100, () => s.messages.push(idle('failed', { type: 'provider.internal', message: 'control plan is unavailable' }))),
+  quota: (s) => later(100, () => s.messages.push(idle('failed', { type: 'provider.quota', message: 'quota exceeded' }))),
+  // A gateway error OpenCode did not map to a provider.* type.
+  'gateway-502': (s) =>
+    later(100, () => s.messages.push(idle('failed', { type: 'unknown', message: 'do request failed: HTTP 502 Bad Gateway' }))),
   rejected: (s) => later(100, () => s.messages.push(idle('failed', { type: 'permission.rejected', message: 'rejected' }))),
   // The orchestrator delegates, then the subagent's model goes quiet after its first thought.
   'child-stall': (s) =>
@@ -123,6 +139,9 @@ process.env.OPENCODE_SERVER_PASSWORD = '';
 process.env.OPENCODE_FIRST_RESPONSE_TIMEOUT_MS = String(FIRST_MS);
 process.env.OPENCODE_STALL_TIMEOUT_MS = String(STALL_MS);
 delete process.env.OPENCODE_FALLBACK_MODEL;
+delete process.env.OPENCODE_DEFAULT_MODEL;
+delete process.env.OWB_BREAKER_THRESHOLD;
+delete process.env.OWB_BREAKER_COOLDOWN_MS;
 
 const server = createServer(handle);
 await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -130,6 +149,7 @@ process.env.OPENCODE_URL = `http://127.0.0.1:${(server.address() as AddressInfo)
 
 // provider.ts reads its settings at module load, so the bot modules load after the fake server is up.
 const { resultText, runTask } = await import('../orchestrator.js');
+const { resetModelRouting } = await import('../model-routing.js');
 const { openStateDb } = await import('../tasks/db.js');
 const db = openStateDb(join(tmp, 'state.db'));
 
@@ -161,12 +181,16 @@ async function run(plan: Script[], { stopAfterMs, project, botId }: RunOptions =
 beforeEach(() => {
   sessions.length = 0;
   scripts.length = 0;
+  // Gateway state lives in memory for the whole process; each test starts with every breaker closed.
+  resetModelRouting();
+  delete process.env.OWB_BREAKER_THRESHOLD;
 });
 
 after(() => {
   server.closeAllConnections();
   server.close();
   rmSync(tmp, { recursive: true, force: true });
+  delete process.env.OWB_BREAKER_THRESHOLD;
 });
 
 test('a model that never answers times out, and the fallback model finishes the task', async () => {
@@ -176,7 +200,7 @@ test('a model that never answers times out, and the fallback model finishes the 
   assert.equal(roots.length, 2);
   assert.ok(roots[0].interrupted, 'the silent session is interrupted');
   assert.equal(roots[0].model, undefined);
-  assert.deepEqual(roots[1].model, { providerID: 'oneapi', id: 'DeepSeek-V4.1-Flash' });
+  assert.deepEqual(roots[1].model, GPT);
   assert.doesNotMatch(roots[0].prompt ?? '', /^retry: /m);
   assert.match(roots[1].prompt ?? '', /^retry: /m);
   assert.equal(task.session_id, roots[1].id);
@@ -207,6 +231,12 @@ test('a provider error is retried once, then the task fails with a short error',
   assert.equal(delivered.length, 1);
 });
 
+test('a gateway error OpenCode did not map to provider.* is retried on the fallback too', async () => {
+  const { task, roots } = await run(['gateway-502', 'answer']);
+  assert.equal(task.status, 'done');
+  assert.deepEqual(roots.map((s) => s.model), [undefined, GPT]);
+});
+
 test('other failures are not retried', async () => {
   const { task, roots } = await run(['rejected', 'answer']);
   assert.equal(task.status, 'failed');
@@ -221,6 +251,36 @@ test('a stopped task is not retried', async () => {
   assert.equal(roots.length, 1);
   assert.ok(roots[0].interrupted);
   assert.equal(delivered.length, 0);
+});
+
+test('a gateway that keeps failing is skipped by later tasks, and the user hears it once', async () => {
+  process.env.OWB_BREAKER_THRESHOLD = '1';
+  const notices = db.pendingNotices('test').length;
+  const first = await run(['quota', 'answer']);
+  assert.equal(first.task.status, 'done');
+  assert.deepEqual(first.roots.map((s) => s.model), [undefined, GPT]);
+  sessions.length = 0;
+  const second = await run(['answer']);
+  assert.equal(second.task.status, 'done');
+  assert.deepEqual(second.roots.map((s) => s.model), [GPT], 'one session, already on the fallback');
+  assert.doesNotMatch(second.roots[0].prompt ?? '', /^retry: /m);
+  assert.deepEqual(
+    db.pendingNotices('test').slice(notices).map((n) => n.text),
+    ['⚠️ oneapi 连续 1 次失败，已切到备用模型 oneapi-chat-gpt/gpt-6-astra（后续任务自动跳过该网关，稍后自动恢复）'],
+  );
+});
+
+test('a success in between starts the count over, so the gateway is not skipped', async () => {
+  process.env.OWB_BREAKER_THRESHOLD = '2';
+  const notices = db.pendingNotices('test').length;
+  const plans: Script[][] = [['quota', 'answer'], ['answer'], ['quota', 'answer'], ['answer']];
+  const models: unknown[][] = [];
+  for (const plan of plans) {
+    sessions.length = 0;
+    models.push((await run(plan)).roots.map((s) => s.model));
+  }
+  assert.deepEqual(models, [[undefined, GPT], [undefined], [undefined, GPT], [undefined]]);
+  assert.equal(db.pendingNotices('test').length, notices);
 });
 
 test('a project task opens its sessions at the repo root, any other task in the account workspace', async () => {

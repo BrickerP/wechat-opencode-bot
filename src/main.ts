@@ -12,7 +12,7 @@ import { backupStateDb } from './backup.js';
 import { acquireDaemonLock, lockHolder, releaseDaemonLock } from './lifecycle.js';
 import { logger } from './logger.js';
 import { createNotifier, runNotify } from './notify.js';
-import { IMAGE_ONLY_INPUT, runTask, saveAttachment } from './orchestrator.js';
+import { formatQueueAck, IMAGE_ONLY_INPUT, runTask, saveAttachment } from './orchestrator.js';
 import { initOpenCode, interruptSession } from './opencode/provider.js';
 import { createPermissionBroker } from './permission.js';
 import { routeMessage } from './projects.js';
@@ -213,7 +213,16 @@ async function runDaemon(): Promise<void> {
     });
     queue.kick(accountId);
     // A task that starts right away is acknowledged by the typing indicator.
-    if (ahead > 0) await notifier.reply(accountId, `⏳ 已排队：任务 #${task.seq}（前面还有 ${ahead} 个任务）`);
+    if (ahead > 0) {
+      // The ETA is a nicety: without it the ack still goes out.
+      let durations: number[] = [];
+      try {
+        durations = db.recentDurations(accountId);
+      } catch (err) {
+        logger.warn('Queue ETA unavailable', { error: String(err) });
+      }
+      await notifier.reply(accountId, formatQueueAck(task.seq, ahead, durations));
+    }
   }
 
   // The monitor does not await onMessage; chaining keeps inbound messages in arrival order.

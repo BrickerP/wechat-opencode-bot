@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { longestFirst, mentionPattern, prefixPattern } from './aliases.js';
-import { botAliases, defaultBot, detectBot, loadBots, type Bot } from './bots.js';
+import { ALL_BOTS, botAliases, defaultBot, detectBot, loadBots, type Bot } from './bots.js';
 import { loadConfig } from './config.js';
 import { DATA_DIR } from './constants.js';
 import { logger } from './logger.js';
@@ -32,12 +32,16 @@ const KNOWN_PROJECTS: Record<string, { id: string; aliases: string[] }> = {
 /** The base itself is a project when it is a repo. */
 const PROJECT_MARKERS = ['.git', 'AGENTS.md', 'opencode.json'];
 
-/** A follow-up stays in the previous task's project only if that task came this recently. */
+/** A follow-up stays in the previous task's project, and with its bot, only if that task came this recently. */
 const FOLLOW_UP_MS = 2 * 60 * 60 * 1000;
 /** A follow-up opens with one of these cues; inside another word (其它, 再见) or later in a sentence they mean nothing. */
 const FOLLOW_UP = /^(继续|接着|然后|再(?!见)|那|这个|上面|刚才|它|还有|第二个|改一下|看一下)/;
 /** Longer messages are new requests: they name their project or run in the base. */
 const FOLLOW_UP_MAX_CHARS = 32;
+/** Opens a message that follows neither the last project nor the last bot; it comes off the text. */
+const NEW_TOPIC = /^\s*(?:新话题|换个话题|new\s+topic(?![A-Za-z]))(?=$|[\s:：,，])[\s:：,，]*/i;
+/** "@base" at the start runs the task in the base workspace, whether or not the registry has a "base" project. */
+const BASE_PREFIX = prefixPattern('base');
 /** Shorter aliases only work as an explicit "@alias". */
 const MIN_MENTION_CHARS = 2;
 
@@ -166,8 +170,9 @@ export function stripProjectPrefix(text: string, project: Project): string {
 /**
  * Who answers an inbound message, where it runs, and the text to store for it. The "@bot" prefix
  * comes off first and the project is found in the rest, so "@research 在 miaoda 里…" is both. A
- * message that opens with "@project" may name its bot right after it: "@miaoda @eng …".
- * No project means the account's workspace.
+ * message that opens with "@project" or "@base" may name its bot right after it: "@miaoda @eng …".
+ * A short follow-up such as "继续" that names no bot stays with the last task's bot, as it stays in
+ * the last task's project; "新话题：…" follows neither. No project means the account's workspace.
  */
 export function routeMessage(
   db: StateDb,
@@ -175,15 +180,23 @@ export function routeMessage(
   text: string,
 ): { input: string; project?: TaskProject; botId: string } {
   const bots = loadBots();
-  const { botId, input: rest } = detectBot(text, bots);
-  const base = loadConfig().workingDirectory;
-  const [last] = db.recentTasks(accountId, 1);
-  const lastProjectId = last && Date.now() - last.created_at <= FOLLOW_UP_MS ? last.project_id : null;
-  const project = detectProject(rest, loadProjects(base, PROJECTS_PATH, bots), lastProjectId);
-  if (!project) return { input: rest, botId };
-  const input = stripProjectPrefix(rest, project);
+  const topic = NEW_TOPIC.exec(text);
+  const message = (topic && text.slice(topic[0].length).trim()) || text;
+  const { botId, input: rest } = detectBot(message, bots);
   // Only a message that no "@bot" opened looks for one after the project; a message names one bot.
-  const opened = botId !== defaultBot(bots).id || rest !== text;
-  const routed = opened ? { botId, input } : detectBot(input, bots);
-  return { input: routed.input, project: { id: project.id, dir: resolveProjectDir(base, project) }, botId: routed.botId };
+  const opened = botId !== defaultBot(bots).id || rest !== message;
+  const withBot = (input: string) => (opened ? { botId, input } : detectBot(input, bots));
+  if (BASE_PREFIX.test(rest)) return withBot(rest.replace(BASE_PREFIX, '').trim() || rest);
+
+  const base = loadConfig().workingDirectory;
+  const last = topic ? undefined : db.recentTasks(accountId, 1)[0];
+  const recent = last && Date.now() - last.created_at <= FOLLOW_UP_MS ? last : undefined;
+  const project = detectProject(rest, loadProjects(base, PROJECTS_PATH, bots), recent?.project_id);
+  const routed = withBot(project ? stripProjectPrefix(rest, project) : rest);
+  // A follow-up opens with its cue, so no "@project" and no "@bot" stands before it.
+  const lastBot = recent?.bot_id;
+  if (!opened && lastBot && isFollowUp(rest) && (lastBot === ALL_BOTS || bots.some((bot) => bot.id === lastBot))) {
+    routed.botId = lastBot;
+  }
+  return project ? { ...routed, project: { id: project.id, dir: resolveProjectDir(base, project) } } : routed;
 }

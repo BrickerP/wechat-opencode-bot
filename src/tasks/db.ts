@@ -285,6 +285,15 @@ export function openStateDb(file: string = STATE_DB_PATH) {
         : all<TaskRow>(`${TASK_SELECT} WHERE t.account_id = ? ORDER BY t.rowid DESC LIMIT ?`, accountId, limit);
     },
 
+    /** How long the newest done tasks ran (ms), newest first; the queue ack's ETA comes from them. */
+    recentDurations(accountId: string, limit = 10): number[] {
+      return all<{ ms: number }>(
+        `SELECT finished_at - started_at AS ms FROM tasks WHERE account_id = ? AND status = 'done'
+           AND started_at IS NOT NULL AND finished_at IS NOT NULL AND finished_at >= started_at ORDER BY rowid DESC LIMIT ?`,
+        accountId, limit,
+      ).map((row) => row.ms);
+    },
+
     statusCounts(accountId: string): Record<TaskStatus, number> {
       const counts: Record<TaskStatus, number> = { queued: 0, running: 0, done: 0, failed: 0, interrupted: 0 };
       for (const row of all<{ status: TaskStatus; n: number }>(

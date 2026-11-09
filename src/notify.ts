@@ -152,6 +152,10 @@ export function createNotifier(db: StateDb, api: WeChatApi, sender: Sender) {
         await flush(accountId);
       },
       typing: () => typing(accountId),
+      // Progress notes are best-effort replies: one that fails to send is not worth a retry.
+      async progress(text) {
+        await reply(accountId, text);
+      },
       async onPermission(request) {
         // Register before asking so a quick answer cannot arrive ahead of the pending entry.
         const answer = broker.createPending(accountId, request.action, request.resources.join(', '));

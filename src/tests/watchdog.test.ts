@@ -1,6 +1,6 @@
 // runTask against a fake OpenCode server: the first-response and stall watchdogs, the one-shot fallback to
-// another gateway and the breaker that skips a failing one, the directory each session opens in, and the
-// bot a task speaks as.
+// another gateway and the breaker that skips a failing one, the progress notes of a long task, the directory
+// each session opens in, and the bot a task speaks as.
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
@@ -14,6 +14,8 @@ const FIRST_MS = 2000;
 const STALL_MS = 2500;
 /** Longer than STALL_MS plus a poll, so only the running-tool rule keeps the turn alive. */
 const TOOL_MS = 5000;
+/** Progress notes per task; a turn that runs past 300ms gets its first. */
+const PROGRESS_MAX = 2;
 const REPLY = '<<<WECHAT_REPLY>>>\nok\n<<<WECHAT_MEMORY>>>\n- 无\n<<<WECHAT_SUMMARY>>>\nok';
 const FACT = '用户喜欢简短的回复';
 /** The session model of the fallback for the default oneapi/DeepSeek-V4.1-Flash. */
@@ -138,6 +140,10 @@ process.env.OWB_DATA_DIR = join(tmp, 'data');
 process.env.OPENCODE_SERVER_PASSWORD = '';
 process.env.OPENCODE_FIRST_RESPONSE_TIMEOUT_MS = String(FIRST_MS);
 process.env.OPENCODE_STALL_TIMEOUT_MS = String(STALL_MS);
+process.env.OWB_PROGRESS_FIRST_MS = '300';
+process.env.OWB_PROGRESS_MIN_GAP_MS = '200';
+process.env.OWB_PROGRESS_EVERY_MS = '1000';
+process.env.OWB_PROGRESS_MAX = String(PROGRESS_MAX);
 delete process.env.OPENCODE_FALLBACK_MODEL;
 delete process.env.OPENCODE_DEFAULT_MODEL;
 delete process.env.OWB_BREAKER_THRESHOLD;
@@ -158,10 +164,12 @@ interface RunOptions {
   stopAfterMs?: number;
   project?: TaskProject;
   botId?: string;
+  /** Every progress note fails to send, as a reply does while WeChat is unreachable. */
+  progressFails?: boolean;
 }
 
 /** Run one task through the given session scripts. */
-async function run(plan: Script[], { stopAfterMs, project, botId }: RunOptions = {}) {
+async function run(plan: Script[], { stopAfterMs, project, botId, progressFails }: RunOptions = {}) {
   scripts.push(...plan);
   const task = db.startTaskNow('test', 'hi', project, botId)!;
   const controller = new AbortController();
@@ -172,10 +180,22 @@ async function run(plan: Script[], { stopAfterMs, project, botId }: RunOptions =
     });
   }
   const delivered: TaskRow[] = [];
+  const progress: string[] = [];
   const startedAt = Date.now();
-  await runTask(db, task, { deliver: async (t) => void delivered.push(t) }, controller.signal);
+  await runTask(
+    db,
+    task,
+    {
+      deliver: async (t) => void delivered.push(t),
+      progress: async (text) => {
+        progress.push(text);
+        if (progressFails) throw new Error('send failed');
+      },
+    },
+    controller.signal,
+  );
   const roots = sessions.filter((s) => !s.parentID);
-  return { task: db.getTask(task.id)!, delivered, roots, elapsed: Date.now() - startedAt };
+  return { task: db.getTask(task.id)!, delivered, progress, roots, elapsed: Date.now() - startedAt };
 }
 
 beforeEach(() => {
@@ -216,11 +236,31 @@ test('a subagent that stops making progress times out the turn', async () => {
   assert.ok(child?.interrupted, 'the stalled subagent session is interrupted');
 });
 
-test('a tool that runs longer than the stall timeout is not a stall', async () => {
-  const { task, roots, elapsed } = await run(['child-tool']);
+test('a tool that runs longer than the stall timeout is not a stall, and the user hears that the task is running', async () => {
+  const { task, roots, elapsed, progress } = await run(['child-tool']);
   assert.equal(task.status, 'done');
   assert.equal(roots.length, 1);
   assert.ok(elapsed >= TOOL_MS, `took ${elapsed}ms`);
+  assert.ok(progress.length >= 1 && progress.length <= PROGRESS_MAX, `${progress.length} notes`);
+  assert.match(progress[0], new RegExp(`^⏳ 任务 #${task.seq} 运行中（\\d+秒），已派出 1 个子任务$`));
+});
+
+test('a task that finishes quickly sends no progress note', async () => {
+  const { task, progress } = await run(['answer']);
+  assert.equal(task.status, 'done');
+  assert.deepEqual(progress, []);
+});
+
+test('progress notes stop at the cap over both attempts, and a note that fails to send is dropped', async () => {
+  const notices = db.pendingNotices('test').length;
+  // Uncapped, the silent primary and the fallback's long tool would bring 4 notes.
+  const { task, roots, progress } = await run(['silent', 'child-tool'], { progressFails: true });
+  assert.equal(task.status, 'done');
+  assert.equal(roots.length, 2);
+  assert.equal(progress.length, PROGRESS_MAX);
+  assert.match(progress[0], new RegExp(`^⏳ 任务 #${task.seq} 运行中（\\d+秒）$`), 'the silent primary has no subagent');
+  assert.match(progress[1], /，已派出 1 个子任务$/);
+  assert.equal(db.pendingNotices('test').length, notices, 'progress never goes to the outbox');
 });
 
 test('a provider error is retried once, then the task fails with a short error', async () => {

@@ -19,6 +19,8 @@ export interface QueryOptions {
   onPermission?: (request: PermissionRequest) => Promise<PermissionDecision>;
   /** Called once the session exists, before the prompt is sent. */
   onSession?: (sessionId: string) => void;
+  /** Called while the turn runs, at most once per poll: how long it has run and how many subagent sessions exist. */
+  onProgress?: (update: { elapsedMs: number; children: number; idleMs: number }) => void;
 }
 
 export interface PermissionRequest {
@@ -496,6 +498,11 @@ async function waitForTurn(sessionId: string, since: number, options: QueryOptio
     }
     if (responded && now - progressAt > STALL_TIMEOUT_MS) {
       throw new TurnTimeout(`上游模型 ${STALL_TIMEOUT_MS / 1000} 秒无进展`);
+    }
+    try {
+      options.onProgress?.({ elapsedMs: now - startedAt, children: children.length, idleMs: now - progressAt });
+    } catch (err) {
+      logger.debug("Progress callback failed", { sessionId, error: String(err) });
     }
 
     await sleep(POLL_INTERVAL_MS, options.signal);

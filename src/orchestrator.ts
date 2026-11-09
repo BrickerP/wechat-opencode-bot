@@ -26,6 +26,8 @@ export interface TaskIO {
   deliver(task: TaskRow): Promise<void>;
   /** Starts a typing indicator and returns the function that stops it. */
   typing?(): () => void;
+  /** Best-effort note while a long task runs; a failed one is dropped, never queued for retry. */
+  progress?(text: string): void | Promise<void>;
   onPermission?(request: PermissionRequest): Promise<PermissionDecision>;
 }
 
@@ -249,6 +251,15 @@ export function parseOrchestratorOutput(text: string): OrchestratorOutput {
 
 const EDIT_ACTION = /edit|write|patch/i;
 
+/** A long task gets its first progress note once an attempt has run this long. */
+const PROGRESS_FIRST_MS = Number(process.env.OWB_PROGRESS_FIRST_MS) || 60_000;
+/** Progress notes are at least this far apart. */
+const PROGRESS_MIN_GAP_MS = Number(process.env.OWB_PROGRESS_MIN_GAP_MS) || 90_000;
+/** After the first note, only new subagent sessions or this much time bring another. */
+const PROGRESS_EVERY_MS = Number(process.env.OWB_PROGRESS_EVERY_MS) || 300_000;
+/** Progress notes per task, over all its attempts. */
+const PROGRESS_MAX = Number(process.env.OWB_PROGRESS_MAX) || 4;
+
 /** The mode is read per request so /permission applies to a task that is already running. */
 async function decidePermission(request: PermissionRequest, io: TaskIO): Promise<PermissionDecision> {
   const mode = loadConfig().permissionMode ?? 'default';
@@ -268,11 +279,48 @@ export function resultText(task: TaskRow): string {
   return `⏹ ${label} 已中断${reason}，需要的话请重新发送`;
 }
 
+/** The ack for a task that has to wait. The ETA is the median run time of recent tasks, once per task ahead. */
+export function formatQueueAck(seq: number, ahead: number, durations: number[]): string {
+  const ack = `⏳ 已排队：任务 #${seq}（前面还有 ${ahead} 个任务）`;
+  if (!durations.length) return ack;
+  const sorted = [...durations].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  const median = sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+  const eta = median * ahead;
+  return `${ack}，${eta < 60_000 ? '预计不到 1 分钟' : `预计约 ${Math.round(eta / 60_000)} 分钟`}`;
+}
+
+/**
+ * The onProgress handler of one task, shared by its attempts so the limits hold for the whole task: a note
+ * once an attempt has run PROGRESS_FIRST_MS, then on new subagent sessions or every PROGRESS_EVERY_MS.
+ * Notes go out through io.progress, never the outbox, and a failed one is only logged.
+ */
+function progressNotes(task: TaskRow, io: TaskIO, running: () => boolean) {
+  const startedAt = task.started_at ?? Date.now();
+  let sent = 0;
+  let lastSent = 0;
+  let lastChildren = 0;
+  return ({ elapsedMs, children }: { elapsedMs: number; children: number }): void => {
+    const now = Date.now();
+    if (!io.progress || sent >= PROGRESS_MAX || elapsedMs < PROGRESS_FIRST_MS || now - lastSent < PROGRESS_MIN_GAP_MS) return;
+    if (children <= lastChildren && now - lastSent < PROGRESS_EVERY_MS) return;
+    if (!running()) return;
+    sent++;
+    lastSent = now;
+    lastChildren = children;
+    const text = `⏳ 任务 #${task.seq} 运行中（${formatElapsed(startedAt, now)}）${children > 0 ? `，已派出 ${children} 个子任务` : ''}`;
+    Promise.resolve()
+      .then(() => io.progress?.(text))
+      .catch((err) => logger.debug('Progress note failed', { taskId: task.id, error: String(err) }));
+  };
+}
+
 /**
  * Run one task in a fresh orchestrator session and report the outcome. A model whose gateway fails or goes
  * silent gets one retry on fallbackModel, behind another gateway, and the user hears only the final outcome.
  * Repeated upstream failures open that gateway's breaker: later tasks start on the fallback until the
- * cooldown is over, and the user gets one notice when that begins.
+ * cooldown is over, and the user gets one notice when that begins. While it runs, a long task sends a few
+ * best-effort progress notes (progressNotes).
  * A task that was finished elsewhere meanwhile (/stop, restart) is not reported again.
  */
 export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: AbortSignal): Promise<void> {
@@ -289,6 +337,9 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
     // A project task opens at the repo root, so OpenCode loads that repo's AGENTS.md and opencode.json.
     const workspace = task.project_dir || user?.workspace || loadConfig().workingDirectory;
     const attachments = resolveAttachments(db, task);
+    // /stop and restarts finish the task elsewhere; only a failing or silent model is worth a second try.
+    const running = () => !signal.aborted && db.getTask(task.id)?.status === 'running';
+    const onProgress = progressNotes(task, io, running);
     const attempt = (next: string | undefined, retry: boolean) => {
       model = next;
       attempts++;
@@ -302,10 +353,9 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
         signal,
         onPermission: (request) => decidePermission(request, io),
         onSession: (sessionId) => db.setTaskSession(task.id, sessionId),
+        onProgress,
       });
     };
-    // /stop and restarts finish the task elsewhere; only a failing or silent model is worth a second try.
-    const running = () => !signal.aborted && db.getTask(task.id)?.status === 'running';
     /** Counts the last attempt's upstream failure against its gateway; true when that opens the breaker. */
     const recordFailure = (): boolean => {
       const provider = providerOf(model ?? DEFAULT_MODEL);

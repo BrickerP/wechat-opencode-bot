@@ -28,6 +28,7 @@ export interface TaskRow {
   created_at: number;
   started_at: number | null;
   finished_at: number | null;
+  /** OpenCode session of the task's last attempt; null before it has one and once retention deleted it. */
   session_id: string | null;
   result: string | null;
   summary: string | null;
@@ -343,6 +344,25 @@ export function openStateDb(file: string = STATE_DB_PATH) {
 
     setTaskSession(id: string, sessionId: string): void {
       run('UPDATE tasks SET session_id = ? WHERE id = ?', sessionId, id);
+    },
+
+    /**
+     * Sessions retention may delete: those of tasks that finished before cutoff (epoch ms), oldest first. The
+     * newest keep finished tasks keep theirs however old they are. A session no task records never qualifies.
+     */
+    staleSessionIds: (cutoff: number, keep: number) =>
+      all<{ session_id: string }>(
+        `SELECT t.session_id FROM tasks t WHERE t.session_id IS NOT NULL AND t.status IN ('done', 'failed', 'interrupted')
+           AND t.finished_at IS NOT NULL AND t.finished_at < ?
+           AND t.session_id NOT IN (SELECT session_id FROM tasks WHERE session_id IS NOT NULL AND finished_at IS NOT NULL
+             ORDER BY finished_at DESC LIMIT ?)
+         ORDER BY t.finished_at ASC`,
+        cutoff, keep,
+      ).map((row) => row.session_id),
+
+    /** The session is gone from OpenCode: its tasks stop naming it, so retention does not ask for it again. */
+    forgetSession(sessionId: string): void {
+      run('UPDATE tasks SET session_id = NULL WHERE session_id = ?', sessionId);
     },
 
     /**

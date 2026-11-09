@@ -165,6 +165,7 @@ It also prints the bot's command line, its working directory and where `current`
 
 - `~/.wechat-opencode-bot/backups/` collects `state.db.pre-<tag>-<time>`, `run-bot.sh.pre-<tag>-<time>`, `agents-<time>/` and `launchd-<time>/`. Nothing prunes it.
 - Installed releases stay in `releases/`, so a rollback needs no tarball. Delete old releases and their tarballs by hand, never the one `current` points at (`readlink current`).
+- Session retention: at startup and every 24 hours the bot deletes, through the OpenCode API, the sessions of tasks that finished more than `OWB_SESSION_TTL_DAYS` (default 7) ago, always keeping the newest `OWB_SESSION_KEEP` (default 300) finished tasks' sessions. It only touches sessions recorded in `state.db` and never opens `opencode.db`; a session it deletes is forgotten in `state.db`, and a failed delete is retried on the next run. SQLite does not shrink on delete, so the file stops growing rather than getting smaller.
 
 ## Model routing
 

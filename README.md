@@ -109,6 +109,7 @@ Put the settings in `~/.wechat-opencode-bot/env` (mode 600). The bot loads it at
 | `OPENCODE_DEFAULT_MODEL` | `oneapi/DeepSeek-V4.1-Flash` | The primary model routing assumes when `/model` is unset; such sessions still use the orchestrator agent's model |
 | `OWB_BREAKER_THRESHOLD`, `OWB_BREAKER_COOLDOWN_MS` | `3`, `600000` | Consecutive upstream failures that open a gateway's breaker, and its first cooldown; a failed probe doubles it, up to 1 hour |
 | `OWB_FAILURE_ALERT_COUNT`, `OWB_FAILURE_ALERT_WINDOW_MS`, `OWB_FAILURE_ALERT_COOLDOWN_MS` | `3`, `1800000`, `1800000` | Failed tasks within the window that send one alert to WeChat, the window, and how long the next alert waits |
+| `OWB_SESSION_TTL_DAYS`, `OWB_SESSION_KEEP` | `7`, `300` | Delete a finished task's OpenCode session after this many days through the API, always keeping the newest N sessions |
 | `OPENCODE_FIRST_RESPONSE_TIMEOUT_MS`, `OPENCODE_STALL_TIMEOUT_MS` | `120000`, `180000` | How long the model may take to start answering, and then between signs of progress |
 
 Try one task without WeChat with `node dist/main.js --simulate "列出工作目录"`, or run the bot in the foreground with `node dist/main.js --daemon`. For the always-on setup with launchd, releases and rollback, follow [docs/DEPLOY.md](docs/DEPLOY.md).

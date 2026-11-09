@@ -295,6 +295,18 @@ export async function interruptSession(sessionId: string): Promise<void> {
   );
 }
 
+/** OpenCode's 404 for a session that does not exist, as opposed to a route it does not have. */
+const SESSION_NOT_FOUND = /-> HTTP 404: .*"SessionNotFoundError"/;
+
+/** Delete a session; OpenCode deletes its child sessions with it. One that is already gone counts as deleted. */
+export async function deleteSession(sessionId: string): Promise<void> {
+  try {
+    await api(`/api/session/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
+  } catch (err) {
+    if (!SESSION_NOT_FOUND.test(String(err))) throw err;
+  }
+}
+
 async function listPendingPermissions(sessionId: string): Promise<PermissionRequest[]> {
   try {
     const out = await api<{ data: any[] }>(`/api/session/${sessionId}/permission`);

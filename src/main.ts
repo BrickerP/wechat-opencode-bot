@@ -17,6 +17,7 @@ import { formatQueueAck, IMAGE_ONLY_INPUT, runTask, saveAttachment } from './orc
 import { initOpenCode, interruptSession } from './opencode/provider.js';
 import { createPermissionBroker } from './permission.js';
 import { routeMessage } from './projects.js';
+import { PRUNE_INTERVAL_MS, pruneSessions } from './retention.js';
 import { runSimulate, SIMULATE_ACCOUNT } from './simulate.js';
 import { openStateDb } from './tasks/db.js';
 import { createTaskQueue } from './tasks/queue.js';
@@ -127,6 +128,9 @@ async function runDaemon(): Promise<void> {
   } catch (err) {
     logger.warn('State backup failed', { error: String(err) });
   }
+  // Sessions of long-finished tasks go through the OpenCode API. A run never throws and does not hold up startup.
+  void pruneSessions(db);
+  setInterval(() => void pruneSessions(db), PRUNE_INTERVAL_MS).unref();
   const api = new WeChatApi(account.botToken, account.baseUrl);
   const notifier = createNotifier(db, api, createSender(api, accountId));
   const broker = createPermissionBroker(

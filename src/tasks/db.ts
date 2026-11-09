@@ -305,6 +305,27 @@ export function openStateDb(file: string = STATE_DB_PATH) {
       return counts;
     },
 
+    /** Finished tasks by outcome, counting those that finished at or after since (epoch ms). */
+    statusCountsSince(accountId: string, since: number): Record<FinishedStatus, number> {
+      const counts: Record<FinishedStatus, number> = { done: 0, failed: 0, interrupted: 0 };
+      for (const row of all<{ status: FinishedStatus; n: number }>(
+        `SELECT status, COUNT(*) AS n FROM tasks WHERE account_id = ? AND status IN ('done', 'failed', 'interrupted')
+           AND finished_at >= ? GROUP BY status`,
+        accountId, since,
+      )) {
+        counts[row.status] = row.n;
+      }
+      return counts;
+    },
+
+    /** The task that failed last, at or after since (epoch ms); undefined if none did. */
+    lastFailure: (accountId: string, since: number) =>
+      one<TaskRow>(
+        `${TASK_SELECT} WHERE t.account_id = ? AND t.status = 'failed' AND t.finished_at >= ?
+           ORDER BY t.finished_at DESC, t.rowid DESC LIMIT 1`,
+        accountId, since,
+      ),
+
     setTaskSession(id: string, sessionId: string): void {
       run('UPDATE tasks SET session_id = ? WHERE id = ?', sessionId, id);
     },

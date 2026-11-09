@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { BOTS_PATH, defaultBot, loadBots, type Bot } from '../bots.js';
 import { loadConfig, saveConfig, type PermissionMode } from '../config.js';
 import { memoryPath, memoryStats } from '../memory.js';
+import { breaker } from '../model-routing.js';
 import { clip, formatElapsed, formatTime, STATUS_LABEL } from '../orchestrator.js';
 import { formatModelRef, listModels, resolveModelRef } from '../opencode/provider.js';
 import type { PermissionBroker } from '../permission.js';
@@ -23,11 +24,12 @@ type Handler = (args: string, ctx: CommandContext) => string | Promise<string>;
 const DEFAULT_TASKS = 5;
 const MAX_TASKS = 20;
 const MAX_LS_ENTRIES = 100;
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 const HELP_TEXT = `可用命令：
 
 任务：
-  /status           查看当前状态
+  /status           查看当前状态（含 24 小时统计、熔断、待补发通知和消息令牌更新时间）
   /tasks [数量]     查看最近的任务（默认 5 个）
   /stop             停止正在运行的任务
   /stop all         同时取消所有排队的任务
@@ -91,8 +93,36 @@ function memoryCounts(accountId: string, bots: Bot[]): string {
   return counts.join('，');
 }
 
-/** Shared by /status and --status. */
-export function formatStatus(db: StateDb, accountId: string): string {
+/** Tasks that finished in the last 24 hours by outcome, and the latest failure among them. */
+function dayHealth(db: StateDb, accountId: string, now: number): string {
+  const since = now - DAY_MS;
+  const { done, failed, interrupted } = db.statusCountsSince(accountId, since);
+  const line = `🩺 24小时: 完成 ${done}，失败 ${failed}，中断 ${interrupted}`;
+  const last = db.lastFailure(accountId, since);
+  if (!last) return line;
+  // formatTime ends in "HH:mm".
+  return `${line}（最近失败 ${formatTime(last.finished_at!).slice(-5)} 任务 #${last.seq}：${clip(last.error ?? '', 60)}）`;
+}
+
+/** A gateway as breaker.snapshot() reports it. */
+interface Gateway {
+  provider: string;
+  openUntil: number;
+}
+
+/** The gateways whose breaker is still open, with the minutes left. */
+function openBreakers(gateways: Gateway[], now: number): string {
+  const open = gateways
+    .filter((g) => g.openUntil > now)
+    .map((g) => `${g.provider}（剩 ${Math.ceil((g.openUntil - now) / 60_000)} 分钟）`);
+  return open.join('，') || '无';
+}
+
+/**
+ * Shared by /status and --status. The breakers live in the bot's memory: /status passes breaker.snapshot(),
+ * and --status, a process of its own, has none to pass.
+ */
+export function formatStatus(db: StateDb, accountId: string, gateways?: Gateway[]): string {
   const config = loadConfig();
   const user = db.getUser(accountId);
   const counts = db.statusCounts(accountId);
@@ -100,6 +130,7 @@ export function formatStatus(db: StateDb, accountId: string): string {
   const total = Object.values(counts).reduce((sum, n) => sum + n, 0);
   const bots = loadBots();
   const primary = defaultBot(bots);
+  const now = Date.now();
   const lines = [
     `📂 工作目录: ${user?.workspace || config.workingDirectory}`,
     `📁 最近项目: ${lastProject(db, accountId)}`,
@@ -113,9 +144,16 @@ export function formatStatus(db: StateDb, accountId: string): string {
     `⏳ 排队: ${counts.queued} 个`,
     `📊 累计: ${total} 个任务（完成 ${counts.done}，失败 ${counts.failed}，中断 ${counts.interrupted}）`,
     `🧠 记忆: ${memoryCounts(accountId, bots)}`,
+    dayHealth(db, accountId, now),
+    `🧯 熔断: ${gateways ? openBreakers(gateways, now) : '仅 bot 进程内可见，在微信发送 /status 查看'}`,
   ];
-  const pending = db.pendingNotices(accountId).length;
-  if (pending) lines.push(`📮 待补发通知: ${pending} 条`);
+  const pending = db.pendingNotices(accountId);
+  if (pending.length) {
+    const retries = Math.max(...pending.map((n) => n.attempts));
+    lines.push(`📮 待补发: ${pending.length} 条（最久 ${formatElapsed(pending[0].created_at, now)}，重试 ${retries} 次）`);
+  }
+  // The token's age only: the token itself is a credential.
+  lines.push(`🔑 消息令牌: ${user?.context_token_at ? `${formatElapsed(user.context_token_at, now)}前` : '无'}`);
   return lines.join('\n');
 }
 
@@ -149,7 +187,7 @@ const version: Handler = () => {
 export const handlers: Record<string, Handler> = {
   help: () => HELP_TEXT,
 
-  status: (_args, { accountId, db }) => formatStatus(db, accountId),
+  status: (_args, { accountId, db }) => formatStatus(db, accountId, breaker.snapshot()),
 
   tasks: (args, { accountId, db }) => formatTasks(db, accountId, parseTaskLimit(args)),
 

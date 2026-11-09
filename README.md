@@ -48,7 +48,7 @@ WeChat (phone) ←→ ilink bot API ←→ bot daemon (Node.js) ←→ OpenCode 
 
 | Command | What it does |
 |---|---|
-| `/status` | Show the state: working directory, recent project, default and recent bot, model, permission mode, running and queued tasks, memory |
+| `/status` | Show the state: working directory, recent project, default and recent bot, model, permission mode, running and queued tasks, memory. Then health: the last 24 hours' outcomes and latest failure, open gateway breakers, the outbox backlog and the message token's age |
 | `/tasks [n]` | Show the last n tasks (default 5, at most 20) |
 | `/stop` | Stop the running task; `/stop all` also cancels the queued ones |
 | `/cwd [path]` | Show or switch the working directory. The path must exist and stay inside the `workingDirectory` set up in `config.env` |
@@ -108,6 +108,7 @@ Put the settings in `~/.wechat-opencode-bot/env` (mode 600). The bot loads it at
 | `OPENCODE_FALLBACK_MODEL` | the cross-gateway chain (`oneapi-chat-gpt/gpt-6-astra`) | The model for the one retry; set it to override the chain |
 | `OPENCODE_DEFAULT_MODEL` | `oneapi/DeepSeek-V4.1-Flash` | The primary model routing assumes when `/model` is unset; such sessions still use the orchestrator agent's model |
 | `OWB_BREAKER_THRESHOLD`, `OWB_BREAKER_COOLDOWN_MS` | `3`, `600000` | Consecutive upstream failures that open a gateway's breaker, and its first cooldown; a failed probe doubles it, up to 1 hour |
+| `OWB_FAILURE_ALERT_COUNT`, `OWB_FAILURE_ALERT_WINDOW_MS`, `OWB_FAILURE_ALERT_COOLDOWN_MS` | `3`, `1800000`, `1800000` | Failed tasks within the window that send one alert to WeChat, the window, and how long the next alert waits |
 | `OPENCODE_FIRST_RESPONSE_TIMEOUT_MS`, `OPENCODE_STALL_TIMEOUT_MS` | `120000`, `180000` | How long the model may take to start answering, and then between signs of progress |
 
 Try one task without WeChat with `node dist/main.js --simulate "列出工作目录"`, or run the bot in the foreground with `node dist/main.js --daemon`. For the always-on setup with launchd, releases and rollback, follow [docs/DEPLOY.md](docs/DEPLOY.md).

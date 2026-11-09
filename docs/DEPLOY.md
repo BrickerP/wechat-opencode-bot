@@ -171,6 +171,7 @@ It also prints the bot's command line, its working directory and where `current`
 - An upstream failure (5xx, 429, timeout, transport, `do request failed`) retries once on a model behind another gateway: `OPENCODE_FALLBACK_MODEL` when set, otherwise the first of `oneapi-chat-gpt/gpt-6-astra`, `oneapi/DeepSeek-V4.1-Flash`, `oneapi-gemini/Gemini 4 Argon` whose provider differs from the primary.
 - Auth errors, HTTP 4xx and permission rejections are not retried, and neither is an unreachable local OpenCode server: another gateway would fail the same way.
 - 3 upstream failures in a row open that gateway's breaker for 10 minutes (`OWB_BREAKER_THRESHOLD`, `OWB_BREAKER_COOLDOWN_MS`). Later tasks start on the fallback and the chat gets one notice. A failed probe doubles the cooldown, up to an hour; a success closes the breaker. The state is in memory, so a restart starts with every breaker closed.
+- `/status` lists the open breakers with the minutes left, the outbox backlog and the message token's age; `--status` runs in a process of its own and cannot see the breakers. 3 failed tasks within 30 minutes queue one alert to the chat, and the next alert waits at least 30 minutes (`OWB_FAILURE_ALERT_COUNT`, `OWB_FAILURE_ALERT_WINDOW_MS`, `OWB_FAILURE_ALERT_COOLDOWN_MS`).
 - `Task finished` lines carry `model`, `attempts`, `fallback` and `errorKind`.
 
 Subagents have no `model:` in their agent files, so OpenCode runs them on the parent session's model and a task that fell back stays on one gateway from start to finish.

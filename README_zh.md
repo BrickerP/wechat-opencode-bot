@@ -48,7 +48,7 @@
 
 | 命令 | 作用 |
 |---|---|
-| `/status` | 查看状态：工作目录、最近项目、默认与最近 bot、模型、权限模式、运行中和排队的任务、记忆 |
+| `/status` | 查看状态：工作目录、最近项目、默认与最近 bot、模型、权限模式、运行中和排队的任务、记忆；以及健康情况：24 小时内的任务结果和最近一次失败、已熔断的网关、待补发通知、消息令牌多久前收到 |
 | `/tasks [数量]` | 查看最近的任务（默认 5 个，最多 20 个） |
 | `/stop` | 停止正在运行的任务；`/stop all` 同时取消所有排队的任务 |
 | `/cwd [路径]` | 查看或切换工作目录。路径必须已存在，且在 `config.env` 设定的 `workingDirectory` 范围内 |
@@ -108,6 +108,7 @@ npm run setup     # 用微信扫码，然后输入工作目录
 | `OPENCODE_FALLBACK_MODEL` | 跨网关链（`oneapi-chat-gpt/gpt-6-astra`） | 重试那一次使用的模型；设置后覆盖默认链 |
 | `OPENCODE_DEFAULT_MODEL` | `oneapi/DeepSeek-V4.1-Flash` | 未设置 `/model` 时路由假定的主模型；这类会话实际仍使用 orchestrator agent 自己的模型 |
 | `OWB_BREAKER_THRESHOLD`、`OWB_BREAKER_COOLDOWN_MS` | `3`、`600000` | 同一网关连续多少次上游失败后熔断，以及第一次冷却时间；探测再失败则翻倍，最长 1 小时 |
+| `OWB_FAILURE_ALERT_COUNT`、`OWB_FAILURE_ALERT_WINDOW_MS`、`OWB_FAILURE_ALERT_COOLDOWN_MS` | `3`、`1800000`、`1800000` | 窗口内失败多少个任务就往微信发一条告警、窗口长度，以及发出告警后多久内不再发 |
 | `OPENCODE_FIRST_RESPONSE_TIMEOUT_MS`、`OPENCODE_STALL_TIMEOUT_MS` | `120000`、`180000` | 模型开始输出的等待上限，以及之后两次进展之间的等待上限 |
 
 不接微信也能先试一个任务：`node dist/main.js --simulate "列出工作目录"`；或者用 `node dist/main.js --daemon` 在前台运行 bot。常驻运行（launchd、发布、回滚）请按 [docs/DEPLOY.md](docs/DEPLOY.md) 操作。

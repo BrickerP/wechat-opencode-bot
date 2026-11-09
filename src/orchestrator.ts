@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { maybeAlertFailures } from './alerts.js';
 import { defaultBot, loadBots, resolveBot, type Bot } from './bots.js';
 import { loadConfig } from './config.js';
 import { DATA_DIR } from './constants.js';
@@ -413,6 +414,8 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
     if (!db.finishTask(task.id, 'interrupted', { error: result.error })) return;
   } else if (result.error) {
     if (!db.finishTask(task.id, 'failed', { error: clip(result.error, MAX_ERROR_CHARS) })) return;
+    // Also ahead of the outcome, so the flush in deliver sends it now.
+    maybeAlertFailures(db, task.account_id);
   } else {
     const output = parseOrchestratorOutput(result.text);
     if (!db.finishTask(task.id, 'done', { result: output.reply, summary: output.summary })) return;

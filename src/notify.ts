@@ -14,7 +14,6 @@ type Sender = ReturnType<typeof createSender>;
 const MAX_MESSAGE_CHARS = 2048;
 /** Pause between the chunks of one send, so WeChat keeps them in order. */
 const CHUNK_GAP_MS = 200;
-const TYPING_KEEPALIVE_MS = 5000;
 /** Failed-send backoff: 30s, 2m, 10m, then 1h. */
 const BACKOFF_MS = [30_000, 120_000, 600_000, 3_600_000] as const;
 const backoffMs = (attempts: number): number => BACKOFF_MS[Math.min(Math.max(attempts, 1) - 1, BACKOFF_MS.length - 1)];
@@ -118,39 +117,6 @@ export function createNotifier(db: StateDb, api: WeChatApi, sender: Sender) {
     return serial(accountId, () => sendChunks(accountId, splitMessage(text).map((chunk) => ({ text: chunk }))));
   }
 
-  /** Best-effort typing indicator; returns the function that stops it. */
-  function typing(accountId: string): () => void {
-    const user = db.getUser(accountId);
-    if (!user?.context_token) return () => {};
-    const toUserId = user.wechat_user_id;
-    let stopped = false;
-    let ticket: string | undefined;
-    let clientId: string | undefined;
-    let keepalive: ReturnType<typeof setInterval> | undefined;
-
-    const stop = () => {
-      clearInterval(keepalive);
-      if (ticket && clientId) sender.stopTyping(toUserId, ticket, clientId).catch(() => {});
-    };
-    api
-      .getConfig(toUserId, user.context_token)
-      .then(async (config) => {
-        if (stopped || !config.typing_ticket) return;
-        ticket = config.typing_ticket;
-        clientId = await sender.sendTyping(toUserId, ticket);
-        if (stopped) return stop();
-        keepalive = setInterval(() => {
-          sender.sendTyping(toUserId, ticket!).catch(() => {});
-        }, TYPING_KEEPALIVE_MS);
-      })
-      .catch((err) => logger.warn('Typing indicator failed', { error: String(err) }));
-
-    return () => {
-      stopped = true;
-      stop();
-    };
-  }
-
   /** Daemon IO: outcomes go out through the outbox, permission asks wait for the user's y/n. */
   function taskIO(task: TaskRow, broker: PermissionBroker): TaskIO {
     const accountId = task.account_id;
@@ -158,7 +124,6 @@ export function createNotifier(db: StateDb, api: WeChatApi, sender: Sender) {
       async deliver() {
         await flush(accountId);
       },
-      typing: () => typing(accountId),
       // Progress notes are best-effort replies: one that fails to send is not worth a retry.
       async progress(text) {
         await reply(accountId, text);

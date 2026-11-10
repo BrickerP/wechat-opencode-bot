@@ -240,7 +240,6 @@ async function runDaemon(): Promise<void> {
       ahead,
     });
     queue.kick(accountId);
-    // A task that starts right away is acknowledged by the typing indicator.
     if (ahead > 0) {
       // The ETA is a nicety: without it the ack still goes out. Only the task's own lane holds it up.
       let durations: number[] = [];

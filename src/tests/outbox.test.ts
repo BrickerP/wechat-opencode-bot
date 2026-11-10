@@ -21,10 +21,6 @@ test('a failed notice backs off and blocks later notices; clearing it sends in o
       if (fail) throw new Error('send failed');
       sent.push(text);
     },
-    async sendTyping() {
-      return 'typing';
-    },
-    async stopTyping() {},
   } as any;
   const notifier = createNotifier(db, {} as any, sender);
 

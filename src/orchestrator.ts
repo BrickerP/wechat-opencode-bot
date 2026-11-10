@@ -27,8 +27,6 @@ const SUMMARY_MARKER = '<<<WECHAT_SUMMARY>>>';
 export interface TaskIO {
   /** Reports a finished task; the daemon hands it to the outbox. */
   deliver(task: TaskRow): Promise<void>;
-  /** Starts a typing indicator and returns the function that stops it. */
-  typing?(): () => void;
   /** Best-effort note while a long task runs; a failed one is dropped, never queued for retry. */
   progress?(text: string): void | Promise<void>;
   onPermission?(request: PermissionRequest): Promise<PermissionDecision>;
@@ -255,7 +253,7 @@ export function parseOrchestratorOutput(text: string): OrchestratorOutput {
 const EDIT_ACTION = /edit|write|patch/i;
 
 /** A long task gets its first progress note once an attempt has run this long. */
-const PROGRESS_FIRST_MS = Number(process.env.OWB_PROGRESS_FIRST_MS) || 60_000;
+const PROGRESS_FIRST_MS = Number(process.env.OWB_PROGRESS_FIRST_MS) || 20_000;
 /** Progress notes are at least this far apart. */
 const PROGRESS_MIN_GAP_MS = Number(process.env.OWB_PROGRESS_MIN_GAP_MS) || 90_000;
 /** After the first note, only new subagent sessions or this much time bring another. */
@@ -328,7 +326,6 @@ function progressNotes(task: TaskRow, io: TaskIO, running: () => boolean) {
  * A task that was finished elsewhere meanwhile (/stop, restart) is not reported again.
  */
 export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: AbortSignal): Promise<void> {
-  const stopTyping = io.typing?.();
   let result: QueryResult;
   // The last attempt's model; undefined runs the orchestrator agent's own model, taken to be DEFAULT_MODEL.
   let model: string | undefined;
@@ -408,8 +405,6 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
   } catch (err) {
     // openCodeQuery reports its own failures; this covers preparing the prompt.
     result = { text: '', sessionId: '', error: err instanceof Error ? err.message : String(err) };
-  } finally {
-    stopTyping?.();
   }
 
   // Queued ahead of the outcome, so the user reads the notice before the answer.

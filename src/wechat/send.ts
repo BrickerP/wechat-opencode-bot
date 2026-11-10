@@ -34,20 +34,5 @@ export function createSender(api: WeChatApi, botAccountId: string) {
     logger.info('Text message sent', { toUserId, clientId });
   }
 
-  async function sendTyping(toUserId: string, typingTicket: string): Promise<string> {
-    const clientId = generateClientId();
-
-    logger.info('Sending typing indicator', { toUserId, clientId, typingTicket });
-    await api.sendTyping(toUserId, typingTicket, 1);
-    logger.info('Typing indicator sent', { toUserId, clientId });
-    return clientId;
-  }
-
-  async function stopTyping(toUserId: string, typingTicket: string, typingClientId: string): Promise<void> {
-    logger.info('Stopping typing indicator', { toUserId, clientId: typingClientId, typingTicket });
-    await api.sendTyping(toUserId, typingTicket, 2);
-    logger.info('Typing indicator stopped', { toUserId, clientId: typingClientId });
-  }
-
-  return { sendText, sendTyping, stopTyping };
+  return { sendText };
 }

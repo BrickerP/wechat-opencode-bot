@@ -2,7 +2,7 @@
 
 English | [中文](README_zh.md)
 
-A bridge between WeChat and [OpenCode](https://opencode.ai). Each message you send the bot becomes a task: a daemon on your machine runs it in a new session on a local OpenCode server and sends the result back to the chat. It handles text, images, permission approvals, scheduled tasks, several bots and several projects.
+A bridge between WeChat and [OpenCode](https://opencode.ai). Each message you send the bot becomes a task: a daemon on your machine runs it in a new session on a local OpenCode server and sends the result back to the chat. It handles text, images, voice messages, permission approvals, scheduled tasks, several bots and several projects, and can send images and files back.
 
 ## Demo
 
@@ -48,8 +48,8 @@ flowchart LR
 3. The lane's worker takes the oldest queued task and opens a new OpenCode session at the project root, or in the chat's working directory. OpenCode loads that directory's `AGENTS.md` and `opencode.json`, whose rules take precedence over memory and recent tasks.
 4. Sessions are never resumed, so the prompt carries the context: time, attachments, the bot's role, the project, the chat's memory and the last 8 tasks, with reply excerpts for the latest 2.
 5. The orchestrator hands the work to `wechat-explore` or `wechat-general`, at most 3 at once and 6 per task. Permission asks go to WeChat, and a long task sends up to 4 progress notes.
-6. The orchestrator ends its output with `<<<WECHAT_REPLY>>>`, `<<<WECHAT_MEMORY>>>` and `<<<WECHAT_SUMMARY>>>` sections. The daemon keeps the reply, adds up to 5 dated facts to memory and stores the one-line summary for later prompts.
-7. The result goes to the outbox and out in 2048-character chunks, after the bot's reply prefix. A failure reads `⚠️ 任务 #N 失败：…`; a task cut off by a restart reads `⏹ 任务 #N 已中断…`.
+6. The orchestrator ends its output with `<<<WECHAT_REPLY>>>`, `<<<WECHAT_MEMORY>>>`, `<<<WECHAT_SUMMARY>>>`, an optional `<<<WECHAT_HANDOFF>>>` and optional `<<<WECHAT_FILES>>>` sections. The daemon keeps the reply, adds up to 5 dated facts to memory, stores the summary, handoff, token usage and file paths, and sends the files after the text.
+7. The next task within 2 hours gets the previous task's handoff (files, commands, open work, next step), so "继续" does not start from the summary alone. The result goes to the outbox in 2048-character chunks; a failure reads `⚠️ 任务 #N 失败：…`, a restart `⏹ 任务 #N 已中断…`.
 
 ### Routing
 
@@ -149,12 +149,14 @@ Run `npm run build` after every change. For an always-on bot, `scripts/release.s
 | Command | What it does |
 |---|---|
 | `/help` | Show the help |
-| `/status` | Working directory, project, bots, model, permission mode, running and queued tasks, memory; then 24-hour outcomes, open breakers, the outbox backlog and the token's age |
-| `/tasks [n]` | The last n tasks (default 5, at most 20) |
+| `/status` | Working directory, project, bots, model, permission mode, running and queued tasks, memory; then 24-hour outcomes, tokens used, open breakers, the outbox backlog and the token's age |
+| `/tasks [n]` | The last n tasks (default 5, at most 20), with token usage when recorded |
 | `/stop` | Stop the running tasks in both lanes and deny waiting asks; `/stop all` also cancels the queue |
+| `/cancel <n>` | Cancel one queued task |
+| `/steer [#n] <text>` | Send a correction into a running task's session; OpenCode applies it at the next step |
 | `/cwd [path]` | Show or set the chat's working directory, inside the base directory |
 | `/ls` | List the working directory (up to 100 entries) |
-| `/projects` | List the projects and their aliases |
+| `/projects [add\|rm] …` | List projects, or `add <id> [dir]` / `rm <id\|alias>` |
 | `/bots` | List the bots: id, aliases, reply prefix, model, default |
 | `/model [model]` | Show or set the model for the next tasks, overriding every bot: `provider/model[#variant]` or a bare id; `/model default` returns to each bot's own model |
 | `/models` | List the server's models |
@@ -203,6 +205,7 @@ Every `node dist/main.js` command loads `env` from the data directory, and varia
 | `OWB_ALERT_PING_URL` | empty | URL the watchdog GETs after every healthy run, for an external dead-man's switch such as healthchecks.io |
 | `OWB_SESSION_TTL_DAYS`, `OWB_SESSION_KEEP` | `7`, `300` | Session retention: age in days, and how many of the newest finished tasks keep all their sessions |
 | `OWB_PROGRESS_FIRST_MS`, `OWB_PROGRESS_MIN_GAP_MS`, `OWB_PROGRESS_EVERY_MS`, `OWB_PROGRESS_MAX` | `20000`, `90000`, `300000`, `4` | Progress notes: first after, minimum gap, regular interval, maximum per task |
+| `OWB_ASR_URL`, `OWB_ASR_MODEL`, `OWB_ASR_API_KEY` | empty, `whisper-1`, empty | OpenAI-compatible transcription endpoint for voice without WeChat's own text; SILK is decoded to WAV first |
 | `OWB_DATA_DIR` | `~/.wechat-opencode-bot` | The data directory |
 | `OWB_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
 

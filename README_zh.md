@@ -2,7 +2,7 @@
 
 [English](README.md) | 中文
 
-连接微信和 [OpenCode](https://opencode.ai) 的桥接程序。你发给 bot 的每条消息都会变成一个任务：本机的守护进程在本地 OpenCode 服务上新开一个会话执行它，再把结果发回聊天。支持文字、图片、权限审批、定时任务，以及多个 bot 和多个项目。
+连接微信和 [OpenCode](https://opencode.ai) 的桥接程序。你发给 bot 的每条消息都会变成一个任务：本机的守护进程在本地 OpenCode 服务上新开一个会话执行它，再把结果发回聊天。支持文字、图片、语音、权限审批、定时任务，以及多个 bot 和多个项目，也能把图片和文件发回微信。
 
 ## Demo
 
@@ -48,8 +48,8 @@ flowchart LR
 3. 通道的 worker 取出最早排队的任务，在项目根目录（没有项目时在聊天的工作目录）新开一个 OpenCode 会话。OpenCode 会加载该目录的 `AGENTS.md` 和 `opencode.json`，其中的规则优先于记忆和最近任务。
 4. 会话从不复用，所以上下文由 prompt 携带：时间、附件、bot 的角色、项目、聊天记忆，以及最近 8 个任务（最近 2 个附回复摘录）。
 5. orchestrator 把工作交给 `wechat-explore` 或 `wechat-general`，同时最多 3 个，每个任务最多 6 个。权限请求发到微信；长任务最多发 4 条进度通知。
-6. orchestrator 的输出以 `<<<WECHAT_REPLY>>>`、`<<<WECHAT_MEMORY>>>` 和 `<<<WECHAT_SUMMARY>>>` 三段收尾。守护进程保留回复，把最多 5 条带日期的事实写入记忆，并保存一行摘要供之后的 prompt 使用。
-7. 结果进入待发队列，加上 bot 的回复前缀后按 2048 字分段发出。失败时是 `⚠️ 任务 #N 失败：…`；被重启打断的任务是 `⏹ 任务 #N 已中断…`。
+6. orchestrator 的输出以 `<<<WECHAT_REPLY>>>`、`<<<WECHAT_MEMORY>>>`、`<<<WECHAT_SUMMARY>>>` 收尾，可选带 `<<<WECHAT_HANDOFF>>>` 和 `<<<WECHAT_FILES>>>` 段。守护进程保留回复、把最多 5 条带日期的事实写进记忆，保存摘要、交接、token 用量和文件路径，并在文字之后发送文件。
+7. 2 小时内的下一个任务会收到上一个任务的 handoff（文件、命令、未完成项、下一步），所以“继续”不必只靠摘要重新摸索。结果加上 bot 的回复前缀后按 2048 字分段进入待发队列；失败显示 `⚠️ 任务 #N 失败：…`，重启中断显示 `⏹ 任务 #N 已中断…`。
 
 ### 路由
 
@@ -149,12 +149,14 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 | 命令 | 作用 |
 |---|---|
 | `/help` | 显示帮助 |
-| `/status` | 工作目录、项目、bot、模型、权限模式、运行中和排队的任务、记忆；以及 24 小时结果、已打开的熔断、待补发数量和消息令牌的时效 |
-| `/tasks [n]` | 最近 n 个任务（默认 5 个，最多 20 个） |
+| `/status` | 工作目录、项目、bot、模型、权限模式、运行中和排队的任务、记忆；以及 24 小时结果、token 用量、已打开的熔断、待补发数量和消息令牌的时效 |
+| `/tasks [n]` | 最近 n 个任务（默认 5 个，最多 20 个），有记录时附带 token 用量 |
 | `/stop` | 停止两条通道里正在运行的任务，并拒绝等待中的权限请求；`/stop all` 同时取消队列 |
+| `/cancel <编号>` | 取消一个排队中的任务 |
+| `/steer [#编号] <内容>` | 给运行中的任务发一条修正；OpenCode 在下一个步骤采纳 |
 | `/cwd [path]` | 查看或设置聊天的工作目录，须在基础目录内 |
 | `/ls` | 列出工作目录（最多 100 项） |
-| `/projects` | 列出项目及其别名 |
+| `/projects [add\|rm] …` | 列出项目，或 `add <id> [目录]` / `rm <id\|别名>` |
 | `/bots` | 列出 bot：id、别名、回复前缀、model、是否默认 |
 | `/model [model]` | 查看或设置之后任务的模型，覆盖所有 bot：`provider/model[#variant]` 或只写 id；`/model default` 恢复各 bot 自己的 model |
 | `/models` | 列出服务上的模型 |
@@ -203,6 +205,7 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 | `OWB_ALERT_PING_URL` | 空 | watchdog 每次运行结果健康时 GET 这个 URL，供外部的 dead-man's switch（如 healthchecks.io）在收不到 ping 时告警 |
 | `OWB_SESSION_TTL_DAYS`、`OWB_SESSION_KEEP` | `7`、`300` | 会话保留：天数，以及最近多少个已完成任务保留它们的全部会话 |
 | `OWB_PROGRESS_FIRST_MS`、`OWB_PROGRESS_MIN_GAP_MS`、`OWB_PROGRESS_EVERY_MS`、`OWB_PROGRESS_MAX` | `20000`、`90000`、`300000`、`4` | 进度通知：首条时间、最小间隔、常规间隔、每个任务的上限 |
+| `OWB_ASR_URL`、`OWB_ASR_MODEL`、`OWB_ASR_API_KEY` | 空、`whisper-1`、空 | 语音没有微信自带转写时使用的 OpenAI 兼容转写接口；SILK 会先解码为 WAV |
 | `OWB_DATA_DIR` | `~/.wechat-opencode-bot` | 数据目录 |
 | `OWB_LOG_LEVEL` | `info` | `debug`、`info`、`warn` 或 `error` |
 

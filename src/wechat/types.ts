@@ -47,7 +47,11 @@ export interface ImageItem {
 }
 
 export interface VoiceItem {
-  cdn_media: CDNMedia;
+  cdn_media?: CDNMedia;
+  /** Where newer API versions put the CDN locator */
+  media?: { encrypt_query_param: string; aes_key?: string; encrypt_type?: number };
+  /** WeChat's own transcription; some API versions name it voice_text */
+  text?: string;
   voice_text?: string;
 }
 

@@ -25,10 +25,10 @@ import { createTaskQueue } from './tasks/queue.js';
 import { loadLatestAccount } from './wechat/accounts.js';
 import { WeChatApi } from './wechat/api.js';
 import { displayQrInTerminal, startQrLogin, waitForQrScan } from './wechat/login.js';
-import { downloadImage, extractFirstImageUrl, extractText } from './wechat/media.js';
+import { asrUrl, downloadImage, extractFirstImageUrl, extractText, extractVoiceText } from './wechat/media.js';
 import { createMonitor } from './wechat/monitor.js';
 import { createSender } from './wechat/send.js';
-import { MessageType, type WeixinMessage } from './wechat/types.js';
+import { MessageItemType, MessageType, type WeixinMessage } from './wechat/types.js';
 
 /** Replies that answer a pending permission request. */
 const ANSWERS = new Map<string, boolean>([
@@ -173,8 +173,21 @@ async function runDaemon(): Promise<void> {
     else db.ensureUser(accountId, msg.from_user_id);
     await notifier.flush(accountId);
 
-    const text = msg.item_list.map(extractText).filter(Boolean).join('\n').trim();
+    const typed = msg.item_list.map(extractText).filter(Boolean).join('\n').trim();
     const imageItem = extractFirstImageUrl(msg.item_list);
+    const voiceItem = msg.item_list.find((item) => item.type === MessageItemType.VOICE);
+    const voiceText = voiceItem ? await extractVoiceText(voiceItem) : null;
+    if (voiceItem && !voiceText && !typed && !imageItem) {
+      await notifier.reply(
+        accountId,
+        asrUrl()
+          ? '🎤 收到语音，但没能转成文字，请重发或改发文字。'
+          : '🎤 收到语音，但没能转成文字。可在 ~/.wechat-opencode-bot/env 配置 OWB_ASR_URL / OWB_ASR_MODEL 后重试。',
+      );
+      return;
+    }
+    // A transcription counts as typed text: a spoken "同意" answers a permission request, a spoken command runs.
+    const text = [typed, voiceText].filter(Boolean).join('\n').trim();
 
     const answer = imageItem ? undefined : ANSWERS.get(text.toLowerCase());
     if (answer !== undefined) {
@@ -203,7 +216,7 @@ async function runDaemon(): Promise<void> {
       return;
     }
     if (!text && !imageItem) {
-      await notifier.reply(accountId, '暂不支持此类型消息，请发送文字或图片');
+      await notifier.reply(accountId, '暂不支持此类型消息，请发送文字、图片或语音');
       return;
     }
     // Download before the task exists: the runner must never pick up a task whose image is still missing.
@@ -217,7 +230,9 @@ async function runDaemon(): Promise<void> {
       await notifier.reply(accountId, '⚠️ 图片下载失败，请重新发送');
       return;
     }
-    const { input: body, project, botId } = routeMessage(db, accountId, text);
+    const { input: routed, project, botId } = routeMessage(db, accountId, text);
+    // Marked after routing, which reads "@bot", "@project" and "继续" at the start of the text.
+    const body = voiceText ? `[语音] ${routed}` : routed;
     const input = image ? (body ? `${IMAGE_ONLY_INPUT} ${body}` : IMAGE_ONLY_INPUT) : body;
     const messageId = msg.message_id ? String(msg.message_id) : null;
     // A read-only bot's task runs in its own lane and does not wait for a running write task.
@@ -237,6 +252,7 @@ async function runDaemon(): Promise<void> {
       lane: task.lane,
       inputLength: input.length,
       image: Boolean(image),
+      voice: Boolean(voiceText),
       ahead,
     });
     queue.kick(accountId);

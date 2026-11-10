@@ -1,7 +1,6 @@
 import type {
   GetUpdatesResp,
   SendMessageReq,
-  GetUploadUrlResp,
 } from './types.js';
 import { logger } from '../logger.js';
 
@@ -113,18 +112,6 @@ export class WeChatApi {
     if (code !== undefined && code !== 0) {
       throw new ILinkError(code, `sendmessage failed: ret=${code} ${resp.retmsg ?? resp.errmsg ?? ''}`.trim());
     }
-  }
-
-  /** Get a presigned upload URL for media files. */
-  async getUploadUrl(
-    fileType: string,
-    fileSize: number,
-    fileName: string,
-  ): Promise<GetUploadUrlResp> {
-    return this.request<GetUploadUrlResp>(
-      'ilink/bot/getuploadurl',
-      { file_type: fileType, file_size: fileSize, file_name: fileName },
-    );
   }
 
   /** Get bot config for a user (includes typing_ticket). */

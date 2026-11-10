@@ -112,18 +112,3 @@ export interface OutboundMessage {
 export interface SendMessageReq {
   msg: OutboundMessage;
 }
-
-// ── GetUploadUrl API ────────────────────────────────────────────────────────
-
-export interface GetUploadUrlReq {
-  file_type: string;
-  file_size: number;
-  file_name: string;
-}
-
-export interface GetUploadUrlResp {
-  errcode: number;
-  url: string;
-  aes_key: string;
-  encrypt_query_param: string;
-}

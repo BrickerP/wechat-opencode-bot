@@ -12,7 +12,6 @@
     "daemon:status": "node dist/main.js --status"
   },
   "dependencies": {
-    "@opencode-ai/sdk": "^1.0.0",
     "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0"
   },

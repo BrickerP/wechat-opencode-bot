@@ -150,15 +150,24 @@ Logs are in `~/.wechat-opencode-bot/logs/`. launchd writes `bot.out.log`, `bot.e
 
 ## Watchdog
 
-`scripts/watchdog.sh` runs at login and every 5 minutes through `com.yupeng.opencode-wechat-watchdog`. A run is healthy when `scripts/healthcheck.sh` passes and `~/.wechat-opencode-bot/heartbeat` is younger than 5 minutes; the daemon rewrites that file every 30 seconds, so a hung event loop is detectable. Two unhealthy checks 60 seconds apart restart the bot with `launchctl kickstart -k`; if it is still unhealthy after the restart, the next attempt waits 30 minutes. Every restart and failure goes to `~/.wechat-opencode-bot/logs/watchdog.log` and a macOS notification; a healthy run writes nothing.
+The `com.yupeng.opencode-wechat-watchdog` job runs `scripts/watchdog.sh` at login and every 5 minutes. A stuck bot cannot reach WeChat, so the watchdog reports through macOS notifications (they come from Script Editor; allow it in System Settings → Notifications).
 
-Once a day the same script runs `node current/dist/main.js --simulate "只回复 ok"` as a smoke test, which exercises the OpenCode server, the agents and the model. It has a 180-second timeout, logs its result and notifies on failure. Run it now with `scripts/watchdog.sh --smoke`.
+- The bot is healthy when `scripts/healthcheck.sh` passes and the bot that holds `daemon.lock` rewrote `~/.wechat-opencode-bot/heartbeat` within 5 minutes. The daemon rewrites it every 30 s from a timer, which only fires while its event loop turns.
+- A failed check is repeated 60 s later, so a wake from sleep or a deploy's restart does not count. If it fails again, the watchdog restarts the bot with `launchctl kickstart -k`, checks every 5 s for 30 s, and sends a notification either way.
+- After a restart that did not help, the next restart waits 30 minutes, and the first check that passes sends a notification.
+- It only restarts the bot. It leaves a down OpenCode server or a broken release alone; the notification names the check that failed.
+- It does nothing while the bot job is not loaded, so a bot stopped with `launchctl bootout` stays stopped until the next login.
 
-Install the third job with `scripts/install-launchd.sh --apply`, then load it once (the script prints the exact commands):
+Once a day after a passing check, and on `scripts/watchdog.sh --smoke`, it runs a smoke test: `node current/dist/main.js --simulate "只回复 ok"`, or `dist/main.js` without `current`. The task goes through the real OpenCode server and model under the `simulate` account, so the chat's history and memory stay untouched. A test that has not finished after 180 s is stopped and fails. A failure sends a notification and logs the last 20 lines of the output; the next test still waits a day.
 
-```bash
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.yupeng.opencode-wechat-watchdog.plist
-```
+A healthy run writes nothing, apart from the daily smoke-test result. `~/.wechat-opencode-bot/logs/watchdog.log` gets failures, restarts and smoke-test results, with the healthcheck's `ok` and `FAIL` lines but never its `--status` report or the env file. In a terminal, `scripts/watchdog.sh` does the same, restart included, and prints what it found.
+
+Install the watchdog only after deploying a release that writes the heartbeat: `cat ~/.wechat-opencode-bot/heartbeat` must show the running bot's pid. With an older build every check fails, and the watchdog restarts the bot every 30 minutes.
+
+1. Run `scripts/install-launchd.sh --apply`. It reports the watchdog plist as `new`.
+2. Run the `launchctl bootstrap` line it prints. The first check and the first smoke test run right away.
+
+Before a rollback to a release without the heartbeat, stop the watchdog: `launchctl bootout gui/$(id -u)/com.yupeng.opencode-wechat-watchdog`.
 
 ## Health
 

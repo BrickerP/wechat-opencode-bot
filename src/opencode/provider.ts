@@ -257,7 +257,8 @@ async function createSession(title: string, cwd: string, agent?: string, model?:
   const body: Record<string, unknown> = { title, location: { directory: cwd } };
   if (agent) body.agent = agent;
   if (model) {
-    // Stored models were validated by /model, so a malformed one is a bug rather than something to guess around.
+    // A model comes from /model or a bot's bots.json entry; both store provider/model[#variant], so a
+    // malformed one is a bug in the caller rather than something to guess around.
     const ref = parseModelRef(model);
     if (!ref) throw new Error(`无效的模型: ${model}`);
     body.model = ref;

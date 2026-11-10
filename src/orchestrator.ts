@@ -319,8 +319,9 @@ function progressNotes(task: TaskRow, io: TaskIO, running: () => boolean) {
 }
 
 /**
- * Run one task in a fresh orchestrator session and report the outcome. A model whose gateway fails or goes
- * silent gets one retry on fallbackModel, behind another gateway, and the user hears only the final outcome.
+ * Run one task in a fresh orchestrator session and report the outcome. The task runs on the chat's /model,
+ * else its bot's model, else the orchestrator agent's own. A model whose gateway fails or goes silent gets
+ * one retry on fallbackModel, behind another gateway, and the user hears only the final outcome.
  * Repeated upstream failures open that gateway's breaker: later tasks start on the fallback until the
  * cooldown is over, and the user gets one notice when that begins. While it runs, a long task sends a few
  * best-effort progress notes (progressNotes).
@@ -369,7 +370,8 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
       return opened;
     };
 
-    const primary = user?.model ?? undefined;
+    // /model overrides every bot; with neither, the session gets no model and routing assumes DEFAULT_MODEL.
+    const primary = user?.model ?? resolveBot(task.bot_id).bot.model;
     const primaryProvider = providerOf(primary ?? DEFAULT_MODEL);
     const fallback = fallbackModel(primary ?? DEFAULT_MODEL);
     // While the primary's breaker is open, tasks start on the fallback; after the cooldown they try the primary again.

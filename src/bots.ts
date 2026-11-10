@@ -22,6 +22,8 @@ export interface Bot {
   role: string;
   /** The subagent the bot prefers for its work; unset means either. */
   subagent?: 'wechat-explore' | 'wechat-general';
+  /** Its tasks' model, "provider/model[#variant]"; /model overrides it. Unset: the orchestrator agent's own. */
+  model?: string;
 }
 
 export const BOTS_PATH = join(DATA_DIR, 'bots.json');
@@ -34,6 +36,8 @@ const SUBAGENTS: readonly string[] = ['wechat-explore', 'wechat-general'];
 const BOT_ID = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 /** One word: no whitespace, "@" or path separators. */
 const BOT_ALIAS = /^[^\s@/\\]+$/;
+/** "provider/model" or "provider/model#variant", as /model stores it. Model ids may hold spaces and "/". */
+const MODEL_REF = /^[^\s/#]+\/[^\s#](?:[^#]*[^\s#])?(?:#[^\s#]+)?$/;
 
 /** Written to bots.json on first run; after that the file is the user's. */
 const GENERATED = [
@@ -71,7 +75,10 @@ const GENERATED = [
   },
 ];
 
-/** A registry entry as a Bot; throws if it is malformed. toBots settles which bot is the default. */
+/**
+ * A registry entry as a Bot; throws if it is malformed, except for a bad model, which is dropped with a warning.
+ * toBots settles which bot is the default.
+ */
 function toBot(entry: any): Bot {
   const text = (value: unknown): string => (typeof value === 'string' ? value.trim() : '');
   const id = text(entry?.id);
@@ -94,6 +101,12 @@ function toBot(entry: any): Bot {
   }
   const bot: Bot = { id, name, aliases, prefix: entry.prefix ?? '', default: entry.default === true, role };
   if (entry.subagent) bot.subagent = entry.subagent;
+  if (entry.model !== undefined) {
+    // A typo here must not cost the bot, or fail every task it gets: the bot stays, on the default model.
+    const model = text(entry.model);
+    if (MODEL_REF.test(model)) bot.model = model;
+    else logger.warn('Ignoring bot model: use "provider/model" or "provider/model#variant"', { id, model: entry.model });
+  }
   return bot;
 }
 

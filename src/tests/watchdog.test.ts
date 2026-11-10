@@ -1,8 +1,8 @@
 // runTask against a fake OpenCode server: the first-response and stall watchdogs, the one-shot fallback to
 // another gateway and the breaker that skips a failing one, the progress notes of a long task, the directory
-// each session opens in, the bot a task speaks as, and the orchestrator agent of each lane.
+// each session opens in, the bot a task speaks as and the model it runs on, and the orchestrator agent of each lane.
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -21,6 +21,8 @@ const REPLY = '<<<WECHAT_REPLY>>>\nok\n<<<WECHAT_MEMORY>>>\n- 无\n<<<WECHAT_SUM
 const FACT = '用户喜欢简短的回复';
 /** The session model of the fallback for the default oneapi/DeepSeek-V4.1-Flash. */
 const GPT = { providerID: 'oneapi-chat-gpt', id: 'gpt-6-astra' };
+/** The session model of oneapi/DeepSeek-V4.1-Flash, which is also the fallback for a GPT model. */
+const DEEPSEEK = { providerID: 'oneapi', id: 'DeepSeek-V4.1-Flash' };
 
 type Script =
   | 'silent'
@@ -158,6 +160,7 @@ process.env.OPENCODE_URL = `http://127.0.0.1:${(server.address() as AddressInfo)
 
 // provider.ts reads its settings at module load, so the bot modules load after the fake server is up.
 const { resultText, runTask } = await import('../orchestrator.js');
+const { BOTS_PATH, loadBots } = await import('../bots.js');
 const { resetModelRouting } = await import('../model-routing.js');
 const { openStateDb } = await import('../tasks/db.js');
 const db = openStateDb(join(tmp, 'state.db'));
@@ -363,4 +366,26 @@ test('a read-lane task runs on the read-only orchestrator, its retry too; a writ
   assert.deepEqual(read.roots.map((s) => s.agent), ['wechat-orchestrator-read', 'wechat-orchestrator-read']);
   sessions.length = 0;
   assert.deepEqual((await run(['answer'])).roots.map((s) => s.agent), ['wechat-orchestrator']);
+});
+
+test("a task runs on its bot's model unless /model picks one, and a failing bot model falls back behind another gateway", async (t) => {
+  // eng runs Claude; ops runs a GPT variant, so its fallback differs from the default model's.
+  const models: Record<string, string> = { eng: 'oneapi-chat/claude-opus-5-5', ops: 'oneapi-chat-gpt/gpt-6-astra#high' };
+  const bots = loadBots();
+  const registry = readFileSync(BOTS_PATH, 'utf-8');
+  writeFileSync(BOTS_PATH, JSON.stringify({ bots: bots.map((b) => (models[b.id] ? { ...b, model: models[b.id] } : b)) }));
+  db.ensureUser('test', 'wx');
+  t.after(() => {
+    writeFileSync(BOTS_PATH, registry);
+    db.setModel('test', null);
+  });
+  const sessionModels = async (plan: Script[], botId?: string) => {
+    sessions.length = 0;
+    return (await run(plan, { botId })).roots.map((s) => s.model);
+  };
+  assert.deepEqual(await sessionModels(['answer'], 'eng'), [{ providerID: 'oneapi-chat', id: 'claude-opus-5-5' }]);
+  assert.deepEqual(await sessionModels(['answer']), [undefined], "a bot without a model runs the agent's own");
+  assert.deepEqual(await sessionModels(['provider-error', 'answer'], 'ops'), [{ ...GPT, variant: 'high' }, DEEPSEEK]);
+  db.setModel('test', 'oneapi/DeepSeek-V4.1-Flash');
+  assert.deepEqual(await sessionModels(['answer'], 'eng'), [DEEPSEEK], '/model wins over the bot model');
 });

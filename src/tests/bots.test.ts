@@ -1,4 +1,4 @@
-// The bot roster: the generated registry and its checks, "@bot" routing, the v4 bot_id column,
+// The bot roster: the generated registry and its checks, each bot's model, "@bot" routing, the v4 bot_id column,
 // per-bot memory, the <persona> block, reply prefixes, /bots and /status.
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -17,6 +17,7 @@ mkdirSync(join(tmp, '.wechat-opencode-bot'));
 writeFileSync(join(tmp, '.wechat-opencode-bot', 'config.env'), `workingDirectory=${tmp}\n`);
 
 const { BOTS_PATH, detectBot, isReadOnlyBot, loadBots, resolveBot } = await import('../bots.js');
+const { logger } = await import('../logger.js');
 const { appendMemory, memoryPath, readMemory } = await import('../memory.js');
 const { composePrompt, resultText } = await import('../orchestrator.js');
 const { openStateDb } = await import('../tasks/db.js');
@@ -87,6 +88,24 @@ test('a registry without a valid bot falls back to the built-in default bot', ()
     writeFileSync(file, content);
     assert.deepEqual(loadBots(file).map((b) => [b.id, b.default]), [['chief', true]], content);
   }
+});
+
+test('a bot may name its model; a malformed one is dropped with a warning and the bot kept', (t) => {
+  const file = join(tmp, 'models.json');
+  const warn = t.mock.method(logger, 'warn');
+  const entry = (id: string, fields: object = {}) => ({ id, name: id, aliases: [id], role: 'r', ...fields });
+  const good = [' oneapi-chat/claude-opus-5-5 ', 'oneapi-gemini/Gemini 4 Argon', 'oneapi-chat-gpt/gpt-6-astra#high', 'or/vendor/model'];
+  const bad = ['', ' ', 'DeepSeek-V4.1-Flash', '/m', 'oneapi/', 'oneapi/m#', 'one api/m', 'oneapi/m #high', 42, null];
+  const entries = [...good.map((model, i) => entry(`good${i}`, { model })), ...bad.map((model, i) => entry(`bad${i}`, { model }))];
+  writeFileSync(file, JSON.stringify({ bots: [...entries, entry('none')] }));
+  const loaded = loadBots(file);
+  assert.deepEqual(loaded.slice(0, good.length).map((b) => b.model), good.map((model) => model.trim()));
+  const kept = loaded.slice(good.length);
+  assert.deepEqual(kept.map((b) => b.id), [...bad.map((_, i) => `bad${i}`), 'none'], 'no bot is skipped');
+  assert.ok(kept.every((b) => !('model' in b)), 'a dropped model leaves no model behind');
+  assert.deepEqual(kept.at(-1), { id: 'none', name: 'none', aliases: ['none'], prefix: '', default: false, role: 'r' });
+  assert.deepEqual(warn.mock.calls.map((call) => call.arguments[1]), bad.map((model, i) => ({ id: `bad${i}`, model })));
+  assert.ok(loadBots().every((b) => !('model' in b)), 'the generated bots run on the default model');
 });
 
 test('"@alias" at the start picks the bot in any case and is stripped; "@all" and "@everyone" address everyone', () => {
@@ -190,12 +209,17 @@ test('the bridge puts the bot prefix before a reply; the default bot and notices
   assert.equal(resultText(task({ status: 'interrupted', error: '用户停止' })), '⏹ 任务 #7 已中断：用户停止，需要的话请重新发送');
 });
 
-test('/bots lists the roster with the default bot and "@all"', async () => {
+test('/bots lists the roster with the default bot, each model and "@all"', async (t) => {
   const text = await routeCommand('/bots', {} as CommandContext);
-  assert.match(text, /^- chief: Chief（chief, 总管）默认，无回复前缀$/m);
-  assert.match(text, /^- research: 研究（research, 研究）回复前缀「研究：」$/m);
+  assert.match(text, /^- chief: Chief（chief, 总管）默认，无回复前缀，model=默认$/m);
+  assert.match(text, /^- research: 研究（research, 研究）回复前缀「研究：」，model=默认$/m);
   assert.match(text, /^- all: @all 或 @everyone 交给 Chief，/m);
   assert.ok(text.includes(BOTS_PATH));
+  const generated = readFileSync(BOTS_PATH, 'utf-8');
+  t.after(() => writeFileSync(BOTS_PATH, generated));
+  writeFileSync(BOTS_PATH, JSON.stringify({ bots: bots.map((b) => (b.id === 'eng' ? { ...b, model: 'oneapi-chat/claude-opus-5-5' } : b)) }));
+  const withModel = await routeCommand('/bots', {} as CommandContext);
+  assert.match(withModel, /^- eng: 工程（eng, 工程, code）回复前缀「工程：」，model=oneapi-chat\/claude-opus-5-5$/m);
 });
 
 test('/status shows the default bot, the last bot and each memory; /tasks shows the "@bot"', () => {

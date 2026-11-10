@@ -57,10 +57,10 @@ const HELP_TEXT = `可用命令：
   /projects         查看项目列表
 
 Bot：
-  /bots             查看 bot 列表（id、别名、回复前缀、默认 bot）
+  /bots             查看 bot 列表（id、别名、回复前缀、模型、默认 bot）
 
 模型与权限：
-  /model [模型]     查看或切换模型，所有 bot 共用（/model default 恢复默认）
+  /model [模型]     查看或切换模型，覆盖所有 bot（/model default 恢复各 bot 自己的 model，未设则用默认）
   /models           查看可用模型
   /permission [模式] 查看或设置权限模式
 
@@ -156,7 +156,7 @@ export function formatStatus(db: StateDb, accountId: string, gateways?: Gateway[
     `📁 最近项目: ${lastProject(db, accountId)}`,
     `🎭 默认 bot: ${primary.id}（${primary.name}）`,
     `💬 最近 bot: ${lastBot(db, accountId, primary.id)}`,
-    `🤖 模型: ${user?.model || '默认'}`,
+    `🤖 模型: ${user?.model ? `${user.model}（覆盖各 bot）` : '各 bot 自己的 model（/bots 查看）'}`,
     `🔒 权限模式: ${config.permissionMode ?? 'default'}`,
     `▶️ 运行中: ${running.join('；') || '无'}`,
     `⏳ 排队: ${counts.queued} 个`,
@@ -403,13 +403,17 @@ export const handlers: Record<string, Handler> = {
     const bots = loadBots();
     const lines = ['🎭 Bot（以 @别名 开头指定由谁回复）：'];
     for (const bot of bots) {
-      const notes = [bot.default ? '默认' : '', bot.prefix ? `回复前缀「${bot.prefix}」` : '无回复前缀'].filter(Boolean);
+      const notes = [
+        bot.default ? '默认' : '',
+        bot.prefix ? `回复前缀「${bot.prefix}」` : '无回复前缀',
+        `model=${bot.model ?? '默认'}`,
+      ].filter(Boolean);
       lines.push(`- ${bot.id}: ${bot.name}（${bot.aliases.join(', ') || '无别名'}）${notes.join('，')}`);
     }
     lines.push(
       `- all: @all 或 @everyone 交给 ${defaultBot(bots).name}，按需调用各专家，只回复一次`,
       '',
-      '🤖 所有 bot 共用 /model 设置的模型',
+      '🤖 /model 设置的模型优先于各 bot 的 model；都没设时用默认模型',
       `📝 配置: ${BOTS_PATH}`,
     );
     return lines.join('\n');
@@ -417,12 +421,13 @@ export const handlers: Record<string, Handler> = {
 
   async model(args, { accountId, db }) {
     if (!args) {
-      const current = db.getUser(accountId)?.model || '默认';
-      return `🤖 当前模型: ${current}（所有 bot 共用）\n用法: /model <provider/model>，/model default 恢复默认\n发送 /models 查看可用模型`;
+      const current = db.getUser(accountId)?.model;
+      const scope = current ? `${current}（覆盖所有 bot）` : '默认（各 bot 用自己的 model，发送 /bots 查看）';
+      return `🤖 当前模型: ${scope}\n用法: /model <provider/model>，/model default 恢复默认\n发送 /models 查看可用模型`;
     }
     if (/^(default|reset)$/i.test(args)) {
       db.setModel(accountId, null);
-      return '✅ 已恢复默认模型';
+      return '✅ 已恢复默认：各 bot 用自己的 model，未设则用默认模型';
     }
     const ref = await resolveModelRef(args);
     if (!ref) return `⚠️ 未找到模型: ${args}\n发送 /models 查看可用模型`;

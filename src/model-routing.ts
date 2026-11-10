@@ -2,8 +2,8 @@
 export type ErrorKind = 'auth' | 'quota' | 'timeout' | 'transport' | 'server' | 'bad_request' | 'unknown';
 
 /**
- * The model a task runs on when the user has not picked one with /model. Such sessions are still created
- * without a model, so the orchestrator agent's own model applies; this only tells routing its gateway.
+ * The model routing assumes when neither the chat's /model nor the bot's model is set. Such sessions are
+ * still created without a model, so the orchestrator agent's own model applies; this only tells routing its gateway.
  */
 export const DEFAULT_MODEL = process.env.OPENCODE_DEFAULT_MODEL || 'oneapi/DeepSeek-V4.1-Flash';
 

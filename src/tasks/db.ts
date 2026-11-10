@@ -223,6 +223,18 @@ export function openStateDb(file: string = STATE_DB_PATH) {
       if (!hasColumn('tasks', 'routine_id')) db.exec('ALTER TABLE tasks ADD COLUMN routine_id TEXT');
       db.exec('PRAGMA user_version = 7');
     }
+    if (version < 8) {
+      // Retention deletes every attempt's session; tasks.session_id names only the last. Older tasks bring that one.
+      db.exec(`CREATE TABLE IF NOT EXISTS task_sessions (
+        session_id TEXT NOT NULL PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS task_sessions_task ON task_sessions(task_id);
+      INSERT OR IGNORE INTO task_sessions (session_id, task_id, created_at)
+        SELECT session_id, id, COALESCE(finished_at, started_at, created_at) FROM tasks WHERE session_id IS NOT NULL;
+      PRAGMA user_version = 8;`);
+    }
   });
 
   const getTask = (id: string) => one<TaskRow>(`${TASK_SELECT} WHERE t.id = ?`, id);
@@ -393,27 +405,42 @@ export function openStateDb(file: string = STATE_DB_PATH) {
         accountId, since,
       ),
 
+    /** Every attempt's session is recorded for retention; the task names the last. */
     setTaskSession(id: string, sessionId: string): void {
-      run('UPDATE tasks SET session_id = ? WHERE id = ?', sessionId, id);
+      immediate(() => {
+        run('UPDATE tasks SET session_id = ? WHERE id = ?', sessionId, id);
+        run('INSERT OR IGNORE INTO task_sessions (session_id, task_id, created_at) VALUES (?, ?, ?)', sessionId, id, Date.now());
+      });
     },
 
     /**
-     * Sessions retention may delete: those of tasks that finished before cutoff (epoch ms), oldest first. The
-     * newest keep finished tasks keep theirs however old they are. A session no task records never qualifies.
+     * Sessions retention may delete: every attempt's of the tasks that finished before cutoff (epoch ms), oldest
+     * first. The newest keep finished tasks keep all theirs however old they are. A binary before v8 records a
+     * session only in tasks.session_id, so that counts too; a session no task records never qualifies.
      */
     staleSessionIds: (cutoff: number, keep: number) =>
       all<{ session_id: string }>(
-        `SELECT t.session_id FROM tasks t WHERE t.session_id IS NOT NULL AND t.status IN ('done', 'failed', 'interrupted')
-           AND t.finished_at IS NOT NULL AND t.finished_at < ?
-           AND t.session_id NOT IN (SELECT session_id FROM tasks WHERE session_id IS NOT NULL AND finished_at IS NOT NULL
-             ORDER BY finished_at DESC LIMIT ?)
-         ORDER BY t.finished_at ASC`,
+        `WITH recorded AS (
+           SELECT session_id, task_id, rowid AS pos FROM task_sessions
+           UNION ALL
+           SELECT session_id, id, NULL FROM tasks t
+             WHERE session_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM task_sessions s WHERE s.session_id = t.session_id)
+         ), finished AS (
+           SELECT id, finished_at, rowid AS pos FROM tasks WHERE status IN ('done', 'failed', 'interrupted')
+             AND finished_at IS NOT NULL AND id IN (SELECT task_id FROM recorded)
+         )
+         SELECT r.session_id FROM recorded r JOIN finished f ON f.id = r.task_id
+         WHERE f.finished_at < ? AND f.id NOT IN (SELECT id FROM finished ORDER BY finished_at DESC, pos DESC LIMIT ?)
+         ORDER BY f.finished_at, f.pos, r.pos NULLS LAST`,
         cutoff, keep,
       ).map((row) => row.session_id),
 
-    /** The session is gone from OpenCode: its tasks stop naming it, so retention does not ask for it again. */
+    /** The session is gone from OpenCode: task_sessions drops it and no task names it, so retention does not ask again. */
     forgetSession(sessionId: string): void {
-      run('UPDATE tasks SET session_id = NULL WHERE session_id = ?', sessionId);
+      immediate(() => {
+        run('DELETE FROM task_sessions WHERE session_id = ?', sessionId);
+        run('UPDATE tasks SET session_id = NULL WHERE session_id = ?', sessionId);
+      });
     },
 
     /**

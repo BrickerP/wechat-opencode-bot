@@ -1,5 +1,5 @@
-// Session retention: which sessions may go, the order they go in through the OpenCode API, and a cleanup that
-// counts what fails and never throws.
+// Session retention: the v8 record of every attempt's session, which sessions may go, the order they go in through
+// the OpenCode API, and a cleanup that counts what fails and never throws.
 import assert from 'node:assert/strict';
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { createServer } from 'node:http';
@@ -49,18 +49,24 @@ after(() => {
   rmSync(tmp, { recursive: true, force: true });
 });
 
-/** A state.db of the test's own, and a way to add a task with a given status, session and finish time. */
+/**
+ * A state.db of the test's own; a way to add a task with a given status, sessions (one per attempt, recorded as the
+ * orchestrator records them) and finish time; and the sessions task_sessions records for a task, oldest first.
+ */
 function fresh(name: string) {
   const file = join(tmp, `${name}.db`);
   const db = openStateDb(file);
   const raw = new DatabaseSync(file);
   raws.push(raw);
-  const seed = (status: TaskStatus, sessionId: string | null, finishedAt: number | null): string => {
+  const seed = (status: TaskStatus, sessions: string | string[] | null, finishedAt: number | null): string => {
     const { task } = db.createTask('acc', 'hi');
-    raw.prepare('UPDATE tasks SET status = ?, session_id = ?, finished_at = ? WHERE id = ?').run(status, sessionId, finishedAt, task.id);
+    for (const sessionId of [sessions ?? []].flat()) db.setTaskSession(task.id, sessionId);
+    raw.prepare('UPDATE tasks SET status = ?, finished_at = ? WHERE id = ?').run(status, finishedAt, task.id);
     return task.id;
   };
-  return { db, seed };
+  const recorded = (taskId: string) =>
+    raw.prepare('SELECT session_id FROM task_sessions WHERE task_id = ? ORDER BY rowid').all(taskId).map((row) => row.session_id);
+  return { db, raw, seed, recorded };
 }
 
 /** OpenCode's 404 body for a session it does not have. */
@@ -92,6 +98,37 @@ function lastSummary(): unknown {
   return JSON.parse(line.slice(line.indexOf('{')));
 }
 
+test('a v7 database gains task_sessions, filled with the session each task names, and keeps its rows', () => {
+  const { db: v7, raw } = fresh('v7');
+  raw.exec('DROP TABLE task_sessions; PRAGMA user_version = 7;');
+  const [done, running, queued] = ['done', 'running', 'queued'].map((input) => v7.createTask('acc', input).task.id);
+  const update = raw.prepare('UPDATE tasks SET status = ?, started_at = ?, finished_at = ?, session_id = ? WHERE id = ?');
+  update.run('done', T0 - 2 * DAY, T0 - DAY, 'ses_done', done);
+  update.run('running', T0 - 3 * DAY, null, 'ses_running', running);
+
+  const db = openStateDb(join(tmp, 'v7.db'));
+  assert.equal((raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 8);
+  const rows = () =>
+    raw.prepare('SELECT session_id, task_id, created_at FROM task_sessions ORDER BY session_id').all()
+      .map((row) => [row.session_id, row.task_id, row.created_at]);
+  // A finished task's session dates from its finish, a running one's from its start.
+  assert.deepEqual(rows(), [['ses_done', done, T0 - DAY], ['ses_running', running, T0 - 3 * DAY]]);
+  assert.deepEqual(
+    [done, running, queued].map((id) => [db.getTask(id)?.input, db.getTask(id)?.status, db.getTask(id)?.session_id]),
+    [['done', 'done', 'ses_done'], ['running', 'running', 'ses_running'], ['queued', 'queued', null]],
+  );
+  openStateDb(join(tmp, 'v7.db'));
+  assert.equal(rows().length, 2, 'opening again changes nothing');
+});
+
+test('setTaskSession records the session of every attempt, each once, and the task names the last', () => {
+  const { db, recorded } = fresh('record');
+  const { task } = db.createTask('acc', 'hi');
+  for (const sessionId of ['ses_first', 'ses_retry', 'ses_retry']) db.setTaskSession(task.id, sessionId);
+  assert.equal(db.getTask(task.id)?.session_id, 'ses_retry');
+  assert.deepEqual(recorded(task.id), ['ses_first', 'ses_retry']);
+});
+
 test('staleSessionIds: sessions of tasks finished before the cutoff, oldest first, except the newest keep', () => {
   const { db, seed } = fresh('stale');
   seed('done', 'ses_c', T0 - 8 * DAY);
@@ -113,6 +150,21 @@ test('staleSessionIds: sessions of tasks finished before the cutoff, oldest firs
   assert.deepEqual(db.staleSessionIds(cutoff, 1), ['ses_b', 'ses_c']);
   assert.equal(db.getTask(a)?.status, 'failed', 'the task stays');
   assert.equal(db.getTask(a)?.session_id, null);
+});
+
+test('staleSessionIds: every attempt of a stale task, once and in order, even one only tasks.session_id names', () => {
+  const { db, raw, seed } = fresh('attempts');
+  const name = raw.prepare('UPDATE tasks SET session_id = ? WHERE id = ?');
+  // Retried on the fallback model: task_sessions has both attempts, and the task names the retry too.
+  seed('done', ['ses_first', 'ses_retry'], T0 - 10 * DAY);
+  // A binary before v8 sharing state.db records only tasks.session_id: here a task's retry, and a whole task.
+  name.run('ses_mixed_retry', seed('failed', 'ses_mixed_first', T0 - 9.5 * DAY));
+  name.run('ses_legacy', seed('interrupted', null, T0 - 9 * DAY));
+  seed('done', ['ses_kept_first', 'ses_kept_retry'], T0 - 8 * DAY);
+
+  const cutoff = T0 - 7 * DAY;
+  assert.deepEqual(db.staleSessionIds(cutoff, 1), ['ses_first', 'ses_retry', 'ses_mixed_first', 'ses_mixed_retry', 'ses_legacy']);
+  assert.deepEqual(db.staleSessionIds(cutoff, 3), ['ses_first', 'ses_retry'], 'the newest 3 tasks keep every session');
 });
 
 test('deleteSession: deleted or already gone resolves; any other failure rejects, a 404 from a missing route too', async () => {
@@ -174,6 +226,35 @@ test('pruneSessions goes through the OpenCode API, subagent sessions before thei
   requests.length = 0;
   assert.deepEqual(await pruneSessions(db, undefined, NOW), { deleted: 0, failed: 0 });
   assert.deepEqual(requests, []);
+});
+
+test('pruneSessions deletes every attempt of a retried task, each after its subagents, and forgets each', async () => {
+  const { db, seed, recorded } = fresh('retried');
+  const retried = seed('failed', ['ses_first', 'ses_retry'], T0 - 10 * DAY);
+  // KEEP=1: the newest task keeps both of its sessions.
+  const kept = seed('done', ['ses_kept_first', 'ses_kept'], T0 - 8 * DAY);
+
+  // The first attempt's session cannot go this time; the retry's goes, so the task names no session any more.
+  const flaky = fakeApi({ ses_first: ['ses_first_1'], ses_retry: ['ses_retry_1'] }, { remove: ['ses_first'] });
+  assert.deepEqual(await pruneSessions(db, flaky.api, NOW), { deleted: 3, failed: 1 });
+  assert.deepEqual(flaky.calls, [
+    'list ses_first',
+    'delete ses_first_1',
+    'delete ses_first',
+    'list ses_retry',
+    'delete ses_retry_1',
+    'delete ses_retry',
+  ]);
+  assert.equal(db.getTask(retried)?.session_id, null);
+  assert.deepEqual(recorded(retried), ['ses_first']);
+
+  // The next run still finds the first attempt's session; the one after has nothing to ask.
+  const { api, calls } = fakeApi();
+  assert.deepEqual(await pruneSessions(db, api, NOW), { deleted: 1, failed: 0 });
+  assert.deepEqual(await pruneSessions(db, api, NOW), { deleted: 0, failed: 0 });
+  assert.deepEqual(calls, ['list ses_first', 'delete ses_first']);
+  assert.deepEqual(recorded(retried), []);
+  assert.deepEqual([db.getTask(kept)?.session_id, recorded(kept)], ['ses_kept', ['ses_kept_first', 'ses_kept']]);
 });
 
 test('a failed delete is counted and the rest go on; a session whose children cannot be listed waits', async () => {

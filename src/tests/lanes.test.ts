@@ -35,7 +35,7 @@ test('a v5 database gains the lane column and its tasks are writes; new tasks st
   raw.exec('ALTER TABLE tasks DROP COLUMN lane; PRAGMA user_version = 5;');
   const db = openStateDb(file);
   assert.ok(raw.prepare("SELECT name FROM pragma_table_info('tasks')").all().some((c) => c.name === 'lane'));
-  assert.equal((raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 7);
+  assert.equal((raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 8);
   raw.close();
   assert.deepEqual([db.getTask(task.id)?.input, db.getTask(task.id)?.lane], ['old task', 'write']);
   assert.equal(openStateDb(file).getTask(task.id)?.lane, 'write', 'opening again changes nothing');

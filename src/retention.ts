@@ -30,11 +30,11 @@ async function tryDelete(api: RetentionApi, sessionId: string): Promise<boolean>
 }
 
 /**
- * Delete, through the OpenCode API, the sessions of tasks that finished more than ttlDays() ago, oldest first.
- * The newest keepCount() finished tasks keep theirs, a session state.db does not record is never touched, and
- * opencode.db is never opened. A task's subagent sessions go before its own, and a deleted session is forgotten,
- * so no later run asks for it again. Returns how many sessions went and how many could not. Never throws: a
- * failure is logged and counted, and the next run tries again.
+ * Delete, through the OpenCode API, the sessions of tasks that finished more than ttlDays() ago, a retried task's
+ * earlier attempts included, oldest first. The newest keepCount() finished tasks keep theirs, a session state.db
+ * does not record is never touched, and opencode.db is never opened. A session's subagent sessions go before it,
+ * and a deleted session is forgotten, so no later run asks for it again. Returns how many sessions went and how
+ * many could not. Never throws: a failure is logged and counted, and the next run tries again.
  */
 export async function pruneSessions(
   db: StateDb,

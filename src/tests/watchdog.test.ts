@@ -7,6 +7,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { after, beforeEach, test } from 'node:test';
 import type { TaskLane, TaskProject, TaskRow } from '../tasks/db.js';
 
@@ -227,6 +228,11 @@ test('a model that never answers times out, and the fallback model finishes the 
   assert.doesNotMatch(roots[0].prompt ?? '', /^retry: /m);
   assert.match(roots[1].prompt ?? '', /^retry: /m);
   assert.equal(task.session_id, roots[1].id);
+  // Both attempts' sessions are recorded, so retention deletes the first one too.
+  const raw = new DatabaseSync(join(tmp, 'state.db'));
+  const recorded = raw.prepare('SELECT session_id FROM task_sessions WHERE task_id = ? ORDER BY rowid').all(task.id);
+  raw.close();
+  assert.deepEqual(recorded.map((row) => row.session_id), roots.map((s) => s.id));
   assert.equal(delivered.length, 1);
   assert.ok(elapsed >= FIRST_MS && elapsed < FIRST_MS + 5000, `took ${elapsed}ms`);
 });

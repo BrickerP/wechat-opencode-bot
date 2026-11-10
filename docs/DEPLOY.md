@@ -118,7 +118,7 @@ The bot runs write tasks on the `wechat-orchestrator` agent, which hands work to
 
 - To change a prompt, edit `config/agents/<name>.md`, commit, then release and deploy. See [config/agents/README.md](../config/agents/README.md).
 - `install-agents.sh` backs up what it replaces to `~/.wechat-opencode-bot/backups/agents-<time>/`. Never keep a backup inside `~/.config/opencode/agents/`: OpenCode also loads `.md` files in its subdirectories as agents, hidden ones included.
-- `wechat-ducc.md` is not in the repo, because no agent delegates to it. `install-agents.sh` leaves it alone.
+- `wechat-ducc.md` is not part of the setup: no agent delegates to Ducc, and `install-agents.sh` does not create it. The old file in a live agents directory can be deleted.
 
 ## launchd
 
@@ -148,6 +148,18 @@ The bot takes `~/.wechat-opencode-bot/daemon.lock` before it connects to anythin
 
 Logs are in `~/.wechat-opencode-bot/logs/`. launchd writes `bot.out.log`, `bot.err.log`, `server.out.log`, `server.err.log`, `watchdog.out.log` and `watchdog.err.log`; the bot writes `wechat-opencode-bot-<date>.log` and keeps the 3 newest, and the watchdog writes `watchdog.log`.
 
+## Watchdog
+
+`scripts/watchdog.sh` runs at login and every 5 minutes through `com.yupeng.opencode-wechat-watchdog`. A run is healthy when `scripts/healthcheck.sh` passes and `~/.wechat-opencode-bot/heartbeat` is younger than 5 minutes; the daemon rewrites that file every 30 seconds, so a hung event loop is detectable. Two unhealthy checks 60 seconds apart restart the bot with `launchctl kickstart -k`; if it is still unhealthy after the restart, the next attempt waits 30 minutes. Every restart and failure goes to `~/.wechat-opencode-bot/logs/watchdog.log` and a macOS notification; a healthy run writes nothing.
+
+Once a day the same script runs `node current/dist/main.js --simulate "只回复 ok"` as a smoke test, which exercises the OpenCode server, the agents and the model. It has a 180-second timeout, logs its result and notifies on failure. Run it now with `scripts/watchdog.sh --smoke`.
+
+Install the third job with `scripts/install-launchd.sh --apply`, then load it once (the script prints the exact commands):
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.yupeng.opencode-wechat-watchdog.plist
+```
+
 ## Health
 
 ```bash
@@ -160,6 +172,8 @@ It changes nothing and exits 1 if any check fails:
 - the bot job runs, and `daemon.lock` names its pid;
 - `main.js --status` succeeds when run with the bot's own node and entry. Its report is printed.
 
+In WeChat, `/doctor` runs the same class of checks from inside the daemon: OpenCode and the four agents, the message token's age, the outbox, `state.db` and `opencode.db` sizes, open breakers, routines and uptime. `/panic` is the kill switch: it stops and cancels every task, denies waiting asks, switches to `plan` and disables every routine.
+
 It also prints the bot's command line, its working directory and where `current` points.
 
 ## Backups and cleanup
@@ -170,7 +184,7 @@ It also prints the bot's command line, its working directory and where `current`
 
 ## Model routing
 
-- `/model` sets a chat's primary model; without it the session uses the orchestrator agent's model. `OPENCODE_DEFAULT_MODEL` is only what routing assumes in that case, so keep it equal to the `model:` of both orchestrators in `config/agents/`.
+- `/model` sets a chat's primary model; without it the session uses the bot's `model` from `bots.json`, then the orchestrator agent's model. `OPENCODE_DEFAULT_MODEL` is only what routing assumes when neither is set, so keep it equal to the `model:` of both orchestrators in `config/agents/`.
 - An upstream failure (5xx, 429, timeout, transport, `do request failed`) retries once on a model behind another gateway: `OPENCODE_FALLBACK_MODEL` when set, otherwise the first of `oneapi-chat-gpt/gpt-6-astra`, `oneapi/DeepSeek-V4.1-Flash`, `oneapi-gemini/Gemini 4 Argon` whose provider differs from the primary.
 - Auth errors, HTTP 4xx and permission rejections are not retried, and neither is an unreachable local OpenCode server: another gateway would fail the same way.
 - 3 upstream failures in a row open that gateway's breaker for 10 minutes (`OWB_BREAKER_THRESHOLD`, `OWB_BREAKER_COOLDOWN_MS`). Later tasks start on the fallback and the chat gets one notice. A failed probe doubles the cooldown, up to an hour; a success closes the breaker. The state is in memory, so a restart starts with every breaker closed.

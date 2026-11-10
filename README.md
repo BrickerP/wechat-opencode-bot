@@ -63,7 +63,8 @@ flowchart LR
 
 ### Model routing and resilience
 
-- A task runs on the chat's `/model`, else on the orchestrator's own `model:`, which routing takes to be `OPENCODE_DEFAULT_MODEL`. Subagents have no `model:` line and run on their parent's model.
+- A task runs on the chat's `/model`, else on its bot's `model` from `bots.json`, else on the orchestrator's own `model:`, which routing takes to be `OPENCODE_DEFAULT_MODEL`. Subagents have no `model:` line and run on their parent's model.
+- `bots.json` accepts an optional `model` per bot (`provider/model[#variant]`); `/model` overrides every bot, and `/model default` returns to each bot's own model.
 - An upstream failure gets one retry on the fallback model: `OPENCODE_FALLBACK_MODEL` if set, else the first model of the built-in chain on another provider (gateway). Upstream means 429 or quota, 5xx or overloaded, timeouts, connection errors, `provider.*` errors other than auth, and a model silent for 120 s before its first output or 180 s between signs of progress. The retry's prompt warns that the first attempt may have changed files; you only see the final outcome.
 - Not retried: auth, permission, 4xx and unknown errors, errors of the local server, and the 30-minute cap on one attempt.
 - Each gateway has a breaker, kept in memory. 3 upstream failures in a row open it: new tasks start on the fallback and the chat gets one notice. After 10 minutes the next task tries the gateway again; a success closes the breaker, a failure doubles the wait, up to 1 hour. Separately, 3 failed tasks within 30 minutes send one `🚨` alert, then none for 30 minutes.
@@ -76,7 +77,7 @@ Paths are in the data directory (`OWB_DATA_DIR`, default `~/.wechat-opencode-bot
 
 | What | Where | Kept |
 |---|---|---|
-| Tasks, outbox, routines, per-chat settings | `state.db`: `tasks`, `pending_notices`, `routines`, `users` | Migrations run on open (`PRAGMA user_version`, additive only) |
+| Tasks, outbox, routines, per-chat settings | `state.db`: `tasks`, `task_sessions`, `pending_notices`, `routines`, `users` | Migrations run on open (`PRAGMA user_version`, additive only) |
 | Backups of `state.db` | `backups/state-<time>.db` | Taken at start-up when the newest is over a day old; 7 kept |
 | OpenCode sessions | the OpenCode server | Deleted through its API 7 days after the task finished, keeping the newest 300; checked at start-up and daily |
 | Memory | `memory/<account>/MEMORY.md` (shared, written by the default bot), `memory/<account>/bots/<id>.md` | 5 facts per task, 300 characters each; each file adds up to 8 KB to the prompt and is capped at 16 KB |
@@ -97,7 +98,7 @@ When OpenCode asks for approval, the daemon applies the mode in `config.env`, re
 |---|---|
 | `src/` | The daemon: `main.ts` (CLI, inbound messages), `orchestrator.ts` (prompt, run, result), `opencode/` (HTTP client, watchdogs), `tasks/` (`state.db`, lanes), `wechat/` (iLink client), `commands/`, `tests/` |
 | `config/agents/` | The four agent prompts, see [config/agents/README.md](config/agents/README.md) |
-| `config/launchd/` | launchd job templates for the server and the daemon, run through `run-server.sh` and `run-bot.sh` |
+| `config/launchd/` | launchd job templates for the server, the daemon and the watchdog, run through `run-server.sh`, `run-bot.sh` and `scripts/watchdog.sh` |
 | `scripts/` | `release.sh`, `deploy.sh`, `rollback.sh`, `healthcheck.sh`, `install-agents.sh`, `install-launchd.sh` |
 | `docs/` | [DEPLOY.md](docs/DEPLOY.md) and design notes |
 
@@ -142,9 +143,11 @@ Run `npm run build` after every change. For an always-on bot, `scripts/release.s
 | `/cwd [path]` | Show or set the chat's working directory, inside the base directory |
 | `/ls` | List the working directory (up to 100 entries) |
 | `/projects` | List the projects and their aliases |
-| `/bots` | List the bots: id, aliases, reply prefix, default |
-| `/model [model]` | Show or set the model for the next tasks, shared by all bots: `provider/model[#variant]` or a bare id; `/model default` clears it |
+| `/bots` | List the bots: id, aliases, reply prefix, model, default |
+| `/model [model]` | Show or set the model for the next tasks, overriding every bot: `provider/model[#variant]` or a bare id; `/model default` returns to each bot's own model |
 | `/models` | List the server's models |
+| `/doctor` | Self-check: OpenCode, agents, message token, outbox, databases, breakers, routines and uptime |
+| `/panic` | Stop and cancel every task, deny waiting asks, switch to `plan` and disable every routine |
 | `/permission [mode]` | Show or set `default`, `acceptEdits`, `plan` or `auto` |
 | `/routine …` | List routines, or `add`, `rm`, `on`, `off` or `run` one |
 | `/version`, `/v` | Show the version |
@@ -164,7 +167,7 @@ Any other `/word` gets `未知命令`; commands never become tasks.
 
 `/routine add 早报 daily09:00 汇总昨天的工作` queues that prompt as a normal task every day at 09:00. Schedules are `dailyHH:MM` (Asia/Shanghai, a fixed UTC+8), `everyNm` and `everyNh`, from 5 minutes to 24 hours.
 
-- The prompt is routed like a message when you add it, so `@bot` and `@project` work; both stay fixed after that.
+- The prompt is routed like a message when you add it, so `@bot` and `@project` work; both stay fixed after that. If the project is moved or removed later, its next task runs in the base workspace and a warning is logged.
 - A routine never runs two tasks at once: a slot that comes while its last task is queued or running is skipped.
 - After downtime, a routine that came due runs once, then keeps its schedule; the other missed runs are dropped.
 - Results go through the outbox, so without a recent message token they wait for your next message.
@@ -184,7 +187,7 @@ Every `node dist/main.js` command loads `env` from the data directory, and varia
 | `OPENCODE_FIRST_RESPONSE_TIMEOUT_MS`, `OPENCODE_STALL_TIMEOUT_MS` | `120000`, `180000` | Silence allowed before the first output, and between signs of progress |
 | `OWB_BREAKER_THRESHOLD`, `OWB_BREAKER_COOLDOWN_MS` | `3`, `600000` | Upstream failures in a row that open a breaker, and its first cooldown |
 | `OWB_FAILURE_ALERT_COUNT`, `OWB_FAILURE_ALERT_WINDOW_MS`, `OWB_FAILURE_ALERT_COOLDOWN_MS` | `3`, `1800000`, `1800000` | Failed tasks in the window that send an alert, the window, and the pause after an alert |
-| `OWB_SESSION_TTL_DAYS`, `OWB_SESSION_KEEP` | `7`, `300` | Session retention: age in days, and how many of the newest sessions are always kept |
+| `OWB_SESSION_TTL_DAYS`, `OWB_SESSION_KEEP` | `7`, `300` | Session retention: age in days, and how many of the newest finished tasks keep all their sessions |
 | `OWB_PROGRESS_FIRST_MS`, `OWB_PROGRESS_MIN_GAP_MS`, `OWB_PROGRESS_EVERY_MS`, `OWB_PROGRESS_MAX` | `60000`, `90000`, `300000`, `4` | Progress notes: first after, minimum gap, regular interval, maximum per task |
 | `OWB_DATA_DIR` | `~/.wechat-opencode-bot` | The data directory |
 | `OWB_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |

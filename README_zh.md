@@ -63,7 +63,8 @@ flowchart LR
 
 ### 模型路由与容错
 
-- 任务使用聊天里 `/model` 设置的模型；没有设置时使用 orchestrator 自己的 `model:`，路由假定它等于 `OPENCODE_DEFAULT_MODEL`。子 agent 没有 `model:` 行，沿用父会话的模型。
+- 任务优先使用聊天里 `/model` 设置的模型；没有时使用 `bots.json` 中该 bot 的 `model`；都没有时使用 orchestrator 自己的 `model:`，路由假定它等于 `OPENCODE_DEFAULT_MODEL`。子 agent 没有 `model:` 行，沿用父会话的模型。
+- `bots.json` 的每个 bot 可以选填 `model`（`provider/model[#variant]`）；`/model` 会覆盖所有 bot，`/model default` 恢复各 bot 自己的 model。
 - 上游失败会在备用模型上重试一次：设置了 `OPENCODE_FALLBACK_MODEL` 就用它，否则用内置链路里第一个属于其他 provider（网关）的模型。上游失败包括 429 或额度不足、5xx 或过载、超时、连接错误、鉴权以外的 `provider.*` 错误，以及模型首次输出前沉默 120 秒、或两次进展之间沉默 180 秒。重试的 prompt 会提醒第一次尝试可能已改过文件；你只会看到最终结果。
 - 不重试：鉴权、权限、4xx 和未知错误，本地服务的错误，以及单次尝试 30 分钟的上限。
 - 每个网关有一个熔断器，状态只在内存里。连续 3 次上游失败会打开它：新任务直接用备用模型，聊天收到一条通知。10 分钟后下一个任务会再试这个网关；成功则关闭熔断，失败则等待时间翻倍，最长 1 小时。另外，30 分钟内 3 个任务失败会发一条 `🚨` 告警，之后 30 分钟内不再发。
@@ -76,7 +77,7 @@ flowchart LR
 
 | 内容 | 位置 | 保留 |
 |---|---|---|
-| 任务、待发队列、定时任务、每个聊天的设置 | `state.db`：`tasks`、`pending_notices`、`routines`、`users` | 打开时执行迁移（`PRAGMA user_version`，只做增量变更） |
+| 任务、待发队列、定时任务、每个聊天的设置 | `state.db`：`tasks`、`task_sessions`、`pending_notices`、`routines`、`users` | 打开时执行迁移（`PRAGMA user_version`，只做增量变更） |
 | `state.db` 的备份 | `backups/state-<time>.db` | 启动时若最新备份已超过一天就新建一份；保留 7 份 |
 | OpenCode 会话 | OpenCode 服务 | 任务结束 7 天后经它的 API 删除，始终保留最新 300 个；启动时和每天检查一次 |
 | 记忆 | `memory/<account>/MEMORY.md`（共享，由默认 bot 写入）、`memory/<account>/bots/<id>.md` | 每个任务最多 5 条、每条 300 字；每个文件最多向 prompt 注入 8 KB，上限 16 KB |
@@ -97,7 +98,7 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 |---|---|
 | `src/` | 守护进程：`main.ts`（CLI、收消息）、`orchestrator.ts`（prompt、执行、结果）、`opencode/`（HTTP 客户端、watchdog）、`tasks/`（`state.db`、通道）、`wechat/`（iLink 客户端）、`commands/`、`tests/` |
 | `config/agents/` | 四个 agent 的提示词，见 [config/agents/README.md](config/agents/README.md) |
-| `config/launchd/` | 服务和守护进程的 launchd 任务模板，经 `run-server.sh` 和 `run-bot.sh` 启动 |
+| `config/launchd/` | server、daemon、watchdog 三个 launchd 模板，分别经 `run-server.sh`、`run-bot.sh`、`scripts/watchdog.sh` 启动 |
 | `scripts/` | `release.sh`、`deploy.sh`、`rollback.sh`、`healthcheck.sh`、`install-agents.sh`、`install-launchd.sh` |
 | `docs/` | [DEPLOY.md](docs/DEPLOY.md) 和设计文档 |
 
@@ -142,9 +143,11 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 | `/cwd [path]` | 查看或设置聊天的工作目录，须在基础目录内 |
 | `/ls` | 列出工作目录（最多 100 项） |
 | `/projects` | 列出项目及其别名 |
-| `/bots` | 列出 bot：id、别名、回复前缀、是否默认 |
-| `/model [model]` | 查看或设置之后任务的模型，所有 bot 共用：`provider/model[#variant]` 或只写 id；`/model default` 清除设置 |
+| `/bots` | 列出 bot：id、别名、回复前缀、model、是否默认 |
+| `/model [model]` | 查看或设置之后任务的模型，覆盖所有 bot：`provider/model[#variant]` 或只写 id；`/model default` 恢复各 bot 自己的 model |
 | `/models` | 列出服务上的模型 |
+| `/doctor` | 自检：OpenCode、agent、消息令牌、待补发、数据库、熔断、定时任务和运行时长 |
+| `/panic` | 停止并取消所有任务、拒绝等待中的审批、切到 `plan`、停用所有定时任务 |
 | `/permission [mode]` | 查看或设置 `default`、`acceptEdits`、`plan` 或 `auto` |
 | `/routine …` | 列出定时任务，或对某一个执行 `add`、`rm`、`on`、`off`、`run` |
 | `/version`、`/v` | 显示版本 |
@@ -164,7 +167,7 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 
 `/routine add 早报 daily09:00 汇总昨天的工作` 会在每天 09:00 把这段 prompt 作为普通任务排队。时间格式有 `dailyHH:MM`（Asia/Shanghai，固定 UTC+8）、`everyNm` 和 `everyNh`（5 分钟到 24 小时）。
 
-- prompt 在添加时像普通消息一样分派，所以可以带 `@bot` 和 `@project`；之后两者固定不变。
+- prompt 在添加时像普通消息一样分派，所以可以带 `@bot` 和 `@project`；之后两者固定不变。若项目后来被移动或移除，下一次任务会回退到基础工作区并记录一条警告。
 - 同一个定时任务不会同时跑两个任务：到点时如果它的上一个任务还在排队或运行，这次就跳过。
 - 停机期间到期的定时任务会补跑一次，之后按原计划执行；其余错过的执行直接丢弃。
 - 结果经待发队列发送，所以没有较新的消息令牌时，会等你的下一条消息。
@@ -184,7 +187,7 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 | `OPENCODE_FIRST_RESPONSE_TIMEOUT_MS`、`OPENCODE_STALL_TIMEOUT_MS` | `120000`、`180000` | 首次输出前、两次进展之间允许的沉默时长 |
 | `OWB_BREAKER_THRESHOLD`、`OWB_BREAKER_COOLDOWN_MS` | `3`、`600000` | 打开熔断所需的连续上游失败次数，以及首次冷却时长 |
 | `OWB_FAILURE_ALERT_COUNT`、`OWB_FAILURE_ALERT_WINDOW_MS`、`OWB_FAILURE_ALERT_COOLDOWN_MS` | `3`、`1800000`、`1800000` | 窗口内触发告警的失败任务数、窗口长度、告警后的静默时长 |
-| `OWB_SESSION_TTL_DAYS`、`OWB_SESSION_KEEP` | `7`、`300` | 会话保留：天数，以及始终保留的最新会话数 |
+| `OWB_SESSION_TTL_DAYS`、`OWB_SESSION_KEEP` | `7`、`300` | 会话保留：天数，以及最近多少个已完成任务保留它们的全部会话 |
 | `OWB_PROGRESS_FIRST_MS`、`OWB_PROGRESS_MIN_GAP_MS`、`OWB_PROGRESS_EVERY_MS`、`OWB_PROGRESS_MAX` | `60000`、`90000`、`300000`、`4` | 进度通知：首条时间、最小间隔、常规间隔、每个任务的上限 |
 | `OWB_DATA_DIR` | `~/.wechat-opencode-bot` | 数据目录 |
 | `OWB_LOG_LEVEL` | `info` | `debug`、`info`、`warn` 或 `error` |

@@ -1,7 +1,8 @@
 // Routines: the schedule syntax and the next run (no drift, no catch-up), the v7 routines table and the tasks'
-// routine_id, the scheduler tick that queues a due routine once, and /routine with its routing.
+// routine_id, the scheduler tick that queues a due routine once, in its project as the registry has it now, and
+// /routine with its routing.
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -24,6 +25,7 @@ const { openStateDb } = await import('../tasks/db.js');
 const { tickRoutines } = await import('../commands/handlers.js');
 const { routeCommand } = await import('../commands/router.js');
 const { createPermissionBroker } = await import('../permission.js');
+const { loadProjects, PROJECTS_PATH } = await import('../projects.js');
 
 after(() => rmSync(tmp, { recursive: true, force: true }));
 
@@ -196,6 +198,55 @@ test('the tick leaves routines that are off, not due or of another account, disa
     },
   } as unknown as StateDb;
   assert.deepEqual(tickRoutines(locked, 'acc', () => void kicks++, NOW), [], 'a failed tick waits for the next one');
+});
+
+test('the tick runs a routine in its project as the registry has it now, and where a message would once it is gone', () => {
+  const db = openStateDb(join(tmp, 'moved.db'));
+  loadProjects(base);
+  const registry = readFileSync(PROJECTS_PATH, 'utf-8');
+  /** The registry with a "scratch" project at dir, or without it. */
+  const register = (dir?: string) => {
+    const { projects } = JSON.parse(registry);
+    if (dir) projects.push({ id: 'scratch', dir, aliases: ['scratch'] });
+    writeFileSync(PROJECTS_PATH, JSON.stringify({ projects }));
+  };
+  const scratch = join(base, 'scratch');
+  const moved = join(base, 'scratch2');
+  mkdirSync(scratch);
+  register('scratch');
+  const project = { id: 'scratch', dir: scratch };
+  const tidy = db.addRoutine('acc', { name: 'tidy', prompt: '整理一下', schedule: 'every5m', nextRunAt: NOW, project })!;
+  let now = NOW;
+  /** One due run: the project of the task it queued, which then finishes so the next run is not skipped. */
+  const tick = () => {
+    const [task] = tickRoutines(db, 'acc', () => {}, now);
+    now += 5 * MINUTE;
+    db.finishTask(db.claimNextTask('acc', 'write')!.id, 'done');
+    return [task.project_id, task.project_dir];
+  };
+  try {
+    assert.deepEqual(tick(), ['scratch', scratch]);
+    renameSync(scratch, moved);
+    register('scratch2');
+    assert.deepEqual(tick(), ['scratch', moved], 'moved: the new path');
+    assert.equal(db.routine('acc', 'tidy')?.project_dir, scratch, 'the row stays as it was');
+    rmSync(moved, { recursive: true });
+    assert.deepEqual(tick(), [null, null], 'its directory is gone: the workspace, as for a message without a project');
+    mkdirSync(moved);
+    register();
+    assert.deepEqual(tick(), [null, null], 'no longer registered');
+    const logs = join(tmp, '.wechat-opencode-bot', 'logs');
+    const misses = readdirSync(logs)
+      .flatMap((name) => readFileSync(join(logs, name), 'utf-8').split('\n'))
+      .filter((line) => line.includes(' WARN Routine project missing '));
+    assert.deepEqual(
+      misses.map((line) => line.slice(line.indexOf(' WARN '))),
+      Array(2).fill(` WARN Routine project missing {"routineId":"${tidy.id}","name":"tidy","projectId":"scratch"}`),
+    );
+  } finally {
+    writeFileSync(PROJECTS_PATH, registry);
+    for (const dir of [scratch, moved]) rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('/routine add routes the prompt like a message that follows no earlier task; /routine lists the routines', async () => {

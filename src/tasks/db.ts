@@ -582,6 +582,10 @@ export function openStateDb(file: string = STATE_DB_PATH) {
       );
     },
 
+    /** /panic: every routine of the account goes off; /routine on brings one back. Returns how many were on. */
+    disableAllRoutines: (accountId: string): number =>
+      Number(run('UPDATE routines SET enabled = 0 WHERE account_id = ? AND enabled = 1', accountId).changes),
+
     /** Enabled routines of every account whose time has come, the longest due first. */
     dueRoutines: (now: number) =>
       all<RoutineRow>('SELECT * FROM routines WHERE enabled = 1 AND next_run_at <= ? ORDER BY next_run_at, rowid', now),

@@ -164,13 +164,25 @@ function startOpenCodeService(cwd?: string): void {
   }
 }
 
+/** GET /api/info; throws if the server cannot be reached. version is undefined if it reports none. */
+export async function openCodeInfo(signal?: AbortSignal): Promise<{ version?: string }> {
+  const info = await api<{ version?: unknown }>("/api/info", { signal });
+  return { version: typeof info?.version === "string" ? info.version : undefined };
+}
+
 export async function pingOpenCode(): Promise<boolean> {
   try {
-    await api("/api/info");
+    await openCodeInfo();
     return true;
   } catch {
     return false;
   }
+}
+
+/** The agents the server has loaded, hidden ones included. A session names its agent by id. */
+export async function listAgents(signal?: AbortSignal): Promise<Array<{ id: string; name: string }>> {
+  const out = await api<{ data: any[] }>("/api/agent", { signal });
+  return (out.data || []).map((a) => ({ id: String(a.id), name: a.name || a.id }));
 }
 
 export async function initOpenCode(cwd?: string): Promise<void> {

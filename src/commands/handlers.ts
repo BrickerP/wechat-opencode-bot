@@ -1,17 +1,19 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { BOTS_PATH, defaultBot, detectBot, isReadOnlyBot, loadBots, type Bot } from '../bots.js';
 import { loadConfig, saveConfig, type PermissionMode } from '../config.js';
+import { DATA_DIR } from '../constants.js';
 import { logger } from '../logger.js';
 import { memoryPath, memoryStats } from '../memory.js';
 import { breaker } from '../model-routing.js';
-import { clip, formatElapsed, formatTime, STATUS_LABEL } from '../orchestrator.js';
-import { formatModelRef, listModels, resolveModelRef } from '../opencode/provider.js';
+import { clip, formatElapsed, formatTime, ORCHESTRATOR_AGENT, ORCHESTRATOR_READ_AGENT, STATUS_LABEL } from '../orchestrator.js';
+import { formatModelRef, listAgents, listModels, openCodeInfo, resolveModelRef } from '../opencode/provider.js';
 import type { PermissionBroker } from '../permission.js';
 import { detectProject, isRealPathInside, loadProjects, PROJECTS_PATH, resolveProjectDir, stripProjectPrefix } from '../projects.js';
 import { formatSchedule, nextRunText, parseSchedule, type Schedule } from '../routines.js';
-import type { RoutineRow, StateDb, TaskRow } from '../tasks/db.js';
+import { STATE_DB_PATH, type RoutineRow, type StateDb, type TaskProject, type TaskRow } from '../tasks/db.js';
 import type { TaskQueue } from '../tasks/queue.js';
 
 export interface CommandContext {
@@ -38,6 +40,20 @@ const ROUTINE_ADD_USAGE = '用法：/routine add <名称> <dailyHH:MM|everyNm> <
 const ROUTINE_USAGE = `${ROUTINE_ADD_USAGE}\n/routine rm|on|off|run <名称>：删除、启用、停用、立即运行`;
 const SCHEDULE_FORMS = 'daily09:00（每天，北京时间）、every30m（每 N 分钟，N ≥ 5）、every2h（每 N 小时，N ≤ 24）';
 
+/** The agents config/agents installs: tasks run on the orchestrators, which delegate to the other two. */
+const REQUIRED_AGENTS = [ORCHESTRATOR_AGENT, ORCHESTRATOR_READ_AGENT, 'wechat-general', 'wechat-explore'];
+/** What install-agents.sh prints after a change: OpenCode only sees new agents once reloaded. */
+const AGENTS_FIX = [
+  '   修复: scripts/install-agents.sh --apply，再 reload：',
+  `   (set -a; . ${join(DATA_DIR, 'env')}; set +a; opencode reload --server "\${OPENCODE_URL:-http://127.0.0.1:4096}")`,
+].join('\n');
+/** /doctor's wait for OpenCode, past the ~5 s it holds a request while its plugins load. */
+const DOCTOR_TIMEOUT_MS = 8000;
+/** /doctor flags a message token older than this: iLink may have expired it. */
+const TOKEN_STALE_MS = 12 * 60 * 60 * 1000;
+/** OpenCode's own database: /doctor reads its size, never its contents. */
+const OPENCODE_DB_PATH = join(homedir(), '.local', 'share', 'opencode', 'opencode.db');
+
 const HELP_TEXT = `可用命令：
 
 任务：
@@ -45,6 +61,7 @@ const HELP_TEXT = `可用命令：
   /tasks [数量]     查看最近的任务（默认 5 个）
   /stop             停止所有正在运行的任务
   /stop all         同时取消所有排队的任务
+  /panic            紧急停止：停止并取消所有任务，权限切到 plan，停用所有定时任务
 
 定时任务（北京时间）：
   /routine          查看定时任务
@@ -65,6 +82,7 @@ Bot：
   /permission [模式] 查看或设置权限模式
 
 其他：
+  /doctor           自检：OpenCode 与 agent、消息令牌、待补发、数据库、熔断和定时任务
   /help             显示帮助
   /version          查看版本
 
@@ -112,14 +130,22 @@ function memoryCounts(accountId: string, bots: Bot[]): string {
 }
 
 /** Tasks that finished in the last 24 hours by outcome, and the latest failure among them. */
-function dayHealth(db: StateDb, accountId: string, now: number): string {
+function dayHealth(db: StateDb, accountId: string, now: number): { failed: number; text: string } {
   const since = now - DAY_MS;
   const { done, failed, interrupted } = db.statusCountsSince(accountId, since);
-  const line = `🩺 24小时: 完成 ${done}，失败 ${failed}，中断 ${interrupted}`;
+  const text = `24小时: 完成 ${done}，失败 ${failed}，中断 ${interrupted}`;
   const last = db.lastFailure(accountId, since);
-  if (!last) return line;
+  if (!last) return { failed, text };
   // formatTime ends in "HH:mm".
-  return `${line}（最近失败 ${formatTime(last.finished_at!).slice(-5)} 任务 #${last.seq}：${clip(last.error ?? '', 60)}）`;
+  return { failed, text: `${text}（最近失败 ${formatTime(last.finished_at!).slice(-5)} 任务 #${last.seq}：${clip(last.error ?? '', 60)}）` };
+}
+
+/** The outbox backlog: how many notices, the oldest's age, the most retries; null when it is empty. */
+function outboxBacklog(db: StateDb, accountId: string, now: number): string | null {
+  const pending = db.pendingNotices(accountId);
+  if (!pending.length) return null;
+  const retries = Math.max(...pending.map((n) => n.attempts));
+  return `${pending.length} 条（最久 ${formatElapsed(pending[0].created_at, now)}，重试 ${retries} 次）`;
 }
 
 /** A gateway as breaker.snapshot() reports it. */
@@ -162,17 +188,88 @@ export function formatStatus(db: StateDb, accountId: string, gateways?: Gateway[
     `⏳ 排队: ${counts.queued} 个`,
     `📊 累计: ${total} 个任务（完成 ${counts.done}，失败 ${counts.failed}，中断 ${counts.interrupted}）`,
     `🧠 记忆: ${memoryCounts(accountId, bots)}`,
-    dayHealth(db, accountId, now),
+    `🩺 ${dayHealth(db, accountId, now).text}`,
     `🧯 熔断: ${gateways ? openBreakers(gateways, now) : '仅 bot 进程内可见，在微信发送 /status 查看'}`,
   ];
-  const pending = db.pendingNotices(accountId);
-  if (pending.length) {
-    const retries = Math.max(...pending.map((n) => n.attempts));
-    lines.push(`📮 待补发: ${pending.length} 条（最久 ${formatElapsed(pending[0].created_at, now)}，重试 ${retries} 次）`);
-  }
+  const backlog = outboxBacklog(db, accountId, now);
+  if (backlog) lines.push(`📮 待补发: ${backlog}`);
   // The token's age only: the token itself is a credential.
   lines.push(`🔑 消息令牌: ${user?.context_token_at ? `${formatElapsed(user.context_token_at, now)}前` : '无'}`);
   return lines.join('\n');
+}
+
+/** What /doctor learns outside state.db. The handler gathers it, so tests can pass their own. */
+export interface DoctorProbe {
+  /** openCodeInfo(): GET /api/info. */
+  server: PromiseSettledResult<{ version?: string }>;
+  /** listAgents(): GET /api/agent. */
+  agents: PromiseSettledResult<Array<{ id: string }>>;
+  /** breaker.snapshot(): the breakers live in the daemon's memory. */
+  gateways: Gateway[];
+  /** How long the daemon has been up. */
+  uptimeMs: number;
+}
+
+type Check = ['✅' | '⚠️' | '❌', string];
+
+/** 7708422144 → "7.2 GB", in units of 1024 as du -h counts. */
+function formatSize(bytes: number): string {
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let size = bytes;
+  let unit = 0;
+  for (; size >= 1024 && unit < units.length - 1; unit++) size /= 1024;
+  return unit ? `${size.toFixed(1)} ${units[unit]}` : `${size} B`;
+}
+
+/** Why a request to OpenCode failed, in a few words: fetch puts the reason in err.cause. */
+function requestError(err: unknown): string {
+  if (!(err instanceof Error)) return clip(String(err), 80);
+  if (err.name === 'TimeoutError') return `${DOCTOR_TIMEOUT_MS / 1000} 秒无响应`;
+  const code = (err.cause as { code?: unknown } | undefined)?.code;
+  return clip(code ? `${err.message} (${code})` : err.message, 80);
+}
+
+/**
+ * /doctor: one line per thing the daemon depends on, ✅ fine, ⚠️ worth a look, ❌ broken, then how many need
+ * attention. The token shows by its age only.
+ */
+export function formatDoctor(db: StateDb, accountId: string, probe: DoctorProbe, now: number = Date.now()): string {
+  const { server, agents, gateways, uptimeMs } = probe;
+  const checks: Check[] = [
+    server.status === 'fulfilled'
+      ? ['✅', `OpenCode: 已连接${server.value.version ? `（v${server.value.version}）` : ''}`]
+      : ['❌', `OpenCode: 无法连接（${requestError(server.reason)}）`],
+  ];
+  if (agents.status === 'rejected') checks.push(['❌', `Agent: 无法获取（${requestError(agents.reason)}）`]);
+  else {
+    const ids = new Set(agents.value.map((a) => a.id));
+    const missing = REQUIRED_AGENTS.filter((id) => !ids.has(id));
+    checks.push(missing.length ? ['❌', `Agent: 缺少 ${missing.join('、')}\n${AGENTS_FIX}`] : ['✅', `Agent: ${REQUIRED_AGENTS.length} 个已就绪`]);
+  }
+  const tokenAt = db.getUser(accountId)?.context_token_at;
+  checks.push(
+    !tokenAt
+      ? ['❌', '消息令牌: 无（结果会等你的下一条消息再发）']
+      : now - tokenAt > TOKEN_STALE_MS
+        ? ['⚠️', `消息令牌: ${formatElapsed(tokenAt, now)}前（超过 12 小时，可能已失效）`]
+        : ['✅', `消息令牌: ${formatElapsed(tokenAt, now)}前`],
+  );
+  const backlog = outboxBacklog(db, accountId, now);
+  checks.push(backlog ? ['⚠️', `待补发: ${backlog}`] : ['✅', '待补发: 无']);
+  const stateDb = statSync(STATE_DB_PATH, { throwIfNoEntry: false });
+  checks.push(stateDb ? ['✅', `state.db: ${formatSize(stateDb.size)}`] : ['❌', `state.db: 未找到 ${STATE_DB_PATH}`]);
+  const openCodeDb = statSync(OPENCODE_DB_PATH, { throwIfNoEntry: false });
+  if (openCodeDb) checks.push(['✅', `opencode.db: ${formatSize(openCodeDb.size)}（OpenCode 的会话库）`]);
+  checks.push([gateways.some((g) => g.openUntil > now) ? '⚠️' : '✅', `熔断: ${openBreakers(gateways, now)}`]);
+  const day = dayHealth(db, accountId, now);
+  checks.push([day.failed ? '⚠️' : '✅', day.text]);
+  const routines = db.routines(accountId);
+  const enabled = routines.filter((r) => r.enabled).sort((a, b) => a.next_run_at - b.next_run_at);
+  const nextRun = enabled.length ? `，下次 ${nextRunText(enabled[0].next_run_at)}（${enabled[0].name}）` : '';
+  checks.push(['✅', `定时任务: ${routines.length ? `${routines.length} 个，启用 ${enabled.length} 个${nextRun}` : '无'}`]);
+  checks.push(['✅', `运行时长: ${formatElapsed(now - uptimeMs, now)}`]);
+  const issues = checks.filter(([mark]) => mark !== '✅').length;
+  return ['🩺 自检：', ...checks.map(([mark, text]) => `${mark} ${text}`), `总体: ${issues ? `有 ${issues} 项需要注意` : '正常'}`].join('\n');
 }
 
 /** Shared by /tasks and --tasks. Newest first. */
@@ -202,12 +299,26 @@ function describeRoutine(r: RoutineRow, defaultBotId: string): string {
 }
 
 /**
+ * The routine's project as the registry has it now, so a project that moved runs at its new path. One that was
+ * unregistered, or whose directory is gone, runs where a message without a project would. The row stays as it was.
+ */
+function routineProject(routine: RoutineRow, bots: Bot[]): TaskProject | undefined {
+  if (!routine.project_id) return undefined;
+  const base = loadConfig().workingDirectory;
+  const project = loadProjects(base, PROJECTS_PATH, bots).find((p) => p.id === routine.project_id);
+  if (project) return { id: project.id, dir: resolveProjectDir(base, project) };
+  logger.warn('Routine project missing', { routineId: routine.id, name: routine.name, projectId: routine.project_id });
+  return undefined;
+}
+
+/**
  * Queue the routine's task the way its message would have been: its bot, its project, the bot's lane. The
  * routine then counts as run at now. Shared by the scheduler and /routine run.
  */
 function queueRoutine(db: StateDb, routine: RoutineRow, schedule: Schedule, now: number): { task: TaskRow; nextRunAt: number } {
-  const project = routine.project_id && routine.project_dir ? { id: routine.project_id, dir: routine.project_dir } : undefined;
-  const lane = isReadOnlyBot(routine.bot_id) ? 'read' : 'write';
+  const bots = loadBots();
+  const project = routineProject(routine, bots);
+  const lane = isReadOnlyBot(routine.bot_id, bots) ? 'read' : 'write';
   const { task } = db.createTask(routine.account_id, routine.prompt, null, project, routine.bot_id ?? undefined, lane, routine.id);
   const nextRunAt = schedule.nextRunAt(now, routine.next_run_at);
   db.markRoutineRun(routine.id, nextRunAt, now);
@@ -302,6 +413,13 @@ export const handlers: Record<string, Handler> = {
 
   status: (_args, { accountId, db }) => formatStatus(db, accountId, breaker.snapshot()),
 
+  async doctor(_args, { accountId, db }) {
+    // Bounded: messages are handled one at a time, so a hung OpenCode would hold up every later one.
+    const signal = AbortSignal.timeout(DOCTOR_TIMEOUT_MS);
+    const [server, agents] = await Promise.allSettled([openCodeInfo(signal), listAgents(signal)]);
+    return formatDoctor(db, accountId, { server, agents, gateways: breaker.snapshot(), uptimeMs: process.uptime() * 1000 });
+  },
+
   tasks: (args, { accountId, db }) => formatTasks(db, accountId, parseTaskLimit(args)),
 
   stop(args, { accountId, db, queue, broker }) {
@@ -323,6 +441,20 @@ export const handlers: Record<string, Handler> = {
     }
     if (lines.length) return lines.join('\n');
     return all ? '没有运行中或排队的任务' : '没有运行中的任务';
+  },
+
+  /** The kill switch: /stop all, every ask denied, plan mode and every routine off, in one command. */
+  panic(_args, { accountId, db, queue, broker }) {
+    const error = '用户 panic';
+    // As /stop: the rows first, so the runners stay quiet, and this reply is the user's notice.
+    const stopped = db.runningTasks(accountId).filter((t) => db.finishTask(t.id, 'interrupted', { error, notified: true }));
+    broker.rejectPending(accountId);
+    queue.stop(accountId);
+    const cancelled = db.cancelQueued(accountId, error);
+    saveConfig({ ...loadConfig(), permissionMode: 'plan' });
+    const routines = db.disableAllRoutines(accountId);
+    logger.warn('Panic', { stopped: stopped.length, cancelled, routines });
+    return `🛑 已 panic：停止 ${stopped.length} 个任务、取消 ${cancelled} 个排队、权限切到 plan、停用 ${routines} 个定时任务。恢复：/permission default；/routine on <名称>`;
   },
 
   routine(args, { accountId, db, queue }) {

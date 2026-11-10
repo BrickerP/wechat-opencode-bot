@@ -187,6 +187,8 @@ Every `node dist/main.js` command loads `env` from the data directory, and varia
 | `OPENCODE_FIRST_RESPONSE_TIMEOUT_MS`, `OPENCODE_STALL_TIMEOUT_MS` | `120000`, `180000` | Silence allowed before the first output, and between signs of progress |
 | `OWB_BREAKER_THRESHOLD`, `OWB_BREAKER_COOLDOWN_MS` | `3`, `600000` | Upstream failures in a row that open a breaker, and its first cooldown |
 | `OWB_FAILURE_ALERT_COUNT`, `OWB_FAILURE_ALERT_WINDOW_MS`, `OWB_FAILURE_ALERT_COOLDOWN_MS` | `3`, `1800000`, `1800000` | Failed tasks in the window that send an alert, the window, and the pause after an alert |
+| `OWB_ALERT_WEBHOOK` | empty | URL the watchdog also POSTs each of its alerts to, as plain text: an ntfy topic, a Slack proxy… |
+| `OWB_ALERT_PING_URL` | empty | URL the watchdog GETs after every healthy run, for an external dead-man's switch such as healthchecks.io |
 | `OWB_SESSION_TTL_DAYS`, `OWB_SESSION_KEEP` | `7`, `300` | Session retention: age in days, and how many of the newest finished tasks keep all their sessions |
 | `OWB_PROGRESS_FIRST_MS`, `OWB_PROGRESS_MIN_GAP_MS`, `OWB_PROGRESS_EVERY_MS`, `OWB_PROGRESS_MAX` | `20000`, `90000`, `300000`, `4` | Progress notes: first after, minimum gap, regular interval, maximum per task |
 | `OWB_DATA_DIR` | `~/.wechat-opencode-bot` | The data directory |

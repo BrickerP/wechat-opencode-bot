@@ -160,7 +160,14 @@ The `com.yupeng.opencode-wechat-watchdog` job runs `scripts/watchdog.sh` at logi
 
 Once a day after a passing check, and on `scripts/watchdog.sh --smoke`, it runs a smoke test: `node current/dist/main.js --simulate "只回复 ok"`, or `dist/main.js` without `current`. The task goes through the real OpenCode server and model under the `simulate` account, so the chat's history and memory stay untouched. A test that has not finished after 180 s is stopped and fails. A failure sends a notification and logs the last 20 lines of the output; the next test still waits a day.
 
-A healthy run writes nothing, apart from the daily smoke-test result. `~/.wechat-opencode-bot/logs/watchdog.log` gets failures, restarts and smoke-test results, with the healthcheck's `ok` and `FAIL` lines but never its `--status` report or the env file. In a terminal, `scripts/watchdog.sh` does the same, restart included, and prints what it found.
+A healthy run writes nothing, apart from the daily smoke-test result and a failed ping. `~/.wechat-opencode-bot/logs/watchdog.log` gets failures, restarts and smoke-test results, with the healthcheck's `ok` and `FAIL` lines but never its `--status` report or the env file. In a terminal, `scripts/watchdog.sh` does the same, restart included, and prints what it found.
+
+Notifications only reach someone at the Mac. Two optional variables add channels that do not. Set them in `~/.wechat-opencode-bot/env`; a variable already in the environment wins:
+
+- `OWB_ALERT_WEBHOOK`: the text of every notification is also POSTed there as a `text/plain` body, for example to an ntfy topic or a proxy in front of Slack. A failed POST is logged with curl's exit code and changes nothing else.
+- `OWB_ALERT_PING_URL`: every run that ends healthy GETs it, including one that restarted the bot or ran the smoke test. It is the ping of an external dead-man's switch such as healthchecks.io; give the check a period of 5 minutes and a grace time of at least 10. The pings stop, so the service alerts, while the bot stays unhealthy or its job is not loaded, while the Mac sleeps or is off, and when the watchdog itself stops. A failed ping is logged.
+
+Neither URL is logged, and curl reads them from stdin, so they stay out of the process list too. `scripts/watchdog.sh --test-alert` sends `watchdog test alert` as a notification and to the webhook, without checking or restarting anything, and exits 1 if the POST failed. With neither variable set, the watchdog reports through notifications and its log alone.
 
 Install the watchdog only after deploying a release that writes the heartbeat: `cat ~/.wechat-opencode-bot/heartbeat` must show the running bot's pid. With an older build every check fails, and the watchdog restarts the bot every 30 minutes.
 

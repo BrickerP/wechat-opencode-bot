@@ -187,6 +187,8 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 | `OPENCODE_FIRST_RESPONSE_TIMEOUT_MS`、`OPENCODE_STALL_TIMEOUT_MS` | `120000`、`180000` | 首次输出前、两次进展之间允许的沉默时长 |
 | `OWB_BREAKER_THRESHOLD`、`OWB_BREAKER_COOLDOWN_MS` | `3`、`600000` | 打开熔断所需的连续上游失败次数，以及首次冷却时长 |
 | `OWB_FAILURE_ALERT_COUNT`、`OWB_FAILURE_ALERT_WINDOW_MS`、`OWB_FAILURE_ALERT_COOLDOWN_MS` | `3`、`1800000`、`1800000` | 窗口内触发告警的失败任务数、窗口长度、告警后的静默时长 |
+| `OWB_ALERT_WEBHOOK` | 空 | watchdog 的每条告警也以纯文本 POST 到这个 URL，例如 ntfy 主题或 Slack 代理 |
+| `OWB_ALERT_PING_URL` | 空 | watchdog 每次运行结果健康时 GET 这个 URL，供外部的 dead-man's switch（如 healthchecks.io）在收不到 ping 时告警 |
 | `OWB_SESSION_TTL_DAYS`、`OWB_SESSION_KEEP` | `7`、`300` | 会话保留：天数，以及最近多少个已完成任务保留它们的全部会话 |
 | `OWB_PROGRESS_FIRST_MS`、`OWB_PROGRESS_MIN_GAP_MS`、`OWB_PROGRESS_EVERY_MS`、`OWB_PROGRESS_MAX` | `20000`、`90000`、`300000`、`4` | 进度通知：首条时间、最小间隔、常规间隔、每个任务的上限 |
 | `OWB_DATA_DIR` | `~/.wechat-opencode-bot` | 数据目录 |

@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # The bot's watchdog: launchd runs it at login and every 5 minutes. It restarts a bot that fails scripts/healthcheck.sh
 # or stopped rewriting its heartbeat, and once a day sends one task through --simulate as a smoke test.
-# A stuck bot cannot write to WeChat, so the watchdog reports with macOS notifications and logs/watchdog.log.
-# A healthy run writes nothing. It logs the healthcheck's check lines, never its --status report or the env file.
+# A stuck bot cannot write to WeChat, so the watchdog reports with macOS notifications and logs/watchdog.log, and also
+# POSTs each notification's text to OWB_ALERT_WEBHOOK when that is set. When OWB_ALERT_PING_URL is set, every healthy run
+# ends with a GET of it: the ping of an external dead-man's switch, which alerts when the pings stop.
+# A healthy run writes nothing, unless the ping fails. It logs the healthcheck's check lines, never its --status report,
+# the env file or a URL.
 set -euo pipefail
 
-usage() { echo "Usage: scripts/watchdog.sh [--smoke]"; }
+usage() { echo "Usage: scripts/watchdog.sh [--smoke | --test-alert]"; }
 
 REPO="$(cd "$(dirname "$0")/.." && pwd -P)"
 DATA_DIR="${OWB_DATA_DIR:-$HOME/.wechat-opencode-bot}"
@@ -24,8 +27,10 @@ SMOKE_EVERY_SECONDS=86400
 SMOKE_TIMEOUT_SECONDS=180
 
 smoke=0
+test_alert=0
 case "${1:-}" in
   --smoke) smoke=1 ;;
+  --test-alert) test_alert=1 ;;
   '') ;;
   -h | --help) usage; exit 0 ;;
   *) usage >&2; exit 2 ;;
@@ -52,6 +57,26 @@ log_lines() {  # logs stdin, one entry per line
 notify() {  # best effort; macOS shows it as a Script Editor notification
   osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title "wechat-opencode-bot"' -e 'end run' "$1" \
     >/dev/null 2>&1 || true
+}
+env_file_value() {  # what the env file sets $1 to; sourced in a subshell, so none of its variables reach this script
+  [ -f "$DATA_DIR/env" ] || return 0
+  (set +eu; . "$DATA_DIR/env" >/dev/null 2>&1; printf '%s' "${!1:-}") || true
+}
+# Both optional, see docs/DEPLOY.md. As for node dist/main.js, a variable set in the environment wins over the env file.
+OWB_ALERT_WEBHOOK=${OWB_ALERT_WEBHOOK-$(env_file_value OWB_ALERT_WEBHOOK)}
+OWB_ALERT_PING_URL=${OWB_ALERT_PING_URL-$(env_file_value OWB_ALERT_PING_URL)}
+fetch() {  # fetch <url> [curl options]: fails unless a 2xx comes within 10 s. curl reads the URL from stdin, not argv.
+  local url=$1
+  shift
+  printf 'url = "%s"\n' "$url" | curl -fsS -m 10 -K - "$@" >/dev/null 2>&1
+}
+alert_failed=0  # set when a POST to OWB_ALERT_WEBHOOK failed
+alert() {  # a notification, and a POST of its text to OWB_ALERT_WEBHOOK; a failed POST is logged and changes nothing else
+  notify "$1"
+  if [ -n "$OWB_ALERT_WEBHOOK" ]; then
+    fetch "$OWB_ALERT_WEBHOOK" -H 'Content-Type: text/plain; charset=utf-8' --data-raw "$1" ||
+      { log "alert webhook failed: curl exit $?"; alert_failed=1; }
+  fi
 }
 age() {  # seconds since the file was last written; a missing file is very old
   local mtime
@@ -114,6 +139,13 @@ run_with_timeout() {  # run_with_timeout <seconds> <command...>: its exit status
   wait "$pid"
 }
 
+if [ $test_alert = 1 ]; then  # the alert channels alone: no check, no restart, no ping
+  alert "watchdog test alert"
+  if [ -z "$OWB_ALERT_WEBHOOK" ]; then say "OWB_ALERT_WEBHOOK is not set: sent the macOS notification only"
+  elif [ $alert_failed = 0 ]; then say "sent the macOS notification and posted to OWB_ALERT_WEBHOOK"; fi
+  exit $alert_failed
+fi
+
 # A job that is not loaded was stopped on purpose (launchctl bootout). Bootstrapping it brings the checks back.
 if ! launchctl print "gui/$(id -u)/$BOT_LABEL" >/dev/null 2>&1; then
   say "$BOT_LABEL is not loaded; nothing to check"
@@ -131,7 +163,7 @@ if [ $healthy = 1 ]; then
   if [ -e "$FAILED_STAMP" ]; then
     rm -f "$FAILED_STAMP"
     log "healthy again"
-    notify "The bot is healthy again."
+    alert "The bot is healthy again."
   fi
 else
   retry_in=0
@@ -151,12 +183,12 @@ else
   if wait_healthy; then
     rm -f "$FAILED_STAMP"
     log "healthy after the restart"
-    notify "Restarted the bot ($reason). It is healthy again."
+    alert "Restarted the bot ($reason). It is healthy again."
   else
     touch "$FAILED_STAMP"
     log "still unhealthy after the restart: $problem"
     log_checks
-    notify "Restarted the bot, but it is still unhealthy: $problem"
+    alert "Restarted the bot, but it is still unhealthy: $problem"
     exit 1
   fi
 fi
@@ -174,9 +206,11 @@ if [ $smoke = 1 ] || [ "$(age "$SMOKE_STAMP")" -ge $SMOKE_EVERY_SECONDS ]; then
     if [ $status = 124 ]; then reason="no result in $SMOKE_TIMEOUT_SECONDS s"; else reason="exit $status"; fi
     log "smoke test failed: $reason"
     tail -n 20 "$WORK/smoke" | log_lines
-    notify "Smoke test failed: $reason. See logs/watchdog.log."
+    alert "Smoke test failed: $reason. See logs/watchdog.log."
     exit 1
   fi
   log "smoke test passed in $(($(date +%s) - started)) s"
 fi
+# Missing pings make the external service alert, also when this Mac sleeps, is off, or never gets this far.
+if [ -n "$OWB_ALERT_PING_URL" ]; then fetch "$OWB_ALERT_PING_URL" || log "alert ping failed: curl exit $?"; fi
 say healthy

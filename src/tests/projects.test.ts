@@ -328,7 +328,7 @@ test('a v2 database gains the project columns and keeps its rows', () => {
   const migrated = openStateDb(file);
   const columns = raw.prepare("SELECT name FROM pragma_table_info('tasks')").all().map((c) => c.name);
   assert.ok(columns.includes('project_id') && columns.includes('project_dir'));
-  assert.equal((raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 9);
+  assert.equal((raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 10);
   assert.deepEqual([migrated.getTask(task.id)?.input, migrated.getTask(task.id)?.project_id], ['old task', null]);
   raw.close();
 });

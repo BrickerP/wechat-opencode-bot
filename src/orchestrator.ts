@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, lstatSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync, type Stats } from 'node:fs';
+import { extname, isAbsolute, join } from 'node:path';
 import { maybeAlertFailures } from './alerts.js';
 import { defaultBot, loadBots, resolveBot, type Bot } from './bots.js';
 import { loadConfig } from './config.js';
@@ -8,6 +8,7 @@ import { logger } from './logger.js';
 import { appendMemory, memoryPath, readMemory } from './memory.js';
 import { breaker, DEFAULT_MODEL, fallbackModel, providerOf } from './model-routing.js';
 import { openCodeQuery, type PermissionDecision, type PermissionRequest, type QueryResult, type Usage } from './opencode/provider.js';
+import { isRealPathInside } from './projects.js';
 import type { StateDb, TaskRow, TaskStatus, TaskUsage } from './tasks/db.js';
 
 /** OpenCode agent that plans each task and delegates the work to subagent sessions. */
@@ -26,10 +27,23 @@ const REPLY_MARKER = '<<<WECHAT_REPLY>>>';
 const MEMORY_MARKER = '<<<WECHAT_MEMORY>>>';
 const SUMMARY_MARKER = '<<<WECHAT_SUMMARY>>>';
 const HANDOFF_MARKER = '<<<WECHAT_HANDOFF>>>';
+const FILES_MARKER = '<<<WECHAT_FILES>>>';
+
+/** The files a task may send after its text, and the size of each. */
+const MAX_FILES = 3;
+const MAX_FILE_BYTES = 20 * 1024 * 1024;
+/** Files with these extensions go as images, those with the other allowed ones as files. */
+const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp']);
+const FILE_EXTENSIONS = new Set(['pdf', 'txt', 'md', 'patch', 'diff', 'csv', 'json', 'zip']);
+
+const extension = (path: string): string => extname(path).slice(1).toLowerCase();
+
+/** Whether a task's attachment goes as an image; the others go as files. */
+export const isImageFile = (path: string): boolean => IMAGE_EXTENSIONS.has(extension(path));
 
 /** How a task talks back to the user. --simulate prints instead of sending. */
 export interface TaskIO {
-  /** Reports a finished task; the daemon hands it to the outbox. */
+  /** Reports a finished task; the daemon hands its text to the outbox, then sends a done task's files best-effort. */
   deliver(task: TaskRow): Promise<void>;
   /** Best-effort note while a long task runs; a failed one is dropped, never queued for retry. */
   progress?(text: string): void | Promise<void>;
@@ -246,6 +260,8 @@ export interface OrchestratorOutput {
   summary: string;
   /** Notes for the next task, never part of the reply; '' when there are none. */
   handoff: string;
+  /** Paths to send after the reply, as listed and not yet checked (checkTaskFiles); [] when there are none. */
+  files: string[];
 }
 
 /** Text from start up to the next marker position after it, or the end. */
@@ -261,29 +277,80 @@ function cleanHandoff(text: string): string {
   return /^(?:-\s*)?(?:无)?$/.test(handoff) ? '' : handoff;
 }
 
-/** Split the orchestrator's answer into the WeChat reply, new memory facts, a one-line summary and the handoff. */
+/** One path per line, without a "-" bullet or backticks; "-" or "无" means there are none. A repeated path counts once. */
+function cleanFiles(text: string): string[] {
+  const paths = trimmedLines(text).map((line) => line.replace(/^[-*]\s+/, '').replace(/^`(.+)`$/, '$1').trim());
+  return [...new Set(paths.filter((path) => path && path !== '-' && path !== '无'))];
+}
+
+/** Split the orchestrator's answer into the WeChat reply, new memory facts, a one-line summary, the handoff and the files. */
 export function parseOrchestratorOutput(text: string): OrchestratorOutput {
   // Drafts may quote the marker; the last one starts the answer. No marker: the whole text is the reply.
   const replyAt = text.lastIndexOf(REPLY_MARKER);
   const body = replyAt === -1 ? text : text.slice(replyAt + REPLY_MARKER.length);
   const memoryAt = body.indexOf(MEMORY_MARKER);
   const summaryAt = body.indexOf(SUMMARY_MARKER);
-  // The handoff comes last, so its last marker counts: one the reply quotes cannot cut the reply short.
+  // The handoff ends the required sections, so its last marker counts: one the reply quotes cannot cut the reply short.
   const handoffAt = body.lastIndexOf(HANDOFF_MARKER);
+  // The files come after every other section and run to the end; a files marker before one of them is quoted.
+  const lastFilesAt = body.lastIndexOf(FILES_MARKER);
+  const filesAt = lastFilesAt > Math.max(memoryAt, summaryAt, handoffAt) ? lastFilesAt : -1;
 
-  const reply = section(body, 0, memoryAt, summaryAt, handoffAt).trim();
+  const reply = section(body, 0, memoryAt, summaryAt, handoffAt, filesAt).trim();
   const memory =
     memoryAt === -1
       ? []
-      : trimmedLines(section(body, memoryAt + MEMORY_MARKER.length, summaryAt, handoffAt))
+      : trimmedLines(section(body, memoryAt + MEMORY_MARKER.length, summaryAt, handoffAt, filesAt))
           .map((line) => /^[-*]\s+(.+)$/.exec(line)?.[1].trim() ?? '')
           .filter(Boolean);
   const summary =
     summaryAt === -1
       ? ''
-      : (trimmedLines(section(body, summaryAt + SUMMARY_MARKER.length, memoryAt, handoffAt)).find(Boolean) ?? '');
-  const handoff = handoffAt === -1 ? '' : cleanHandoff(section(body, handoffAt + HANDOFF_MARKER.length, memoryAt, summaryAt));
-  return { reply, memory, summary: clip(summary || reply, MAX_SUMMARY_CHARS), handoff };
+      : (trimmedLines(section(body, summaryAt + SUMMARY_MARKER.length, memoryAt, handoffAt, filesAt)).find(Boolean) ?? '');
+  const handoff =
+    handoffAt === -1 ? '' : cleanHandoff(section(body, handoffAt + HANDOFF_MARKER.length, memoryAt, summaryAt, filesAt));
+  const files = filesAt === -1 ? [] : cleanFiles(body.slice(filesAt + FILES_MARKER.length));
+  return { reply, memory, summary: clip(summary || reply, MAX_SUMMARY_CHARS), handoff, files };
+}
+
+/** The attachments a task may send, and the listed paths it may not, each with the reason. */
+export interface CheckedFiles {
+  files: string[];
+  dropped: Array<{ path: string; reason: string }>;
+}
+
+/** Why a listed path cannot be sent, or undefined when it can. Never throws: runTask calls it before finishTask. */
+function attachmentProblem(path: string, workspace: string): string | undefined {
+  if (!isAbsolute(path)) return 'not an absolute path';
+  const ext = extension(path);
+  if (!IMAGE_EXTENSIONS.has(ext) && !FILE_EXTENSIONS.has(ext)) return 'type not allowed';
+  let stat: Stats;
+  try {
+    // lstat, so a symlink does not pass as the file it points to.
+    stat = lstatSync(path);
+  } catch {
+    return 'not found';
+  }
+  if (!stat.isFile()) return 'not a regular file';
+  if (stat.size > MAX_FILE_BYTES) return 'over 20 MB';
+  // Real paths, so neither ".." nor a symlinked directory leads out of the workspace.
+  if (!isRealPathInside(workspace, path)) return 'outside the workspace';
+  return undefined;
+}
+
+/**
+ * The attachments a task listed that it may send: absolute paths of regular files, not symlinks, whose real
+ * path is inside the workspace, of an allowed type and at most 20 MB. The first MAX_FILES valid ones are kept.
+ */
+export function checkTaskFiles(paths: string[], workspace: string): CheckedFiles {
+  const files: string[] = [];
+  const dropped: CheckedFiles['dropped'] = [];
+  for (const path of paths) {
+    const reason = attachmentProblem(path, workspace) ?? (files.length < MAX_FILES ? undefined : `more than ${MAX_FILES}`);
+    if (reason) dropped.push({ path, reason });
+    else files.push(path);
+  }
+  return { files, dropped };
 }
 
 // ── run ──────────────────────────────────────────────────────────────────
@@ -387,11 +454,13 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
       cost: sum.cost + u.cost,
     };
   };
+  // Where the task runs, and so where the files it sends must be.
+  let workspace = '';
   try {
     pruneAttachments();
     const user = db.getUser(task.account_id);
     // A project task opens at the repo root, so OpenCode loads that repo's AGENTS.md and opencode.json.
-    const workspace = task.project_dir || user?.workspace || loadConfig().workingDirectory;
+    workspace = task.project_dir || user?.workspace || loadConfig().workingDirectory;
     const attachments = resolveAttachments(db, task);
     // /stop and restarts finish the task elsewhere; only a failing or silent model is worth a second try.
     const running = () => !signal.aborted && db.getTask(task.id)?.status === 'running';
@@ -474,7 +543,12 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
     maybeAlertFailures(db, task.account_id);
   } else {
     const output = parseOrchestratorOutput(result.text);
-    if (!db.finishTask(task.id, 'done', { result: output.reply, summary: output.summary, handoff: output.handoff, usage })) return;
+    const { files, dropped } = checkTaskFiles(output.files, workspace);
+    for (const { path, reason } of dropped) logger.warn('Attachment dropped', { taskId: task.id, path, reason });
+    // The user hears how many did not come; the log says which and why.
+    const note = dropped.length ? `（有 ${dropped.length} 个附件未发送：路径不在工作区、类型/大小不支持或超过 ${MAX_FILES} 个）` : '';
+    const reply = [output.reply, note].filter(Boolean).join('\n');
+    if (!db.finishTask(task.id, 'done', { result: reply, summary: output.summary, handoff: output.handoff, files, usage })) return;
     try {
       appendMemory(memoryPath(task.account_id, resolveBot(task.bot_id).bot), output.memory);
     } catch (err) {

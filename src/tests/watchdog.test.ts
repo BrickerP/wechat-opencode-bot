@@ -1,9 +1,9 @@
 // runTask against a fake OpenCode server: the first-response and stall watchdogs, the one-shot fallback to
 // another gateway and the breaker that skips a failing one, the progress notes of a long task, the directory
 // each session opens in, the bot a task speaks as and the model it runs on, the orchestrator agent of each lane,
-// and the handoff and the usage a task records.
+// and the handoff, the usage and the attachments a task records.
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -25,6 +25,8 @@ const GPT = { providerID: 'oneapi-chat-gpt', id: 'gpt-6-astra' };
 /** The session model of oneapi/DeepSeek-V4.1-Flash, which is also the fallback for a GPT model. */
 const DEEPSEEK = { providerID: 'oneapi', id: 'DeepSeek-V4.1-Flash' };
 const HANDOFF = 'files: /repo/src/a.ts\nnext: 跑一遍测试';
+/** The paths the 'send-files' script lists after its handoff. */
+const attachments: string[] = [];
 /** What each root session reports it used: 5000 tokens in with the cache reads, 250 out with the reasoning. */
 const ROOT_USAGE = { tokens: { input: 1000, output: 200, reasoning: 50, cache: { read: 4000, write: 0 } }, cost: 0.25 };
 /** What each subagent session reports it used: 900 tokens in with the cache writes, 100 out. */
@@ -40,7 +42,8 @@ type Script =
   | 'gateway-502'
   | 'rejected'
   | 'child-stall'
-  | 'child-tool';
+  | 'child-tool'
+  | 'send-files';
 
 interface FakeSession {
   id: string;
@@ -121,6 +124,8 @@ const play: Record<Script, (session: FakeSession) => void> = {
         answer(s);
       });
     }),
+  'send-files': (s) =>
+    later(100, () => answer(s, `${REPLY}\n<<<WECHAT_HANDOFF>>>\n-\n<<<WECHAT_FILES>>>\n${attachments.join('\n')}`)),
 };
 
 /** The few OpenCode routes runTask uses. */
@@ -440,4 +445,20 @@ test('a failed task and a stopped one still record what they used', async () => 
   assert.equal(stopped.task.status, 'interrupted');
   assert.equal(stopped.task.error, '用户停止');
   assert.deepEqual(used(stopped.task), [5000, 250, 0.25]);
+});
+
+test('a done task keeps the files it may send, and its reply says how many of the others did not go', async () => {
+  const repo = join(tmp, 'repo');
+  mkdirSync(repo);
+  const inside = join(repo, 'chart.png');
+  const outside = join(tmp, 'secret.txt');
+  writeFileSync(inside, 'png');
+  writeFileSync(outside, 'secret');
+  attachments.push(inside, outside);
+  const { task, delivered } = await run(['send-files'], { project: { id: 'repo', dir: repo } });
+  assert.equal(task.status, 'done');
+  assert.equal(task.result, 'ok\n（有 1 个附件未发送：路径不在工作区、类型/大小不支持或超过 3 个）');
+  assert.equal(task.files, JSON.stringify([inside]));
+  assert.equal(task.handoff, null);
+  assert.equal(delivered[0].files, task.files, 'deliver gets the row with the files');
 });

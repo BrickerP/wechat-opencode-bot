@@ -28,6 +28,20 @@ export interface CDNMedia {
   aes_key: string;
   encrypt_query_param: string;
   cdn_url?: string;
+  encrypt_type?: number;
+}
+
+/** Where newer API versions put the CDN locator of a media item. */
+export interface MediaLocator {
+  encrypt_query_param: string;
+  aes_key?: string;
+  encrypt_type?: number;
+}
+
+/** media_type of getuploadurl, which is not the MessageItemType of the item that sends the file. */
+export enum UploadMediaType {
+  IMAGE = 1,
+  FILE = 3,
 }
 
 // ── Message Items ───────────────────────────────────────────────────────────
@@ -40,24 +54,27 @@ export interface ImageItem {
   cdn_media?: CDNMedia;
   /** Alternative field name used by some API versions */
   aeskey?: string;
-  media?: { encrypt_query_param: string };
+  media?: MediaLocator;
   url?: string;
+  /** A sent image gives its ciphertext size here. */
   mid_size?: number;
   hd_size?: number;
 }
 
 export interface VoiceItem {
   cdn_media?: CDNMedia;
-  /** Where newer API versions put the CDN locator */
-  media?: { encrypt_query_param: string; aes_key?: string; encrypt_type?: number };
+  media?: MediaLocator;
   /** WeChat's own transcription; some API versions name it voice_text */
   text?: string;
   voice_text?: string;
 }
 
 export interface FileItem {
-  cdn_media: CDNMedia;
+  cdn_media?: CDNMedia;
+  media?: MediaLocator;
   file_name?: string;
+  /** Size of the file before encryption, as a decimal string. */
+  len?: string;
 }
 
 export interface VideoItem {
@@ -115,4 +132,31 @@ export interface OutboundMessage {
 
 export interface SendMessageReq {
   msg: OutboundMessage;
+}
+
+// ── GetUploadUrl API ────────────────────────────────────────────────────────
+
+export interface GetUploadUrlReq {
+  /** 32 hex characters naming the upload. */
+  filekey: string;
+  media_type: UploadMediaType;
+  to_user_id: string;
+  rawsize: number;
+  /** MD5 of the file before encryption, in hex. */
+  rawfilemd5: string;
+  /** Size of the AES-128-ECB ciphertext. */
+  filesize: number;
+  no_need_thumb: boolean;
+  /** The AES key as 32 hex characters. */
+  aeskey: string;
+}
+
+export interface GetUploadUrlResp {
+  ret?: number;
+  errcode?: number;
+  retmsg?: string;
+  errmsg?: string;
+  /** The whole upload URL; when it is missing, upload_param goes to the CDN's /upload. */
+  upload_full_url?: string;
+  upload_param?: string;
 }

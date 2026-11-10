@@ -55,6 +55,8 @@ export interface TaskRow {
   tokens_out: number | null;
   /** What they cost in USD as OpenCode prices them, 0 for a model it has no price for; null when unknown. */
   cost_usd: number | null;
+  /** JSON array of the absolute paths a done task sends after its text, all checked to be in its workspace; null when none. */
+  files: string | null;
   /** 1-based position of the task in the account's history (computed). */
   seq: number;
 }
@@ -258,6 +260,11 @@ export function openStateDb(file: string = STATE_DB_PATH) {
       if (!hasColumn('tasks', 'tokens_out')) db.exec('ALTER TABLE tasks ADD COLUMN tokens_out INTEGER');
       if (!hasColumn('tasks', 'cost_usd')) db.exec('ALTER TABLE tasks ADD COLUMN cost_usd REAL');
       db.exec('PRAGMA user_version = 9');
+    }
+    if (version < 10) {
+      // A done task can send files after its text. Older tasks sent none.
+      if (!hasColumn('tasks', 'files')) db.exec('ALTER TABLE tasks ADD COLUMN files TEXT');
+      db.exec('PRAGMA user_version = 10');
     }
   });
 
@@ -485,20 +492,28 @@ export function openStateDb(file: string = STATE_DB_PATH) {
 
     /**
      * Finish a running task. Returns false if it was no longer running (stopped or interrupted meanwhile).
-     * notified: the caller already told the user, so the outbox skips the task. An empty handoff stores none.
+     * notified: the caller already told the user, so the outbox skips the task. An empty handoff or file list stores none.
      * usage is stored either way: a task /stop finished first still used what its sessions used.
      */
     finishTask(
       id: string,
       status: FinishedStatus,
-      fields: { result?: string; summary?: string; error?: string; notified?: boolean; handoff?: string; usage?: TaskUsage } = {},
+      fields: {
+        result?: string;
+        summary?: string;
+        error?: string;
+        notified?: boolean;
+        handoff?: string;
+        files?: string[];
+        usage?: TaskUsage;
+      } = {},
     ): boolean {
       return immediate(() => {
         const out = run(
-          `UPDATE tasks SET status = ?, finished_at = ?, result = ?, summary = ?, error = ?, notified = ?, handoff = ?
+          `UPDATE tasks SET status = ?, finished_at = ?, result = ?, summary = ?, error = ?, notified = ?, handoff = ?, files = ?
            WHERE id = ? AND status = 'running'`,
           status, Date.now(), fields.result ?? null, fields.summary ?? null, fields.error ?? null, fields.notified ? 1 : 0,
-          fields.handoff || null, id,
+          fields.handoff || null, fields.files?.length ? JSON.stringify(fields.files) : null, id,
         );
         const { usage } = fields;
         if (usage) run('UPDATE tasks SET tokens_in = ?, tokens_out = ?, cost_usd = ? WHERE id = ?', usage.input, usage.output, usage.cost, id);

@@ -45,7 +45,13 @@ const answer = (rest = '') => `<<<WECHAT_REPLY>>>\n改好了\n<<<WECHAT_MEMORY>>
 
 test('the handoff is what follows its marker, and the reply, memory and summary stop before it', () => {
   const text = `<<<WECHAT_REPLY>>>\n改好了\n<<<WECHAT_MEMORY>>>\n- 用户喜欢简短的回复\n<<<WECHAT_SUMMARY>>>\n修了 parser\n<<<WECHAT_HANDOFF>>>\n${HANDOFF}\n`;
-  assert.deepEqual(parseOrchestratorOutput(text), { reply: '改好了', memory: ['用户喜欢简短的回复'], summary: '修了 parser', handoff: HANDOFF });
+  assert.deepEqual(parseOrchestratorOutput(text), {
+    reply: '改好了',
+    memory: ['用户喜欢简短的回复'],
+    summary: '修了 parser',
+    handoff: HANDOFF,
+    files: [],
+  });
 });
 
 test('an answer without a handoff marker has no handoff, and "-" or "无" after the marker means none too', () => {
@@ -95,7 +101,7 @@ test('a v8 database gains the handoff and usage columns and keeps its rows', () 
   const migrated = openStateDb(v8);
   const columns = old.prepare("SELECT name FROM pragma_table_info('tasks')").all().map((c) => c.name);
   for (const column of ['handoff', 'tokens_in', 'tokens_out', 'cost_usd']) assert.ok(columns.includes(column), column);
-  assert.equal((old.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 9);
+  assert.equal((old.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 10);
   old.close();
   const row = migrated.getTask(task.id)!;
   assert.deepEqual([row.input, row.handoff, row.tokens_in, row.tokens_out, row.cost_usd], ['old task', null, null, null, null]);

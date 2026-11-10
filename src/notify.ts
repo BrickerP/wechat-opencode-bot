@@ -1,7 +1,7 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import { defaultBot, loadBots } from './bots.js';
 import { logger } from './logger.js';
-import { resultText, type TaskIO } from './orchestrator.js';
+import { isImageFile, resultText, type TaskIO } from './orchestrator.js';
 import type { PermissionRequest } from './opencode/provider.js';
 import type { PermissionBroker } from './permission.js';
 import { openStateDb, type StateDb, type TaskRow } from './tasks/db.js';
@@ -34,6 +34,16 @@ export function splitMessage(text: string, maxLen: number = MAX_MESSAGE_CHARS): 
 
 /** The task as an ask names it, such as "任务 #3（eng）"; rows from before bots went to the default bot. */
 const taskLabel = (task: TaskRow): string => `任务 #${task.seq}（${task.bot_id ?? defaultBot(loadBots()).id}）`;
+
+/** The paths of the files a done task sends after its text; [] when it has none. */
+function attachments(task: TaskRow): string[] {
+  try {
+    const files: unknown = JSON.parse(task.files ?? '[]');
+    return Array.isArray(files) ? files.filter((file): file is string => typeof file === 'string') : [];
+  } catch {
+    return [];
+  }
+}
 
 /** `ahead` asks wait before this one: y/n answers them first, so the ask says so. */
 function formatPermissionRequest(request: PermissionRequest, label: string, ahead: number): string {
@@ -117,12 +127,39 @@ export function createNotifier(db: StateDb, api: WeChatApi, sender: Sender) {
     return serial(accountId, () => sendChunks(accountId, splitMessage(text).map((chunk) => ({ text: chunk }))));
   }
 
-  /** Daemon IO: outcomes go out through the outbox, permission asks wait for the user's y/n. */
+  /**
+   * A done task's files, once its text is out. Best-effort: they never go in the outbox, so a file that
+   * fails to upload or send is only logged, never retried. They do not hold the per-account chain, so an
+   * upload does not delay acks or permission asks, which may come between the text and the files.
+   */
+  async function sendFiles(accountId: string, taskId: string, files: string[]): Promise<void> {
+    const user = db.getUser(accountId);
+    if (!user?.context_token) return;
+    for (const path of files) {
+      await sleep(CHUNK_GAP_MS);
+      try {
+        const send = isImageFile(path) ? sender.sendImage : sender.sendFile;
+        await send(user.wechat_user_id, user.context_token, path);
+      } catch (err) {
+        logger.warn('Attachment send failed', { accountId, taskId, path, error: String(err) });
+      }
+    }
+  }
+
+  /** Daemon IO: outcomes go out through the outbox, then a done task's files; permission asks wait for the user's y/n. */
   function taskIO(task: TaskRow, broker: PermissionBroker): TaskIO {
     const accountId = task.account_id;
     return {
-      async deliver() {
-        await flush(accountId);
+      async deliver(finished) {
+        const sent = await flush(accountId);
+        const files = attachments(finished);
+        if (!files.length) return;
+        // A file must not come before its text: while the text waits in the outbox, the files are dropped.
+        if (!sent) {
+          logger.warn('Attachments not sent: the text is still pending', { accountId, taskId: finished.id, files: files.length });
+          return;
+        }
+        await sendFiles(accountId, finished.id, files);
       },
       // Progress notes are best-effort replies: one that fails to send is not worth a retry.
       async progress(text) {

@@ -1,5 +1,7 @@
 import type {
   GetUpdatesResp,
+  GetUploadUrlReq,
+  GetUploadUrlResp,
   SendMessageReq,
 } from './types.js';
 import { logger } from '../logger.js';
@@ -18,6 +20,17 @@ export class ILinkError extends Error {
   constructor(readonly code: number, message: string) {
     super(message);
     this.name = 'ILinkError';
+  }
+}
+
+/** The status fields every iLink answer carries. */
+type ILinkResp = { ret?: number; errcode?: number; retmsg?: string; errmsg?: string };
+
+/** iLink reports rejections (e.g. an expired context_token) in the body, as a non-zero ret or errcode. */
+function assertOk(name: string, resp: ILinkResp | undefined): void {
+  const code = resp?.ret ?? resp?.errcode;
+  if (code !== undefined && code !== 0) {
+    throw new ILinkError(code, `${name} failed: ret=${code} ${resp?.retmsg ?? resp?.errmsg ?? ''}`.trim());
   }
 }
 
@@ -102,15 +115,15 @@ export class WeChatApi {
     );
   }
 
-  /** Send a message to a user. iLink reports rejections (e.g. an expired context_token) in the body. */
+  /** Send a message to a user. */
   async sendMessage(req: SendMessageReq): Promise<void> {
-    const resp = await this.request<{ ret?: number; errcode?: number; retmsg?: string; errmsg?: string }>(
-      'ilink/bot/sendmessage',
-      req,
-    );
-    const code = resp?.ret ?? resp?.errcode;
-    if (code !== undefined && code !== 0) {
-      throw new ILinkError(code, `sendmessage failed: ret=${code} ${resp.retmsg ?? resp.errmsg ?? ''}`.trim());
-    }
+    assertOk('sendmessage', await this.request<ILinkResp>('ilink/bot/sendmessage', req));
+  }
+
+  /** Reserve a CDN upload for a file going to req.to_user_id. */
+  async getUploadUrl(req: GetUploadUrlReq): Promise<GetUploadUrlResp> {
+    const resp = await this.request<GetUploadUrlResp>('ilink/bot/getuploadurl', req);
+    assertOk('getuploadurl', resp);
+    return resp;
   }
 }

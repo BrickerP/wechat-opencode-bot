@@ -31,91 +31,113 @@ In `opencode.json`, refer to a key as `{env:VAR}` or `{file:path}` instead of wr
 
 ## Examples
 
-Each example is a fragment for `~/.config/opencode/opencode.json` (global, because tasks run in many directories). Run `/models` in WeChat after a reload; the model ids it lists are the authoritative ones.
+Each example gives the lines for `~/.wechat-opencode-bot/env` and, when the provider needs one, a block for `opencode.json`. Then follow [Switch the bot's models](#switch-the-bots-models). The model ids are examples too: after a reload, `/models` in WeChat lists the real ones.
 
-Anthropic direct (built-in provider, no `provider` block required when `ANTHROPIC_API_KEY` reaches the server):
+### Anthropic
 
-```json
-{
-  "provider": {
-    "anthropic": { "options": { "apiKey": "{env:ANTHROPIC_API_KEY}" } }
-  }
-}
+`anthropic` is built in, so it needs no `providers` block. OpenCode reads the key from `ANTHROPIC_API_KEY`.
+
+```bash
+ANTHROPIC_API_KEY=<your key>
+OPENCODE_DEFAULT_MODEL=anthropic/claude-sonnet-5-5
+OPENCODE_FALLBACK_MODEL=anthropic/claude-haiku-5-5
 ```
 
-Then set the orchestrators to `anthropic/<model-id>`.
+### OpenAI
 
-OpenAI direct:
+`openai` is built in too. OpenCode reads the key from `OPENAI_API_KEY`.
 
-```json
-{
-  "provider": {
-    "openai": { "options": { "apiKey": "{env:OPENAI_API_KEY}" } }
-  }
-}
+```bash
+OPENAI_API_KEY=<your key>
+OPENCODE_DEFAULT_MODEL=openai/gpt-6.1-sol
+OPENCODE_FALLBACK_MODEL=openai/gpt-6-luna
 ```
 
-Then `openai/<model-id>`.
+With keys for both, put the fallback on the other provider, for example `OPENCODE_FALLBACK_MODEL=openai/gpt-6.1-sol` next to an Anthropic default. Then the retry survives an outage of the first provider.
 
-Ollama on the same machine:
+### Ollama
 
-```json
+OpenCode probes a local Ollama at `http://127.0.0.1:11434` and adds the models it finds to `/models`, with no account and no config. For an Ollama on another host or port, point the built-in `ollama` provider at its `/v1` endpoint:
+
+```jsonc
 {
-  "provider": {
+  "$schema": "https://opencode.ai/config.json",
+  "providers": {
     "ollama": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "Ollama",
-      "options": { "baseURL": "http://127.0.0.1:11434/v1" },
-      "models": { "qwen3-coder:30b": { "name": "Qwen3 Coder 30B" } }
+      "settings": { "baseURL": "http://<host>:11434/v1" }
     }
   }
 }
 ```
 
-Then `ollama/qwen3-coder:30b`. Ollama ignores API keys.
+```bash
+OPENCODE_DEFAULT_MODEL=ollama/<model>
+OPENCODE_FALLBACK_MODEL=ollama/<another model>
+```
 
-Your own OpenAI-compatible gateway (the shape the maintainer's `oneapi` providers use):
+The orchestrators hand work to subagents through tool calls, so pick a model that supports tool calling. A model that stays silent for 120 s before its first output fails the attempt; on slow hardware, raise `OPENCODE_FIRST_RESPONSE_TIMEOUT_MS`.
 
-```json
+### Your own gateway
+
+An OpenAI-compatible gateway gets a `providers` entry of its own. OpenCode reads its key from the variables listed in `env`:
+
+```jsonc
 {
-  "provider": {
+  "$schema": "https://opencode.ai/config.json",
+  "providers": {
     "my-gateway": {
-      "npm": "@ai-sdk/openai-compatible",
       "name": "My gateway",
-      "options": { "baseURL": "https://gateway.example/v1" },
-      "models": {
-        "my-model": { "name": "My Model", "tool_call": true }
-      }
+      "env": ["MY_GATEWAY_API_KEY"],
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": { "baseURL": "https://gateway.example.com/v1" },
+      "models": { "my-model": { "name": "My model" } }
     }
   }
 }
 ```
 
-Then `my-gateway/my-model`. Put the key in the provider's `options.apiKey` as `{env:MY_GATEWAY_KEY}` and add `MY_GATEWAY_KEY` to `~/.wechat-opencode-bot/env`, or use `opencode auth login`.
+```bash
+MY_GATEWAY_API_KEY=<your key>
+OPENCODE_DEFAULT_MODEL=my-gateway/my-model
+OPENCODE_FALLBACK_MODEL=<a model on another provider>
+```
+
+A gateway that serves several APIs, such as OpenAI's and Anthropic's, gets one provider id per API, each with the matching `package` from [OpenCode's provider docs](https://opencode.ai/docs/providers). The bot treats each id as a separate gateway with its own breaker, but ids on one host share that host's outages: a fallback to another id on the same host fails with it.
+
+The `oneapi` defaults are the maintainer's gateways, set up this way: one provider id per API, on two hosts. Without `OPENCODE_FALLBACK_MODEL`, the orchestrators' `oneapi/DeepSeek-V4.1-Flash` falls back to `oneapi-chat-gpt/gpt-6-astra`, which runs on the other host.
+
+Configs written for OpenCode 1, the maintainer's included, put providers under a `provider` key, with an `npm` package such as `@ai-sdk/openai-compatible` and an `options` block. OpenCode 2 still accepts that key but marks it deprecated. Do not mix the shapes: the schema rejects `npm` and `options` under `providers`, and `package` and `settings` under `provider`.
 
 ## Switch the bot's models
 
-1. Edit the `model:` line of **both** `config/agents/wechat-orchestrator.md` and `wechat-orchestrator-read.md` to the primary you want, e.g. `anthropic/<model-id>`.
-2. Set `OPENCODE_DEFAULT_MODEL` to the same value and `OPENCODE_FALLBACK_MODEL` to a model on a **different** provider.
-3. Optional: set `model` per bot in `~/.wechat-opencode-bot/bots.json`, e.g. `"model": "oneapi/DeepSeek-V4.1-Flash"` for `research`.
-4. Run `scripts/install-agents.sh --apply`, then the `opencode reload` command it prints (or restart the server).
-5. Verify: in WeChat send `/doctor` (server and agents), `/models`, and `/model`; then run `node dist/main.js --simulate "只回复 ok"`.
+1. Set `model:` in both `config/agents/wechat-orchestrator.md` and `config/agents/wechat-orchestrator-read.md` to your default model.
+2. In `~/.wechat-opencode-bot/env`, set `OPENCODE_DEFAULT_MODEL` to the same model, and `OPENCODE_FALLBACK_MODEL` to a model on a different provider. Without a fallback, the retry goes to `oneapi-chat-gpt/gpt-6-astra` and fails, and while your provider's breaker is open, every new task starts on that fallback and fails. With a single provider, pick another of its models: that helps when one model is overloaded, not when the provider is down.
+3. Change or remove any `model` in `~/.wechat-opencode-bot/bots.json` that names a provider you lack. The built-in bots set none.
+4. Load the prompts: `scripts/install-agents.sh --apply`, then the `opencode reload` command it prints. On a bot deployed from releases, release and deploy the commit with the change instead, as [config/agents/README.md](../config/agents/README.md) describes.
+5. Restart the daemon so it reads `env` again, and the server if its keys changed. [launchd](DEPLOY.md#launchd) has the commands.
 
-A chat's `/model` overrides every bot; `/model default` returns to the bot's own model, then the orchestrator's `model:`.
+## Check it works
+
+1. `/models` in WeChat lists the models the server can reach, by provider. Yours must be among them.
+2. `/model <provider/model>` checks the name against the server and uses it for the chat's next tasks. `/model default` goes back to each bot's `model`, or the orchestrator's when the bot sets none.
+3. `/doctor` checks the server, the four agents, the message token, the outbox, the databases, the breakers and the routines. It never calls a model, so a bad key still passes.
+4. `node dist/main.js --simulate "只回复 ok"` runs one real task and prints the reply. It ignores the chat's `/model`, so it tests the default bot's model, or the orchestrator's.
+5. Each `Task finished` line in `~/.wechat-opencode-bot/logs/` records `model`, `attempts`, `fallback` and `errorKind`. `fallback: true` means the task ran on the fallback, because the primary failed or its breaker was open.
 
 ## Voice messages
 
-Voice works without extra configuration when WeChat includes its own transcription (`voice_item.text`). Otherwise the bot downloads the audio, decodes WeChat's SILK to WAV, and calls an OpenAI-compatible transcription endpoint:
+Voice transcription bypasses OpenCode. When WeChat sends no transcript of its own, the daemon downloads the audio, decodes WeChat's SILK format to WAV, and posts it to an OpenAI-compatible transcription endpoint. Audio in another format is sent as it is. Put these in `~/.wechat-opencode-bot/env`:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OWB_ASR_URL` | empty | Full endpoint URL, e.g. `https://api.openai.com/v1/audio/transcriptions`. Empty disables transcription |
-| `OWB_ASR_MODEL` | `whisper-1` | The model name sent in the multipart body |
-| `OWB_ASR_API_KEY` | empty | Sent as `Authorization: Bearer …` when set |
+| `OWB_ASR_URL` | empty, transcription off | The endpoint, such as `https://api.openai.com/v1/audio/transcriptions` |
+| `OWB_ASR_MODEL` | `whisper-1` | The `model` field of the request |
+| `OWB_ASR_API_KEY` | empty | Sent as `Authorization: Bearer <key>` |
 
-The audio is capped at 30 seconds per request. Without `OWB_ASR_URL`, a voice message that carries no WeChat transcription gets a short "cannot transcribe" reply instead of a task. The endpoint must accept WAV or the original format; SILK is decoded first with [`silk-wasm`](https://www.npmjs.com/package/silk-wasm).
+A request gets 30 s. When it fails, the bot asks you to send the message again or type it. Without `OWB_ASR_URL`, it says which variables to set.
 
 ## Files and images sent back
 
-The orchestrator can attach files to its reply by ending with a `<<<WECHAT_FILES>>>` section: one absolute path per line, at most 3, each under the task's workspace and at most 20 MB. The bridge uploads them to the iLink CDN and sends them after the text. Supported: common image formats, PDF, text/Markdown, patch/diff, CSV/JSON and ZIP. A failed upload is logged; attachments are not retried through the text outbox.
+Either orchestrator can attach up to 3 files to its reply, as a `<<<WECHAT_FILES>>>` section at the end of its output with one absolute path per line. Each must be a regular file, not a symlink, whose real path is inside the task's workspace, of at most 20 MB and of one of these types: png, jpg, jpeg, gif, webp, bmp, pdf, txt, md, patch, diff, csv, json or zip. The daemon uploads each file to the iLink CDN and sends it after the text, images as images and the rest as files. A path that fails a check is dropped: the log says why, and the reply says how many did not come.
 
+Files never enter the outbox. A file that fails to upload or send is logged and not retried, and while the text still waits in the outbox, the files are not sent at all.

@@ -11,7 +11,7 @@ You:  @eng 修一下登录页的 500
 Bot:  工程：已定位到 src/auth/session.ts：过期 token 没有清 cookie。
       改了 session.ts 和对应测试，npm test 通过。
 You:  继续，补一个 e2e
-Bot:  工程：补了 tests/e2e/login.spec.ts，本地通过。 /status 可以看本次用了多少 token。
+Bot:  工程：补了 tests/e2e/login.spec.ts，本地通过。 /tasks 可以看本次用了多少 token。
 ```
 
 The transcript is illustrative; the bot's replies are plain text in Chinese unless you write in another language.
@@ -119,14 +119,14 @@ When OpenCode asks for approval, the daemon applies the mode in `config.env`, re
 ### Requirements
 
 - Node.js 26, the version CI uses (`node:sqlite` needs at least 22.13). macOS only for the launchd jobs.
-- OpenCode (`npm install -g opencode-ai`) with providers for the models you want.
+- OpenCode 2 (`npm install -g @opencode/cli`, not the OpenCode 1 package `opencode-ai`) with providers for the models you want.
 - A WeChat account to bind by QR code; setup stores the iLink bot token in `~/.wechat-opencode-bot/accounts/`.
 
 ### Setup
 
 1. `git clone <repo> wechat-opencode-bot && cd wechat-opencode-bot && npm ci && npm run build`
 2. `npm run setup`: scan the QR code with WeChat, then enter the base directory (`workingDirectory` in `config.env`); projects and `/cwd` must stay inside it.
-3. Pick your models. The prompts and defaults use `oneapi*` providers you probably lack: change `model:` in `config/agents/wechat-orchestrator.md` and `wechat-orchestrator-read.md`, set `OPENCODE_DEFAULT_MODEL` to the same model and `OPENCODE_FALLBACK_MODEL` to one on another provider.
+3. Pick your models. The prompts and defaults use `oneapi*` providers you probably lack: change `model:` in `config/agents/wechat-orchestrator.md` and `wechat-orchestrator-read.md`, set `OPENCODE_DEFAULT_MODEL` to the same model and `OPENCODE_FALLBACK_MODEL` to one on another provider. [docs/PROVIDERS.md](docs/PROVIDERS.md) has examples for Anthropic, OpenAI, Ollama and your own gateway.
 4. Put those and your other settings in `~/.wechat-opencode-bot/env`, then `chmod 600` it.
 5. `scripts/install-agents.sh --apply` links the agent prompts into `~/.config/opencode/agents/`; without `--apply` it only lists the changes. Then reload OpenCode with the command it prints, or restart the server.
 

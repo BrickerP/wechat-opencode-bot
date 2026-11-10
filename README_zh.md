@@ -11,7 +11,7 @@
 Bot： 工程：已定位到 src/auth/session.ts：过期 token 没有清 cookie。
       改了 session.ts 和对应测试，npm test 通过。
 你：  继续，补一个 e2e
-Bot： 工程：补了 tests/e2e/login.spec.ts，本地通过。 /status 可以看本次用了多少 token。
+Bot： 工程：补了 tests/e2e/login.spec.ts，本地通过。 /tasks 可以看本次用了多少 token。
 ```
 
 以上为示意；bot 默认用中文回复，你用其他语言时它也会跟随。
@@ -119,14 +119,14 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 ### 环境要求
 
 - Node.js 26，即 CI 使用的版本（`node:sqlite` 至少需要 22.13）。只有 launchd 任务需要 macOS。
-- OpenCode（`npm install -g opencode-ai`），并为要用的模型配置好 provider。
+- OpenCode 2（`npm install -g @opencode/cli`，不是 OpenCode 1 的 `opencode-ai`），并为要用的模型配置好 provider。
 - 一个用于扫码绑定的微信号；setup 会把 iLink bot token 存到 `~/.wechat-opencode-bot/accounts/`。
 
 ### 安装与设置
 
 1. `git clone <repo> wechat-opencode-bot && cd wechat-opencode-bot && npm ci && npm run build`
 2. `npm run setup`：用微信扫码，再输入基础目录（`config.env` 里的 `workingDirectory`）；项目和 `/cwd` 都必须在它里面。
-3. 选择模型。提示词和默认值用的是你多半没有的 `oneapi*` provider：修改 `config/agents/wechat-orchestrator.md` 和 `wechat-orchestrator-read.md` 里的 `model:`，把 `OPENCODE_DEFAULT_MODEL` 设成同一个模型，把 `OPENCODE_FALLBACK_MODEL` 设成另一个 provider 上的模型。
+3. 选择模型。提示词和默认值用的是你多半没有的 `oneapi*` provider：修改 `config/agents/wechat-orchestrator.md` 和 `wechat-orchestrator-read.md` 里的 `model:`，把 `OPENCODE_DEFAULT_MODEL` 设成同一个模型，把 `OPENCODE_FALLBACK_MODEL` 设成另一个 provider 上的模型。[docs/PROVIDERS.md](docs/PROVIDERS.md) 有 Anthropic、OpenAI、Ollama 和自建网关的示例。
 4. 把这些和其他配置写进 `~/.wechat-opencode-bot/env`，然后 `chmod 600`。
 5. `scripts/install-agents.sh --apply` 把 agent 提示词链接到 `~/.config/opencode/agents/`；不带 `--apply` 时只列出改动。然后用它打印的命令 reload OpenCode，或者重启服务。
 

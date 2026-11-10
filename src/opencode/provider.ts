@@ -43,6 +43,21 @@ export interface QueryResult {
   upstream?: boolean;
   /** Set when OpenCode or a watchdog ended the turn, not for local failures such as an unreachable server. */
   errorKind?: ErrorKind;
+  /** What the session and its subagent sessions used; undefined when OpenCode could not say. */
+  usage?: Usage;
+}
+
+/** Tokens and cost as OpenCode counts them; its token counts do not overlap. */
+export interface Usage {
+  /** Prompt tokens neither read from nor written to the cache. */
+  input: number;
+  /** Completion tokens, reasoning excluded. */
+  output: number;
+  reasoning: number;
+  cacheRead: number;
+  cacheWrite: number;
+  /** USD; 0 for a model OpenCode has no price for. */
+  cost: number;
 }
 
 export interface ProviderModel {
@@ -284,11 +299,53 @@ async function createSession(title: string, cwd: string, agent?: string, model?:
   return out.data.id;
 }
 
+const count = (value: unknown): number => (typeof value === "number" && Number.isFinite(value) ? value : 0);
+
+/** A session's usage from its tokens and cost fields; a missing field counts as 0. */
+function readUsage(session: any): Usage {
+  const tokens = session?.tokens;
+  return {
+    input: count(tokens?.input),
+    output: count(tokens?.output),
+    reasoning: count(tokens?.reasoning),
+    cacheRead: count(tokens?.cache?.read),
+    cacheWrite: count(tokens?.cache?.write),
+    cost: count(session?.cost),
+  };
+}
+
 /** Sessions spawned by the subagent tool carry parentID. */
-export async function listChildSessions(parentId: string): Promise<Array<{ id: string; title: string; agent?: string }>> {
+export async function listChildSessions(
+  parentId: string,
+): Promise<Array<{ id: string; title: string; agent?: string; usage: Usage }>> {
   const params = new URLSearchParams({ parentID: parentId, limit: "50" });
   const out = await api<{ data: any[] }>(`/api/session?${params.toString()}`);
-  return (out.data || []).map((s) => ({ id: s.id, title: s.title || s.id, agent: s.agent }));
+  return (out.data || []).map((s) => ({ id: s.id, title: s.title || s.id, agent: s.agent, usage: readUsage(s) }));
+}
+
+/**
+ * What a session and its subagent sessions used. OpenCode counts a session's own model calls only, and the
+ * orchestrator's subagents start none of their own, so the root and its children are the whole turn.
+ * Best effort: undefined when OpenCode cannot say.
+ */
+export async function sessionUsage(sessionId: string): Promise<Usage | undefined> {
+  try {
+    const [root, children] = await Promise.all([
+      api<{ data: any }>(`/api/session/${encodeURIComponent(sessionId)}`),
+      listChildSessions(sessionId),
+    ]);
+    return [readUsage(root?.data), ...children.map((child) => child.usage)].reduce((sum, u) => ({
+      input: sum.input + u.input,
+      output: sum.output + u.output,
+      reasoning: sum.reasoning + u.reasoning,
+      cacheRead: sum.cacheRead + u.cacheRead,
+      cacheWrite: sum.cacheWrite + u.cacheWrite,
+      cost: sum.cost + u.cost,
+    }));
+  } catch (err) {
+    logger.warn("Failed to read session usage", { sessionId, error: String(err) });
+    return undefined;
+  }
 }
 
 /** Best effort: stop the session and the subagent sessions it spawned. Idle sessions are a no-op. */
@@ -558,7 +615,7 @@ export async function openCodeQuery(options: QueryOptions): Promise<QueryResult>
 
     const text = await waitForTurn(sessionId, since, options);
     logger.info("OpenCode query completed", { sessionId, textLength: text.length });
-    return { text, sessionId };
+    return { text, sessionId, usage: await sessionUsage(sessionId) };
   } catch (err) {
     const interrupted = err instanceof TurnInterrupted;
     const upstream = err instanceof UpstreamError;
@@ -567,9 +624,11 @@ export async function openCodeQuery(options: QueryOptions): Promise<QueryResult>
     const error = err instanceof Error ? err.message : String(err);
     // Timeouts, aborts and transport errors can leave the session executing on the server.
     if (sessionId) await interruptSession(sessionId);
+    // Read once the interrupt is in, so the stopped sessions are counted as they ended.
+    const usage = sessionId ? await sessionUsage(sessionId) : undefined;
     if (interrupted) logger.info("OpenCode query interrupted", { sessionId });
     else logger.error("OpenCode query failed", { sessionId, error, upstream, errorKind });
-    return { text: "", sessionId, error, interrupted, upstream, errorKind };
+    return { text: "", sessionId, error, interrupted, upstream, errorKind, usage };
   }
 }
 

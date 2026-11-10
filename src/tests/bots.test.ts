@@ -153,7 +153,7 @@ test('a v3 database gains bot_id and keeps its rows; new tasks store their bot',
   raw.exec('ALTER TABLE tasks DROP COLUMN bot_id; PRAGMA user_version = 3;');
   const db = openStateDb(file);
   assert.ok(raw.prepare("SELECT name FROM pragma_table_info('tasks')").all().some((c) => c.name === 'bot_id'));
-  assert.equal((raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 8);
+  assert.equal((raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 9);
   raw.close();
   assert.deepEqual([db.getTask(task.id)?.input, db.getTask(task.id)?.bot_id], ['old task', null]);
   assert.equal(openStateDb(file).getTask(task.id)?.input, 'old task', 'opening again changes nothing');

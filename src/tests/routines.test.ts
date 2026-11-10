@@ -145,7 +145,7 @@ test('a v6 database gains the routines table and routine_id, and keeps its rows'
   const db = openStateDb(file);
   assert.ok(raw.prepare("SELECT name FROM pragma_table_info('tasks')").all().some((c) => c.name === 'routine_id'));
   assert.ok(raw.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'routines'").get());
-  assert.equal((raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 8);
+  assert.equal((raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 9);
   raw.close();
   assert.deepEqual([db.getTask(task.id)?.input, db.getTask(task.id)?.routine_id], ['old task', null]);
   assert.equal(openStateDb(file).getTask(task.id)?.input, 'old task', 'opening again changes nothing');

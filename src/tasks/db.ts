@@ -47,8 +47,24 @@ export interface TaskRow {
   lane: TaskLane;
   /** Routine that queued the task; null for a message's task, older rows included. */
   routine_id: string | null;
+  /** Notes a done task left for the next one (files, commands, open questions, next step); never shown to the user. */
+  handoff: string | null;
+  /** Tokens the task's sessions read over all its attempts, subagents and cache reads included; null when unknown. */
+  tokens_in: number | null;
+  /** Tokens they wrote, reasoning included; null when unknown. */
+  tokens_out: number | null;
+  /** What they cost in USD as OpenCode prices them, 0 for a model it has no price for; null when unknown. */
+  cost_usd: number | null;
   /** 1-based position of the task in the account's history (computed). */
   seq: number;
+}
+
+/** What a task's sessions used over all its attempts. */
+export interface TaskUsage {
+  input: number;
+  output: number;
+  /** USD. */
+  cost: number;
 }
 
 /** The project a task runs in; dir is absolute. */
@@ -235,6 +251,14 @@ export function openStateDb(file: string = STATE_DB_PATH) {
         SELECT session_id, id, COALESCE(finished_at, started_at, created_at) FROM tasks WHERE session_id IS NOT NULL;
       PRAGMA user_version = 8;`);
     }
+    if (version < 9) {
+      // A done task leaves notes for the next one, and every task records what its sessions used. Older tasks have neither.
+      if (!hasColumn('tasks', 'handoff')) db.exec('ALTER TABLE tasks ADD COLUMN handoff TEXT');
+      if (!hasColumn('tasks', 'tokens_in')) db.exec('ALTER TABLE tasks ADD COLUMN tokens_in INTEGER');
+      if (!hasColumn('tasks', 'tokens_out')) db.exec('ALTER TABLE tasks ADD COLUMN tokens_out INTEGER');
+      if (!hasColumn('tasks', 'cost_usd')) db.exec('ALTER TABLE tasks ADD COLUMN cost_usd REAL');
+      db.exec('PRAGMA user_version = 9');
+    }
   });
 
   const getTask = (id: string) => one<TaskRow>(`${TASK_SELECT} WHERE t.id = ?`, id);
@@ -405,6 +429,14 @@ export function openStateDb(file: string = STATE_DB_PATH) {
         accountId, since,
       ),
 
+    /** Token and cost totals of the tasks that finished at or after since (epoch ms); 0 when none recorded any. */
+    usageSince: (accountId: string, since: number): TaskUsage =>
+      one<TaskUsage>(
+        `SELECT COALESCE(SUM(tokens_in), 0) AS input, COALESCE(SUM(tokens_out), 0) AS output, COALESCE(SUM(cost_usd), 0) AS cost
+           FROM tasks WHERE account_id = ? AND finished_at >= ?`,
+        accountId, since,
+      )!,
+
     /** Every attempt's session is recorded for retention; the task names the last. */
     setTaskSession(id: string, sessionId: string): void {
       immediate(() => {
@@ -445,18 +477,25 @@ export function openStateDb(file: string = STATE_DB_PATH) {
 
     /**
      * Finish a running task. Returns false if it was no longer running (stopped or interrupted meanwhile).
-     * notified: the caller already told the user, so the outbox skips the task.
+     * notified: the caller already told the user, so the outbox skips the task. An empty handoff stores none.
+     * usage is stored either way: a task /stop finished first still used what its sessions used.
      */
     finishTask(
       id: string,
       status: FinishedStatus,
-      fields: { result?: string; summary?: string; error?: string; notified?: boolean } = {},
+      fields: { result?: string; summary?: string; error?: string; notified?: boolean; handoff?: string; usage?: TaskUsage } = {},
     ): boolean {
-      const out = run(
-        "UPDATE tasks SET status = ?, finished_at = ?, result = ?, summary = ?, error = ?, notified = ? WHERE id = ? AND status = 'running'",
-        status, Date.now(), fields.result ?? null, fields.summary ?? null, fields.error ?? null, fields.notified ? 1 : 0, id,
-      );
-      return Number(out.changes) === 1;
+      return immediate(() => {
+        const out = run(
+          `UPDATE tasks SET status = ?, finished_at = ?, result = ?, summary = ?, error = ?, notified = ?, handoff = ?
+           WHERE id = ? AND status = 'running'`,
+          status, Date.now(), fields.result ?? null, fields.summary ?? null, fields.error ?? null, fields.notified ? 1 : 0,
+          fields.handoff || null, id,
+        );
+        const { usage } = fields;
+        if (usage) run('UPDATE tasks SET tokens_in = ?, tokens_out = ?, cost_usd = ? WHERE id = ?', usage.input, usage.output, usage.cost, id);
+        return Number(out.changes) === 1;
+      });
     },
 
     markNotified(id: string): void {

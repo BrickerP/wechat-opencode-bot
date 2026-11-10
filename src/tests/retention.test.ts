@@ -107,7 +107,7 @@ test('a v7 database gains task_sessions, filled with the session each task names
   update.run('running', T0 - 3 * DAY, null, 'ses_running', running);
 
   const db = openStateDb(join(tmp, 'v7.db'));
-  assert.equal((raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 8);
+  assert.equal((raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 9);
   const rows = () =>
     raw.prepare('SELECT session_id, task_id, created_at FROM task_sessions ORDER BY session_id').all()
       .map((row) => [row.session_id, row.task_id, row.created_at]);

@@ -57,8 +57,8 @@ const OPENCODE_DB_PATH = join(homedir(), '.local', 'share', 'opencode', 'opencod
 const HELP_TEXT = `可用命令：
 
 任务：
-  /status           查看当前状态（含 24 小时统计、熔断、待补发通知和消息令牌更新时间）
-  /tasks [数量]     查看最近的任务（默认 5 个）
+  /status           查看当前状态（含 24 小时统计与 token 用量、熔断、待补发通知和消息令牌更新时间）
+  /tasks [数量]     查看最近的任务（默认 5 个，含各任务的 token 用量）
   /stop             停止所有正在运行的任务
   /stop all         同时取消所有排队的任务
   /panic            紧急停止：停止并取消所有任务，权限切到 plan，停用所有定时任务
@@ -162,6 +162,17 @@ function openBreakers(gateways: Gateway[], now: number): string {
   return open.join('，') || '无';
 }
 
+const COMPACT = new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 });
+
+/** "↑1.2M ↓3.4k": the prompt tokens, cache included, and the completion tokens, reasoning included. */
+function formatTokens(input: number, output: number): string {
+  const count = (n: number) => COMPACT.format(n).replace('K', 'k');
+  return `↑${count(input)} ↓${count(output)}`;
+}
+
+/** "$0.42", or "<$0.01" under a cent. */
+const formatCost = (usd: number): string => (usd < 0.01 ? '<$0.01' : `$${usd.toFixed(2)}`);
+
 /**
  * Shared by /status and --status. The breakers live in the bot's memory: /status passes breaker.snapshot(),
  * and --status, a process of its own, has none to pass.
@@ -177,6 +188,7 @@ export function formatStatus(db: StateDb, accountId: string, gateways?: Gateway[
   const running = db
     .runningTasks(accountId)
     .map((t) => `#${t.seq} ${taskInput(t, 30, primary.id)}（${t.lane}，已运行 ${formatElapsed(t.started_at ?? t.created_at, now)}）`);
+  const day = db.usageSince(accountId, now - DAY_MS);
   const lines = [
     `📂 工作目录: ${user?.workspace || config.workingDirectory}`,
     `📁 最近项目: ${lastProject(db, accountId)}`,
@@ -189,6 +201,7 @@ export function formatStatus(db: StateDb, accountId: string, gateways?: Gateway[
     `📊 累计: ${total} 个任务（完成 ${counts.done}，失败 ${counts.failed}，中断 ${counts.interrupted}）`,
     `🧠 记忆: ${memoryCounts(accountId, bots)}`,
     `🩺 ${dayHealth(db, accountId, now).text}`,
+    `📊 24h tokens: ${formatTokens(day.input, day.output)}${day.cost > 0 ? `（${formatCost(day.cost)}）` : ''}`,
     `🧯 熔断: ${gateways ? openBreakers(gateways, now) : '仅 bot 进程内可见，在微信发送 /status 查看'}`,
   ];
   const backlog = outboxBacklog(db, accountId, now);
@@ -272,7 +285,7 @@ export function formatDoctor(db: StateDb, accountId: string, probe: DoctorProbe,
   return ['🩺 自检：', ...checks.map(([mark, text]) => `${mark} ${text}`), `总体: ${issues ? `有 ${issues} 项需要注意` : '正常'}`].join('\n');
 }
 
-/** Shared by /tasks and --tasks. Newest first. */
+/** Shared by /tasks and --tasks. Newest first, each with what it used and the next step its handoff names. */
 export function formatTasks(db: StateDb, accountId: string, limit: number): string {
   const tasks = db.recentTasks(accountId, limit);
   if (!tasks.length) return '暂无任务';
@@ -280,8 +293,16 @@ export function formatTasks(db: StateDb, accountId: string, limit: number): stri
   return tasks
     .map((t) => {
       const head = `#${t.seq} ${formatTime(t.created_at)} [${STATUS_LABEL[t.status]}] ${taskInput(t, 40, defaultBotId)}`;
+      const used =
+        t.tokens_in || t.tokens_out
+          ? `  ${formatTokens(t.tokens_in ?? 0, t.tokens_out ?? 0)}${t.cost_usd ? ` ${formatCost(t.cost_usd)}` : ''}`
+          : '';
+      const lines = [head + used];
       const detail = t.summary || t.error;
-      return detail ? `${head}\n    ${clip(detail, 80)}` : head;
+      if (detail) lines.push(`    ${clip(detail, 80)}`);
+      const next = t.handoff && /^[-*]?[ \t]*next[:：][ \t]*(.+)$/im.exec(t.handoff)?.[1];
+      if (next) lines.push(`    ↳ next: ${clip(next, 60)}`);
+      return lines.join('\n');
     })
     .join('\n');
 }

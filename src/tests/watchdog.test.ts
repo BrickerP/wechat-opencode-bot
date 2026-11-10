@@ -1,6 +1,7 @@
 // runTask against a fake OpenCode server: the first-response and stall watchdogs, the one-shot fallback to
 // another gateway and the breaker that skips a failing one, the progress notes of a long task, the directory
-// each session opens in, the bot a task speaks as and the model it runs on, and the orchestrator agent of each lane.
+// each session opens in, the bot a task speaks as and the model it runs on, the orchestrator agent of each lane,
+// and the handoff and the usage a task records.
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
@@ -23,11 +24,17 @@ const FACT = '用户喜欢简短的回复';
 const GPT = { providerID: 'oneapi-chat-gpt', id: 'gpt-6-astra' };
 /** The session model of oneapi/DeepSeek-V4.1-Flash, which is also the fallback for a GPT model. */
 const DEEPSEEK = { providerID: 'oneapi', id: 'DeepSeek-V4.1-Flash' };
+const HANDOFF = 'files: /repo/src/a.ts\nnext: 跑一遍测试';
+/** What each root session reports it used: 5000 tokens in with the cache reads, 250 out with the reasoning. */
+const ROOT_USAGE = { tokens: { input: 1000, output: 200, reasoning: 50, cache: { read: 4000, write: 0 } }, cost: 0.25 };
+/** What each subagent session reports it used: 900 tokens in with the cache writes, 100 out. */
+const CHILD_USAGE = { tokens: { input: 300, output: 100, reasoning: 0, cache: { read: 0, write: 600 } }, cost: 0.0625 };
 
 type Script =
   | 'silent'
   | 'answer'
   | 'remember'
+  | 'delegate'
   | 'provider-error'
   | 'quota'
   | 'gateway-502'
@@ -47,6 +54,9 @@ interface FakeSession {
   prompt?: string;
   messages: any[];
   interrupted: boolean;
+  /** What the session used, as GET /api/session/:id and the child list report it. */
+  tokens?: unknown;
+  cost?: number;
 }
 
 const sessions: FakeSession[] = [];
@@ -61,7 +71,8 @@ const idle = (outcome: string, error?: unknown): any => message('idle', { outcom
 const tool = (name: string): any => ({ type: 'tool', name, state: { status: 'running' }, time: { created: Date.now(), ran: Date.now() } });
 
 function addSession(fields: Partial<FakeSession> = {}): FakeSession {
-  const session: FakeSession = { id: `ses_${++ids}`, messages: [], interrupted: false, ...fields };
+  const usage = fields.parentID ? CHILD_USAGE : ROOT_USAGE;
+  const session: FakeSession = { id: `ses_${++ids}`, messages: [], interrupted: false, ...usage, ...fields };
   sessions.push(session);
   return session;
 }
@@ -77,6 +88,12 @@ const play: Record<Script, (session: FakeSession) => void> = {
   silent: () => {},
   answer: (s) => later(100, () => answer(s)),
   remember: (s) => later(100, () => answer(s, REPLY.replace('- 无', `- ${FACT}`))),
+  // One subagent runs and finishes, then the orchestrator answers and hands off to the next task.
+  delegate: (s) =>
+    later(100, () => {
+      addSession({ parentID: s.id }).messages.push(message('user'), idle('succeeded'));
+      answer(s, `${REPLY}\n<<<WECHAT_HANDOFF>>>\n${HANDOFF}`);
+    }),
   'provider-error': (s) =>
     later(100, () => s.messages.push(idle('failed', { type: 'provider.internal', message: 'control plan is unavailable' }))),
   quota: (s) => later(100, () => s.messages.push(idle('failed', { type: 'provider.quota', message: 'quota exceeded' }))),
@@ -121,6 +138,7 @@ function handle(req: IncomingMessage, res: ServerResponse): void {
     const [, , , id, action] = url.pathname.split('/');
     const session = sessions.find((s) => s.id === id);
     if (!session) return void res.writeHead(404).end();
+    if (action === undefined) return send({ id: session.id, tokens: session.tokens, cost: session.cost });
     if (action === 'message') return send([...session.messages].reverse());
     if (action === 'permission') return send([]);
     if (action === 'interrupt') {
@@ -388,4 +406,37 @@ test("a task runs on its bot's model unless /model picks one, and a failing bot 
   assert.deepEqual(await sessionModels(['provider-error', 'answer'], 'ops'), [{ ...GPT, variant: 'high' }, DEEPSEEK]);
   db.setModel('test', 'oneapi/DeepSeek-V4.1-Flash');
   assert.deepEqual(await sessionModels(['answer'], 'eng'), [DEEPSEEK], '/model wins over the bot model');
+});
+
+/** The tokens in, the tokens out and the cost a task recorded. */
+const used = (task: TaskRow) => [task.tokens_in, task.tokens_out, task.cost_usd];
+
+test('a done task records its handoff and what its session and its subagents used', async () => {
+  const { task } = await run(['delegate']);
+  assert.equal(task.status, 'done');
+  assert.equal(task.result, 'ok', 'the handoff is not part of the reply');
+  assert.equal(task.summary, 'ok');
+  assert.equal(task.handoff, HANDOFF);
+  // The root's 5000 in and 250 out, plus the subagent's 900 and 100.
+  assert.deepEqual(used(task), [5900, 350, 0.3125]);
+});
+
+test('a retried task records what both attempts used, and no handoff when the answer has none', async () => {
+  const { task, roots } = await run(['provider-error', 'answer']);
+  assert.equal(task.status, 'done');
+  assert.equal(roots.length, 2);
+  assert.equal(task.handoff, null);
+  assert.deepEqual(used(task), [10000, 500, 0.5]);
+});
+
+test('a failed task and a stopped one still record what they used', async () => {
+  const failed = await run(['rejected']);
+  assert.equal(failed.task.status, 'failed');
+  assert.deepEqual(used(failed.task), [5000, 250, 0.25]);
+  sessions.length = 0;
+  // The stop finishes the task before runTask does, as /stop does, so runTask only adds the usage.
+  const stopped = await run(['silent'], { stopAfterMs: 500 });
+  assert.equal(stopped.task.status, 'interrupted');
+  assert.equal(stopped.task.error, '用户停止');
+  assert.deepEqual(used(stopped.task), [5000, 250, 0.25]);
 });

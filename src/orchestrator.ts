@@ -7,8 +7,8 @@ import { DATA_DIR } from './constants.js';
 import { logger } from './logger.js';
 import { appendMemory, memoryPath, readMemory } from './memory.js';
 import { breaker, DEFAULT_MODEL, fallbackModel, providerOf } from './model-routing.js';
-import { openCodeQuery, type PermissionDecision, type PermissionRequest, type QueryResult } from './opencode/provider.js';
-import type { StateDb, TaskRow, TaskStatus } from './tasks/db.js';
+import { openCodeQuery, type PermissionDecision, type PermissionRequest, type QueryResult, type Usage } from './opencode/provider.js';
+import type { StateDb, TaskRow, TaskStatus, TaskUsage } from './tasks/db.js';
 
 /** OpenCode agent that plans each task and delegates the work to subagent sessions. */
 export const ORCHESTRATOR_AGENT = 'wechat-orchestrator';
@@ -18,10 +18,14 @@ export const ORCHESTRATOR_READ_AGENT = 'wechat-orchestrator-read';
 const RECENT_TASKS = 8;
 const MAX_SUMMARY_CHARS = 100;
 const MAX_ERROR_CHARS = 200;
+const MAX_HANDOFF_CHARS = 1200;
+/** How long a handoff stays fresh: the same 2 hours in which projects.ts still routes "继续" after the last task. */
+const HANDOFF_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 
 const REPLY_MARKER = '<<<WECHAT_REPLY>>>';
 const MEMORY_MARKER = '<<<WECHAT_MEMORY>>>';
 const SUMMARY_MARKER = '<<<WECHAT_SUMMARY>>>';
+const HANDOFF_MARKER = '<<<WECHAT_HANDOFF>>>';
 
 /** How a task talks back to the user. --simulate prints instead of sending. */
 export interface TaskIO {
@@ -176,6 +180,16 @@ function formatPersona(bots: Bot[], bot: Bot, all: boolean): string {
 }
 
 /**
+ * The notes the task right before this one left, while fresh, so a follow-up such as "继续" picks up where it
+ * stopped. A routine's task starts afresh: like its routing, it never follows the last task.
+ */
+function lastHandoff(task: TaskRow, previous: TaskRow | undefined): string[] {
+  if (task.routine_id || !previous?.handoff || previous.finished_at === null) return [];
+  if (task.created_at - previous.finished_at > HANDOFF_MAX_AGE_MS) return [];
+  return [`<last_handoff>\ntask: #${previous.seq}\n${previous.handoff}\n</last_handoff>`];
+}
+
+/**
  * Each orchestrator session starts empty: everything it knows about the chat comes from this prompt.
  * retry: an earlier session for this task gave up, possibly after its subagents had changed something.
  */
@@ -207,6 +221,7 @@ export function composePrompt(db: StateDb, task: TaskRow, workspace: string, att
     ...project,
     `<memory>\n${shared}${own}\n</memory>`,
     `<recent_tasks>\n${formatRecentTasks(recent, defaultBot(bots).id)}\n</recent_tasks>`,
+    ...lastHandoff(task, recent.at(-1)),
     `<user_message>\n${input}\n</user_message>`,
   ].join('\n\n');
 }
@@ -217,6 +232,8 @@ export interface OrchestratorOutput {
   reply: string;
   memory: string[];
   summary: string;
+  /** Notes for the next task, never part of the reply; '' when there are none. */
+  handoff: string;
 }
 
 /** Text from start up to the next marker position after it, or the end. */
@@ -226,26 +243,35 @@ function section(body: string, start: number, ...markers: number[]): string {
 
 const trimmedLines = (text: string): string[] => text.split('\n').map((line) => line.trim());
 
-/** Split the orchestrator's answer into the WeChat reply, new memory facts and a one-line summary. */
+/** The handoff's lines, trimmed and without blank ones; "-", "无" or "- 无" means there is none. */
+function cleanHandoff(text: string): string {
+  const handoff = trimmedLines(text).filter(Boolean).join('\n').slice(0, MAX_HANDOFF_CHARS).trim();
+  return /^(?:-\s*)?(?:无)?$/.test(handoff) ? '' : handoff;
+}
+
+/** Split the orchestrator's answer into the WeChat reply, new memory facts, a one-line summary and the handoff. */
 export function parseOrchestratorOutput(text: string): OrchestratorOutput {
   // Drafts may quote the marker; the last one starts the answer. No marker: the whole text is the reply.
   const replyAt = text.lastIndexOf(REPLY_MARKER);
   const body = replyAt === -1 ? text : text.slice(replyAt + REPLY_MARKER.length);
   const memoryAt = body.indexOf(MEMORY_MARKER);
   const summaryAt = body.indexOf(SUMMARY_MARKER);
+  // The handoff comes last, so its last marker counts: one the reply quotes cannot cut the reply short.
+  const handoffAt = body.lastIndexOf(HANDOFF_MARKER);
 
-  const reply = section(body, 0, memoryAt, summaryAt).trim();
+  const reply = section(body, 0, memoryAt, summaryAt, handoffAt).trim();
   const memory =
     memoryAt === -1
       ? []
-      : trimmedLines(section(body, memoryAt + MEMORY_MARKER.length, summaryAt))
+      : trimmedLines(section(body, memoryAt + MEMORY_MARKER.length, summaryAt, handoffAt))
           .map((line) => /^[-*]\s+(.+)$/.exec(line)?.[1].trim() ?? '')
           .filter(Boolean);
   const summary =
     summaryAt === -1
       ? ''
-      : (trimmedLines(section(body, summaryAt + SUMMARY_MARKER.length, memoryAt)).find(Boolean) ?? '');
-  return { reply, memory, summary: clip(summary || reply, MAX_SUMMARY_CHARS) };
+      : (trimmedLines(section(body, summaryAt + SUMMARY_MARKER.length, memoryAt, handoffAt)).find(Boolean) ?? '');
+  const handoff = handoffAt === -1 ? '' : cleanHandoff(section(body, handoffAt + HANDOFF_MARKER.length, memoryAt, summaryAt));
+  return { reply, memory, summary: clip(summary || reply, MAX_SUMMARY_CHARS), handoff };
 }
 
 // ── run ──────────────────────────────────────────────────────────────────
@@ -332,6 +358,18 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
   let attempts = 0;
   let usedFallback = false;
   let notice = '';
+  // What the sessions of every attempt used; undefined while OpenCode has reported nothing.
+  let usage: TaskUsage | undefined;
+  /** The prompt counts its cache reads and writes, the completion its reasoning. */
+  const addUsage = (u: Usage | undefined): void => {
+    if (!u) return;
+    const sum = usage ?? { input: 0, output: 0, cost: 0 };
+    usage = {
+      input: sum.input + u.input + u.cacheRead + u.cacheWrite,
+      output: sum.output + u.output + u.reasoning,
+      cost: sum.cost + u.cost,
+    };
+  };
   try {
     pruneAttachments();
     const user = db.getUser(task.account_id);
@@ -341,10 +379,10 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
     // /stop and restarts finish the task elsewhere; only a failing or silent model is worth a second try.
     const running = () => !signal.aborted && db.getTask(task.id)?.status === 'running';
     const onProgress = progressNotes(task, io, running);
-    const attempt = (next: string | undefined, retry: boolean) => {
+    const attempt = async (next: string | undefined, retry: boolean): Promise<QueryResult> => {
       model = next;
       attempts++;
-      return openCodeQuery({
+      const out = await openCodeQuery({
         prompt: composePrompt(db, task, workspace, attachments, retry),
         cwd: workspace,
         agent: task.lane === 'read' ? ORCHESTRATOR_READ_AGENT : ORCHESTRATOR_AGENT,
@@ -356,6 +394,8 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
         onSession: (sessionId) => db.setTaskSession(task.id, sessionId),
         onProgress,
       });
+      addUsage(out.usage);
+      return out;
     };
     /** Counts the last attempt's upstream failure against its gateway; true when that opens the breaker. */
     const recordFailure = (): boolean => {
@@ -410,14 +450,14 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
   // Queued ahead of the outcome, so the user reads the notice before the answer.
   if (notice) db.addNotice(task.account_id, notice);
   if (result.interrupted) {
-    if (!db.finishTask(task.id, 'interrupted', { error: result.error })) return;
+    if (!db.finishTask(task.id, 'interrupted', { error: result.error, usage })) return;
   } else if (result.error) {
-    if (!db.finishTask(task.id, 'failed', { error: clip(result.error, MAX_ERROR_CHARS) })) return;
+    if (!db.finishTask(task.id, 'failed', { error: clip(result.error, MAX_ERROR_CHARS), usage })) return;
     // Also ahead of the outcome, so the flush in deliver sends it now.
     maybeAlertFailures(db, task.account_id);
   } else {
     const output = parseOrchestratorOutput(result.text);
-    if (!db.finishTask(task.id, 'done', { result: output.reply, summary: output.summary })) return;
+    if (!db.finishTask(task.id, 'done', { result: output.reply, summary: output.summary, handoff: output.handoff, usage })) return;
     try {
       appendMemory(memoryPath(task.account_id, resolveBot(task.bot_id).bot), output.memory);
     } catch (err) {
@@ -436,6 +476,7 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
     attempts,
     fallback: usedFallback,
     errorKind: result.errorKind,
+    usage,
   });
   await io.deliver(finished);
 }

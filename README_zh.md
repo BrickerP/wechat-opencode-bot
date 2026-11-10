@@ -197,6 +197,7 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 | `OpenCode 未安装…` 或 `OpenCode 服务启动失败或超时…` | `OPENCODE_URL` 上没有服务响应，守护进程也没能在 120 秒内启动 `opencode serve`。检查 `PATH` 里有没有 `opencode`，以及 `OPENCODE_PORT` 和 `OPENCODE_SERVER_PASSWORD` |
 | 结果不再送达；`/status` 显示 `📮 待补发` | 发送需要较新的 `context_token`。给 bot 随便发一条消息；待发队列过了退避时间就会重试 |
 | 任务一开始就用备用模型；`/status` 的 `🧯 熔断` 列出了某个网关 | 该网关的熔断会保持打开，直到显示的剩余分钟数走完。`~/.wechat-opencode-bot/logs/` 里每条 `Task finished` 日志都有 `model`、`attempts`、`fallback` 和 `errorKind`；`OWB_LOG_LEVEL=debug` 会记录更多 |
+| bot 在运行，但不再回复 | launchd 上的 watchdog（`scripts/watchdog.sh`）会在约 10 分钟内重启不再写心跳的守护进程，并把重启记在 `~/.wechat-opencode-bot/logs/watchdog.log`，见 [Watchdog](docs/DEPLOY.md#watchdog)。它发现不了微信会话过期：见下一行 |
 | 守护进程输出 `⚠️ 微信会话已过期，请重新运行 setup 扫码绑定` | iLink 会话已过期。重新运行 `npm run setup` |
 
 ## License

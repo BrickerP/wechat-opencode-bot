@@ -90,7 +90,7 @@ Today `run-bot.sh` starts `dist-roster/main.js`, a build snapshot in the repo ch
 3. Switch: `scripts/deploy.sh --apply --migrate-wrapper v1.0.0`. On top of a normal deploy, it backs up `run-bot.sh` to `~/.wechat-opencode-bot/backups/run-bot.sh.pre-v1.0.0-<time>` and rewrites its `exec node` line to `exec node current/dist/main.js --daemon`. If the health gate fails, it puts the old `run-bot.sh` back and restarts the old build.
 4. Commit `run-bot.sh`: `git diff run-bot.sh` shows the one changed line. `scripts/release.sh` refuses to run until you do.
 5. Link the agents through `current`: `scripts/install-agents.sh`, then `scripts/install-agents.sh --apply`. The v1.0.0 prompts are copies of the live ones, so it reports `same content` and needs no reload.
-6. Check the launchd jobs: `scripts/install-launchd.sh` should report both plists as `unchanged`.
+6. Check the launchd jobs: `scripts/install-launchd.sh` should report the server and bot plists as `unchanged`.
 
 Keep step 5 after step 3. Until the switch, a deploy moves `current` without restarting the bot, so `deploy.sh` refuses to run while the agents link through `current`.
 
@@ -126,8 +126,9 @@ The bot runs write tasks on the `wechat-orchestrator` agent, which hands work to
 |---|---|---|
 | `com.yupeng.opencode-wechat-server` | `run-server.sh`: `opencode serve` on 127.0.0.1:4096 | Load it first: a bot that finds no server starts one of its own |
 | `com.yupeng.opencode-wechat-bot` | `run-bot.sh` | Every deploy restarts it |
+| `com.yupeng.opencode-wechat-watchdog` | `scripts/watchdog.sh`, at login and every 5 minutes | Restarts a stuck bot, see [Watchdog](#watchdog) |
 
-Both start at login, and launchd starts them again when they exit. Their templates live in `config/launchd/`. `scripts/install-launchd.sh` renders them and diffs them against `~/Library/LaunchAgents/`; with `--apply` it backs up and writes the plists. It never loads anything: it prints the `launchctl bootout` and `bootstrap` commands to run while no task runs.
+The server and the bot start at login, and launchd starts them again when they exit. The templates of all three jobs live in `config/launchd/`. `scripts/install-launchd.sh` renders them and diffs them against `~/Library/LaunchAgents/`; with `--apply` it backs up and writes the plists. It never loads anything: it prints the `launchctl bootout` and `bootstrap` commands to run while no task runs.
 
 To restart a job without reloading its definition, for example the server (check `/status` first):
 
@@ -135,7 +136,7 @@ To restart a job without reloading its definition, for example the server (check
 launchctl kickstart -k gui/$(id -u)/com.yupeng.opencode-wechat-server
 ```
 
-Manage both jobs with `launchctl`. The bot has no start or stop command of its own:
+Manage the jobs with `launchctl`. The bot has no start or stop command of its own:
 
 | To | Run |
 |---|---|
@@ -145,7 +146,7 @@ Manage both jobs with `launchctl`. The bot has no start or stop command of its o
 
 The bot takes `~/.wechat-opencode-bot/daemon.lock` before it connects to anything, and removes it when it exits. While one bot holds the lock, another `--daemon`, such as one started by hand in a terminal, prints `wechat-opencode-bot already running (pid N)` and exits 0. A lock whose process is gone, or that was written before the last boot, is stale: the next bot replaces it.
 
-Logs are in `~/.wechat-opencode-bot/logs/`. launchd writes `bot.out.log`, `bot.err.log`, `server.out.log` and `server.err.log`; the bot writes `wechat-opencode-bot-<date>.log` and keeps the 3 newest.
+Logs are in `~/.wechat-opencode-bot/logs/`. launchd writes `bot.out.log`, `bot.err.log`, `server.out.log`, `server.err.log`, `watchdog.out.log` and `watchdog.err.log`; the bot writes `wechat-opencode-bot-<date>.log` and keeps the 3 newest, and the watchdog writes `watchdog.log`.
 
 ## Health
 

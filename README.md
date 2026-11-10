@@ -197,6 +197,7 @@ Every `node dist/main.js` command loads `env` from the data directory, and varia
 | `OpenCode 未安装…` or `OpenCode 服务启动失败或超时…` | No server answered at `OPENCODE_URL`, and the daemon could not start `opencode serve` within 120 s. Check `opencode` on `PATH`, `OPENCODE_PORT` and `OPENCODE_SERVER_PASSWORD` |
 | Results stop arriving; `/status` shows `📮 待补发` | Sends need a recent `context_token`. Send the bot any message; the outbox retries once its backoff has passed |
 | Tasks start on the fallback; `/status` lists a gateway under `🧯 熔断` | Its breaker stays open for the minutes shown. Each `Task finished` line in `~/.wechat-opencode-bot/logs/` has `model`, `attempts`, `fallback` and `errorKind`; `OWB_LOG_LEVEL=debug` logs more |
+| The bot runs but stops answering | The launchd watchdog (`scripts/watchdog.sh`) restarts a daemon that stopped writing its heartbeat, within about 10 minutes, and logs the restart in `~/.wechat-opencode-bot/logs/watchdog.log`; see [Watchdog](docs/DEPLOY.md#watchdog). It cannot tell that the WeChat session expired: see the next row |
 | `⚠️ 微信会话已过期，请重新运行 setup 扫码绑定` in the daemon's output | The iLink session expired. Run `npm run setup` again |
 
 ## License

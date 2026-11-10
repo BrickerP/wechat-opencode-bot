@@ -10,8 +10,8 @@ DATA_DIR="${OWB_DATA_DIR:-$HOME/.wechat-opencode-bot}"
 SRC_DIR="$REPO/config/launchd"
 DEST_DIR="$HOME/Library/LaunchAgents"
 BACKUP="$DATA_DIR/backups/launchd-$(date +%Y%m%d-%H%M%S)"
-# The server first: a bot that finds no server on its port starts one of its own.
-LABELS="com.yupeng.opencode-wechat-server com.yupeng.opencode-wechat-bot"
+# The server first: a bot that finds no server on its port starts one of its own. The watchdog last, after the jobs it checks.
+LABELS="com.yupeng.opencode-wechat-server com.yupeng.opencode-wechat-bot com.yupeng.opencode-wechat-watchdog"
 
 apply=0
 case "${1:-}" in

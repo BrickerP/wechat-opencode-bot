@@ -1,7 +1,8 @@
 // Must stay first: provider.ts reads OPENCODE_SERVER_PASSWORD when it loads.
 import './env.js';
 import { createInterface } from 'node:readline';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { formatStatus, formatTasks, parseTaskLimit, ROUTINE_TICK_MS, tickRoutines, type CommandContext } from './commands/handlers.js';
@@ -34,6 +35,10 @@ const ANSWERS = new Map<string, boolean>([
   ['y', true], ['yes', true], ['ok', true], ['是', true], ['允许', true], ['同意', true],
   ['n', false], ['no', false], ['否', false], ['拒绝', false],
 ]);
+
+/** Rewritten every HEARTBEAT_MS while the daemon runs; scripts/watchdog.sh restarts a bot whose heartbeat is 5 minutes old. */
+const HEARTBEAT_FILE = join(DATA_DIR, 'heartbeat');
+const HEARTBEAT_MS = 30_000;
 
 function promptUser(question: string, defaultValue?: string): Promise<string> {
   return new Promise((resolve) => {
@@ -263,6 +268,18 @@ async function runDaemon(): Promise<void> {
       console.error('⚠️ 微信会话已过期，请重新运行 setup 扫码绑定');
     },
   });
+
+  // Last in startup, so a bot that hangs before it never writes one; a timer only fires while the event loop turns.
+  // Each write replaces the last one, and the file stays behind on exit.
+  const beat = () => {
+    try {
+      writeFileSync(HEARTBEAT_FILE, `pid=${process.pid}\ntime=${Date.now()}\n`);
+    } catch (err) {
+      logger.warn('Heartbeat write failed', { error: String(err) });
+    }
+  };
+  beat();
+  setInterval(beat, HEARTBEAT_MS).unref();
 
   logger.info('Daemon started', { accountId });
   console.log(`已启动 (账号: ${accountId})`);

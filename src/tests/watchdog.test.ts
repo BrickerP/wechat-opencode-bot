@@ -266,13 +266,14 @@ test('a subagent that stops making progress times out the turn', async () => {
   assert.ok(child?.interrupted, 'the stalled subagent session is interrupted');
 });
 
-test('a tool that runs longer than the stall timeout is not a stall, and the user hears that the task is running', async () => {
+test('a tool that runs longer than the stall timeout is not a stall, and the user hears that the task is running it', async () => {
   const { task, roots, elapsed, progress } = await run(['child-tool']);
   assert.equal(task.status, 'done');
   assert.equal(roots.length, 1);
   assert.ok(elapsed >= TOOL_MS, `took ${elapsed}ms`);
   assert.ok(progress.length >= 1 && progress.length <= PROGRESS_MAX, `${progress.length} notes`);
-  assert.match(progress[0], new RegExp(`^⏳ 任务 #${task.seq} 运行中（\\d+秒），已派出 1 个子任务$`));
+  // The subagent's shell command, not the orchestrator's subagent call that waits on it.
+  assert.match(progress[0], new RegExp(`^⏳ 任务 #${task.seq} 运行中（\\d+秒），正在 shell，已派出 1 个子任务$`));
 });
 
 test('a task that finishes quickly sends no progress note', async () => {
@@ -289,7 +290,7 @@ test('progress notes stop at the cap over both attempts, and a note that fails t
   assert.equal(roots.length, 2);
   assert.equal(progress.length, PROGRESS_MAX);
   assert.match(progress[0], new RegExp(`^⏳ 任务 #${task.seq} 运行中（\\d+秒）$`), 'the silent primary has no subagent');
-  assert.match(progress[1], /，已派出 1 个子任务$/);
+  assert.match(progress[1], /，正在 shell，已派出 1 个子任务$/);
   assert.equal(db.pendingNotices('test').length, notices, 'progress never goes to the outbox');
 });
 

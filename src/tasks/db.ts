@@ -262,6 +262,13 @@ export function openStateDb(file: string = STATE_DB_PATH) {
   });
 
   const getTask = (id: string) => one<TaskRow>(`${TASK_SELECT} WHERE t.id = ?`, id);
+  /** The account's task numbered seq, the number replies and /tasks show; undefined if it has none by that number. */
+  function taskBySeq(accountId: string, seq: number): TaskRow | undefined {
+    if (!Number.isSafeInteger(seq) || seq < 1) return undefined;
+    // seq counts the account's rows by rowid, as TASK_SELECT does.
+    const row = one<{ id: string }>('SELECT id FROM tasks WHERE account_id = ? ORDER BY rowid LIMIT 1 OFFSET ?', accountId, seq - 1);
+    return row && getTask(row.id);
+  }
   const hasRunning = (accountId: string, lane: TaskLane) =>
     one(`SELECT 1 FROM tasks WHERE account_id = ? AND lane = ? AND status = 'running'`, accountId, lane) !== undefined;
 
@@ -319,6 +326,7 @@ export function openStateDb(file: string = STATE_DB_PATH) {
 
     // ── tasks ────────────────────────────────────────────────────────────
     getTask,
+    taskBySeq,
 
     /**
      * Queue a task for an inbound message, or for a routine (routineId, no message). iLink can deliver a message
@@ -509,6 +517,19 @@ export function openStateDb(file: string = STATE_DB_PATH) {
         Date.now(), error, accountId,
       );
       return Number(out.changes);
+    },
+
+    /** /cancel: one queued task never starts; the reply tells the user. null unless the task was still queued. */
+    cancelQueuedTask(accountId: string, seq: number, error: string): TaskRow | null {
+      return immediate(() => {
+        const task = taskBySeq(accountId, seq);
+        if (task?.status !== 'queued') return null;
+        run(
+          "UPDATE tasks SET status = 'interrupted', finished_at = ?, error = ?, notified = 1 WHERE id = ? AND status = 'queued'",
+          Date.now(), error, task.id,
+        );
+        return getTask(task.id)!;
+      });
     },
 
     /** Queued tasks older than the TTL never start; they end as interrupted and the outbox tells the user. */

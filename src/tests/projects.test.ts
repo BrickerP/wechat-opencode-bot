@@ -1,6 +1,7 @@
 // Project routing: the registry, alias and follow-up detection, directory checks (also for /cwd),
 // the prompt's <project> block, routing together with "@bot" in either order, follow-ups that stay
-// with the last bot, "新话题" and "@base", aliases a bot owns, and the v3 task columns.
+// with the last bot, "新话题" and "@base", aliases a bot owns, the v3 task columns, and the registry
+// edits of /projects add and rm.
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -23,9 +24,16 @@ process.env.OWB_DATA_DIR = join(tmp, 'data');
 mkdirSync(join(tmp, '.wechat-opencode-bot'));
 writeFileSync(join(tmp, '.wechat-opencode-bot', 'config.env'), `workingDirectory=${base}\n`);
 
-const { detectProject, loadProjects, PROJECTS_PATH, resolveProjectDir, routeMessage, stripProjectPrefix } = await import(
-  '../projects.js'
-);
+const {
+  addProject,
+  detectProject,
+  loadProjects,
+  PROJECTS_PATH,
+  removeProject,
+  resolveProjectDir,
+  routeMessage,
+  stripProjectPrefix,
+} = await import('../projects.js');
 const { openStateDb } = await import('../tasks/db.js');
 const { composePrompt } = await import('../orchestrator.js');
 const { handlers } = await import('../commands/handlers.js');
@@ -323,4 +331,119 @@ test('a v2 database gains the project columns and keeps its rows', () => {
   assert.equal((raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 9);
   assert.deepEqual([migrated.getTask(task.id)?.input, migrated.getTask(task.id)?.project_id], ['old task', null]);
   raw.close();
+});
+
+test('addProject appends a project for a directory inside the base, and removeProject takes it out again', (t) => {
+  const file = join(tmp, 'manage', 'projects.json');
+  // The first change generates the missing registry, then appends to it: the id lowercased, the dir as typed.
+  assert.deepEqual(addProject(base, file, ' Hidden ', ' .hidden '), { id: 'hidden', dir: '.hidden', aliases: ['hidden'] });
+  assert.deepEqual(loadProjects(base, file).map((p) => p.id), ['dumate', 'medo', 'miaoda', 'miaoda-ops', 'rh-layers', 'hidden']);
+  assert.equal(statSync(file).mode & 0o777, 0o600);
+  assert.deepEqual(readdirSync(join(tmp, 'manage')), ['projects.json'], 'written to a temp file renamed over the registry');
+
+  // A checkout made later; without a dir, the id names it.
+  mkdirSync(join(base, 'NewRepo'));
+  t.after(() => rmSync(join(base, 'NewRepo'), { recursive: true }));
+  const before = readFileSync(file, 'utf-8');
+  const added = addProject(base, file, 'NewRepo');
+  assert.deepEqual(added, { id: 'newrepo', dir: 'NewRepo', aliases: ['newrepo'] });
+  assert.deepEqual(loadProjects(base, file).at(-1), added, 'read back as added');
+  assert.deepEqual(removeProject(base, file, 'NEWREPO'), added, 'by id, in any case');
+  assert.equal(readFileSync(file, 'utf-8'), before, 'the registry is back as it was');
+  assert.ok(statSync(join(base, 'NewRepo')).isDirectory(), 'its directory stays');
+  assert.deepEqual(
+    removeProject(base, file, 'icafe'),
+    { id: 'medo', dir: 'medo-discord-icafe-bot', aliases: ['medo', 'icafe', 'medo-discord', 'medo-discord-icafe-bot'] },
+    'by alias',
+  );
+  assert.deepEqual(loadProjects(base, file).map((p) => p.id), ['dumate', 'miaoda', 'miaoda-ops', 'rh-layers', 'hidden']);
+});
+
+test('addProject refuses a taken name, a bad id or a directory outside the base, and writes nothing', () => {
+  const file = join(tmp, 'refused', 'projects.json');
+  loadProjects(base, file);
+  const saved = readFileSync(file, 'utf-8');
+  const idRule = '项目 id 需以字母或数字开头，只含字母、数字、- 和 _，最多 32 个字符；base 留给基础目录';
+  const pathRule = (id: string) => `project ${id}: dir must be a path inside the base, without ..`;
+  const refused: Array<[string, string | undefined, string]> = [
+    ['miaoda', 'dumate', 'miaoda 已被项目 miaoda 使用，发送 /projects 查看'],
+    ['RH', 'dumate', 'rh 已被项目 rh-layers 使用，发送 /projects 查看'],
+    ['icafe', 'dumate', 'icafe 已被项目 medo 使用，发送 /projects 查看'],
+    ['ops', 'dumate', 'ops 是 bot 的别名，换一个 id'],
+    ['all', 'dumate', 'all 是 bot 的别名，换一个 id'],
+    ['base', '.', idRule],
+    ['-x', 'dumate', idRule],
+    ['a'.repeat(33), 'dumate', idRule],
+    ['秒哒', 'miaoda', idRule],
+    ['up', '../outside', pathRule('up')],
+    ['up', 'miaoda/../../outside', pathRule('up')],
+    ['abs', join(base, 'dumate'), pathRule('abs')],
+    ['out', 'escape', 'project out: escape resolves outside the base'],
+    ['notes', 'notes.txt', 'project notes: notes.txt is not a directory'],
+    ['missing', undefined, `目录不存在: ${join(base, 'missing')}`],
+  ];
+  for (const [id, dir, message] of refused) {
+    assert.throws(() => addProject(base, file, id, dir), { message }, `${id} ${dir}`);
+  }
+  assert.equal(readFileSync(file, 'utf-8'), saved);
+});
+
+test('removeProject refuses "base"; both changes keep the entries they do not touch, and never write over a broken registry', () => {
+  const file = join(tmp, 'kept', 'projects.json');
+  loadProjects(base, file);
+  assert.throws(() => removeProject(base, file, 'nope'), { message: '没有名为 nope 的项目，发送 /projects 查看' });
+  // As in the registry of a base that is a repo, plus an entry loadProjects skips.
+  const registry = JSON.parse(readFileSync(file, 'utf-8'));
+  registry.projects.push({ id: 'base', dir: '.', aliases: ['base', 'root'] }, { id: 'up', dir: '../outside', aliases: ['up'] });
+  writeFileSync(file, JSON.stringify(registry));
+  for (const key of ['base', 'root']) {
+    assert.throws(() => removeProject(base, file, key), { message: 'base 是基础目录本身，不能移除' }, key);
+  }
+  const hidden = addProject(base, file, 'hidden', '.hidden');
+  assert.deepEqual(JSON.parse(readFileSync(file, 'utf-8')).projects, [...registry.projects, hidden], 'the others as written');
+  assert.ok(!loadProjects(base, file).some((p) => p.id === 'up'));
+  assert.deepEqual(removeProject(base, file, 'up'), { id: 'up', dir: '../outside', aliases: ['up'] }, 'a skipped entry can go');
+
+  for (const broken of ['{ not json', '{"projects":{}}']) {
+    writeFileSync(file, broken);
+    for (const change of [() => addProject(base, file, 'other', 'dumate'), () => removeProject(base, file, 'dumate')]) {
+      assert.throws(change, { message: /^项目配置无法读取，先修好 / }, broken);
+    }
+    assert.equal(readFileSync(file, 'utf-8'), broken);
+  }
+});
+
+test('/projects add and rm edit the registry from WeChat, and reply with what to fix when they cannot', async (t) => {
+  const generated = readFileSync(PROJECTS_PATH, 'utf-8');
+  t.after(() => writeFileSync(PROJECTS_PATH, generated));
+  const db = openStateDb(join(tmp, 'manage.db'));
+  const ctx = { accountId: 'acc', db } as CommandContext;
+  const send = (args: string) => handlers.projects(args, ctx);
+  const hidden = { id: 'hidden', dir: join(base, '.hidden') };
+
+  assert.equal(await send('add hidden .hidden'), '✅ 已添加项目 hidden: .hidden，以 @hidden 开头的消息就在该目录运行');
+  assert.deepEqual(routeMessage(db, 'acc', '@hidden 看下'), { input: '看下', project: hidden, botId: 'chief' });
+  assert.match(await send(''), /^- hidden: \.hidden（hidden）$/m);
+  const usage = '用法：/projects 查看；/projects add <id> [目录]；/projects rm <id|别名>';
+  for (const [args, reply] of [
+    ['add up ../outside', '⚠️ project up: dir must be a path inside the base, without ..'],
+    ['add out escape', '⚠️ project out: escape resolves outside the base'],
+    ['add rh .hidden', '⚠️ rh 已被项目 rh-layers 使用，发送 /projects 查看'],
+    ['add', usage],
+    ['rename hidden x', usage],
+  ]) {
+    assert.equal(await send(args), reply, args);
+  }
+
+  // A routine in the project keeps its schedule; from then on its tasks run in the workspace.
+  db.addRoutine('acc', { name: 'daily', prompt: '看下', schedule: 'daily09:00', nextRunAt: Date.now(), project: hidden });
+  assert.equal(await send('rm hidden'), '🗑 已移除项目 hidden（目录本身不受影响）；定时任务 daily 之后在工作目录运行');
+  assert.equal(readFileSync(PROJECTS_PATH, 'utf-8'), generated, 'the registry is back as it was');
+  assert.equal(await send('RM ICAFE'), '🗑 已移除项目 medo（目录本身不受影响）');
+  for (const key of ['hidden', 'base']) {
+    assert.equal(await send(`rm ${key}`), `⚠️ 没有名为 ${key} 的项目，发送 /projects 查看`, key);
+  }
+  const help = await handlers.help('', ctx);
+  assert.match(help, /^ {2}\/projects add <id> \[目录\] {2}添加项目（目录相对基础目录，默认与 id 同名）$/m);
+  assert.match(help, /^ {2}\/projects rm <id\|别名> {2}移除项目（目录本身不受影响）$/m);
 });

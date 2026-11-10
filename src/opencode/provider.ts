@@ -19,8 +19,11 @@ export interface QueryOptions {
   onPermission?: (request: PermissionRequest) => Promise<PermissionDecision>;
   /** Called once the session exists, before the prompt is sent. */
   onSession?: (sessionId: string) => void;
-  /** Called while the turn runs, at most once per poll: how long it has run and how many subagent sessions exist. */
-  onProgress?: (update: { elapsedMs: number; children: number; idleMs: number }) => void;
+  /**
+   * Called while the turn runs, at most once per poll: how long it has run, how many subagent sessions exist and
+   * which tools are running in the session and in them (each name once, at most PROGRESS_TOOLS).
+   */
+  onProgress?: (update: { elapsedMs: number; children: number; idleMs: number; tools: string[] }) => void;
 }
 
 export interface PermissionRequest {
@@ -78,6 +81,8 @@ const FIRST_RESPONSE_TIMEOUT_MS = Number(process.env.OPENCODE_FIRST_RESPONSE_TIM
 /** Once it has answered, something in the session tree must change at least this often. */
 const STALL_TIMEOUT_MS = Number(process.env.OPENCODE_STALL_TIMEOUT_MS) || 180_000;
 const POLL_INTERVAL_MS = 1500;
+/** Running tool names a progress update carries at most. */
+const PROGRESS_TOOLS = 5;
 
 /** The turn was stopped (abort signal, /stop, or an interrupted idle outcome). */
 export class TurnInterrupted extends Error {
@@ -365,6 +370,18 @@ export async function interruptSession(sessionId: string): Promise<void> {
   );
 }
 
+/**
+ * More input for a session's running turn. OpenCode admits it at once and takes it in at the turn's next safe
+ * step, not after the whole turn, so the waitForTurn already polling that session still gets the answer.
+ */
+export async function steerSession(sessionId: string, text: string, signal?: AbortSignal): Promise<void> {
+  await api(`/api/session/${encodeURIComponent(sessionId)}/prompt`, {
+    method: "POST",
+    body: JSON.stringify({ text, delivery: "steer" }),
+    signal,
+  });
+}
+
 /** OpenCode's 404 for a session that does not exist, as opposed to a route it does not have. */
 const SESSION_NOT_FOUND = /-> HTTP 404: .*"SessionNotFoundError"/;
 
@@ -567,7 +584,8 @@ async function waitForTurn(sessionId: string, since: number, options: QueryOptio
     ).flat();
     // A running tool is local work (a build, a long command), not a silent model. The root's subagent calls
     // are judged by their child sessions; a child's own subagent call runs in a session not watched here.
-    const working = runningTools(turn).some((name) => name !== "subagent") || runningTools(childMessages).length > 0;
+    const tools = [...runningTools(turn).filter((name) => name !== "subagent"), ...runningTools(childMessages)];
+    const working = tools.length > 0;
     const signature = progressSignature([...turn, ...childMessages]);
     const now = Date.now();
     if (working || signature !== progress) {
@@ -582,7 +600,12 @@ async function waitForTurn(sessionId: string, since: number, options: QueryOptio
       throw new TurnTimeout(`上游模型 ${STALL_TIMEOUT_MS / 1000} 秒无进展`);
     }
     try {
-      options.onProgress?.({ elapsedMs: now - startedAt, children: children.length, idleMs: now - progressAt });
+      options.onProgress?.({
+        elapsedMs: now - startedAt,
+        children: children.length,
+        idleMs: now - progressAt,
+        tools: [...new Set(tools)].slice(0, PROGRESS_TOOLS),
+      });
     } catch (err) {
       logger.debug("Progress callback failed", { sessionId, error: String(err) });
     }

@@ -226,6 +226,18 @@ export function composePrompt(db: StateDb, task: TaskRow, workspace: string, att
   ].join('\n\n');
 }
 
+/**
+ * What /steer sends into a running task's session. The session has the task's prompt already; the frame tells
+ * the orchestrator that this changes that task, and that the answer keeps its format.
+ */
+export function composeSteer(text: string): string {
+  return [
+    `<user_correction>\n${text}\n</user_correction>`,
+    'The user sent this correction while the task runs. It changes the task in <user_message>: apply it from here on, ' +
+      'and check work already done or delegated where it matters. End the run with the four markers as usual.',
+  ].join('\n\n');
+}
+
 // ── output ───────────────────────────────────────────────────────────────
 
 export interface OrchestratorOutput {
@@ -286,6 +298,8 @@ const PROGRESS_MIN_GAP_MS = Number(process.env.OWB_PROGRESS_MIN_GAP_MS) || 90_00
 const PROGRESS_EVERY_MS = Number(process.env.OWB_PROGRESS_EVERY_MS) || 300_000;
 /** Progress notes per task, over all its attempts. */
 const PROGRESS_MAX = Number(process.env.OWB_PROGRESS_MAX) || 4;
+/** A note names this many of the running tools at most. */
+const PROGRESS_NOTE_TOOLS = 3;
 
 /** The mode is read per request so /permission applies to a task that is already running. */
 async function decidePermission(request: PermissionRequest, io: TaskIO): Promise<PermissionDecision> {
@@ -319,7 +333,8 @@ export function formatQueueAck(seq: number, ahead: number, durations: number[]):
 
 /**
  * The onProgress handler of one task, shared by its attempts so the limits hold for the whole task: a note
- * once an attempt has run PROGRESS_FIRST_MS, then on new subagent sessions or every PROGRESS_EVERY_MS.
+ * once an attempt has run PROGRESS_FIRST_MS, then on new subagent sessions or every PROGRESS_EVERY_MS. A note
+ * names the tools running at the time and counts the subagent sessions.
  * Notes go out through io.progress, never the outbox, and a failed one is only logged.
  */
 function progressNotes(task: TaskRow, io: TaskIO, running: () => boolean) {
@@ -327,7 +342,7 @@ function progressNotes(task: TaskRow, io: TaskIO, running: () => boolean) {
   let sent = 0;
   let lastSent = 0;
   let lastChildren = 0;
-  return ({ elapsedMs, children }: { elapsedMs: number; children: number }): void => {
+  return ({ elapsedMs, children, tools }: { elapsedMs: number; children: number; tools: string[] }): void => {
     const now = Date.now();
     if (!io.progress || sent >= PROGRESS_MAX || elapsedMs < PROGRESS_FIRST_MS || now - lastSent < PROGRESS_MIN_GAP_MS) return;
     if (children <= lastChildren && now - lastSent < PROGRESS_EVERY_MS) return;
@@ -335,7 +350,9 @@ function progressNotes(task: TaskRow, io: TaskIO, running: () => boolean) {
     sent++;
     lastSent = now;
     lastChildren = children;
-    const text = `⏳ 任务 #${task.seq} 运行中（${formatElapsed(startedAt, now)}）${children > 0 ? `，已派出 ${children} 个子任务` : ''}`;
+    const doing = tools.length ? `，正在 ${tools.slice(0, PROGRESS_NOTE_TOOLS).join('、')}` : '';
+    const delegated = children > 0 ? `，已派出 ${children} 个子任务` : '';
+    const text = `⏳ 任务 #${task.seq} 运行中（${formatElapsed(startedAt, now)}）${doing}${delegated}`;
     Promise.resolve()
       .then(() => io.progress?.(text))
       .catch((err) => logger.debug('Progress note failed', { taskId: task.id, error: String(err) }));

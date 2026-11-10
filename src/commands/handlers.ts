@@ -8,10 +8,19 @@ import { DATA_DIR } from '../constants.js';
 import { logger } from '../logger.js';
 import { memoryPath, memoryStats } from '../memory.js';
 import { breaker } from '../model-routing.js';
-import { clip, formatElapsed, formatTime, ORCHESTRATOR_AGENT, ORCHESTRATOR_READ_AGENT, STATUS_LABEL } from '../orchestrator.js';
-import { formatModelRef, listAgents, listModels, openCodeInfo, resolveModelRef } from '../opencode/provider.js';
+import { clip, composeSteer, formatElapsed, formatTime, ORCHESTRATOR_AGENT, ORCHESTRATOR_READ_AGENT, STATUS_LABEL } from '../orchestrator.js';
+import { formatModelRef, listAgents, listModels, openCodeInfo, resolveModelRef, steerSession } from '../opencode/provider.js';
 import type { PermissionBroker } from '../permission.js';
-import { detectProject, isRealPathInside, loadProjects, PROJECTS_PATH, resolveProjectDir, stripProjectPrefix } from '../projects.js';
+import {
+  addProject,
+  detectProject,
+  isRealPathInside,
+  loadProjects,
+  PROJECTS_PATH,
+  removeProject,
+  resolveProjectDir,
+  stripProjectPrefix,
+} from '../projects.js';
 import { formatSchedule, nextRunText, parseSchedule, type Schedule } from '../routines.js';
 import { STATE_DB_PATH, type RoutineRow, type StateDb, type TaskProject, type TaskRow } from '../tasks/db.js';
 import type { TaskQueue } from '../tasks/queue.js';
@@ -39,6 +48,9 @@ const ROUTINE_NAME = /^[^@]\S{0,23}$/u;
 const ROUTINE_ADD_USAGE = '用法：/routine add <名称> <dailyHH:MM|everyNm> <内容>';
 const ROUTINE_USAGE = `${ROUTINE_ADD_USAGE}\n/routine rm|on|off|run <名称>：删除、启用、停用、立即运行`;
 const SCHEDULE_FORMS = 'daily09:00（每天，北京时间）、every30m（每 N 分钟，N ≥ 5）、every2h（每 N 小时，N ≤ 24）';
+const CANCEL_USAGE = '用法：/cancel <任务编号>，如 /cancel 3；运行中的任务用 /stop';
+const STEER_USAGE = '用法：/steer [#任务编号] <修正内容>，如 /steer #3 先别改测试；只有一个任务在运行时可省略编号';
+const PROJECTS_USAGE = '用法：/projects 查看；/projects add <id> [目录]；/projects rm <id|别名>';
 
 /** The agents config/agents installs: tasks run on the orchestrators, which delegate to the other two. */
 const REQUIRED_AGENTS = [ORCHESTRATOR_AGENT, ORCHESTRATOR_READ_AGENT, 'wechat-general', 'wechat-explore'];
@@ -47,8 +59,8 @@ const AGENTS_FIX = [
   '   修复: scripts/install-agents.sh --apply，再 reload：',
   `   (set -a; . ${join(DATA_DIR, 'env')}; set +a; opencode reload --server "\${OPENCODE_URL:-http://127.0.0.1:4096}")`,
 ].join('\n');
-/** /doctor's wait for OpenCode, past the ~5 s it holds a request while its plugins load. */
-const DOCTOR_TIMEOUT_MS = 8000;
+/** How long /doctor and /steer wait for OpenCode, past the ~5 s it holds a request while its plugins load. */
+const OPENCODE_TIMEOUT_MS = 8000;
 /** /doctor flags a message token older than this: iLink may have expired it. */
 const TOKEN_STALE_MS = 12 * 60 * 60 * 1000;
 /** OpenCode's own database: /doctor reads its size, never its contents. */
@@ -59,6 +71,8 @@ const HELP_TEXT = `可用命令：
 任务：
   /status           查看当前状态（含 24 小时统计与 token 用量、熔断、待补发通知和消息令牌更新时间）
   /tasks [数量]     查看最近的任务（默认 5 个，含各任务的 token 用量）
+  /steer [#编号] <内容>  给运行中的任务发修正，它在下一个步骤采纳，不新建任务
+  /cancel <编号>    取消一个排队中的任务
   /stop             停止所有正在运行的任务
   /stop all         同时取消所有排队的任务
   /panic            紧急停止：停止并取消所有任务，权限切到 plan，停用所有定时任务
@@ -72,6 +86,8 @@ const HELP_TEXT = `可用命令：
   /cwd [路径]       查看或切换工作目录
   /ls               显示工作目录内容
   /projects         查看项目列表
+  /projects add <id> [目录]  添加项目（目录相对基础目录，默认与 id 同名）
+  /projects rm <id|别名>  移除项目（目录本身不受影响）
 
 Bot：
   /bots             查看 bot 列表（id、别名、回复前缀、模型、默认 bot）
@@ -237,7 +253,7 @@ function formatSize(bytes: number): string {
 /** Why a request to OpenCode failed, in a few words: fetch puts the reason in err.cause. */
 function requestError(err: unknown): string {
   if (!(err instanceof Error)) return clip(String(err), 80);
-  if (err.name === 'TimeoutError') return `${DOCTOR_TIMEOUT_MS / 1000} 秒无响应`;
+  if (err.name === 'TimeoutError') return `${OPENCODE_TIMEOUT_MS / 1000} 秒无响应`;
   const code = (err.cause as { code?: unknown } | undefined)?.code;
   return clip(code ? `${err.message} (${code})` : err.message, 80);
 }
@@ -436,12 +452,52 @@ export const handlers: Record<string, Handler> = {
 
   async doctor(_args, { accountId, db }) {
     // Bounded: messages are handled one at a time, so a hung OpenCode would hold up every later one.
-    const signal = AbortSignal.timeout(DOCTOR_TIMEOUT_MS);
+    const signal = AbortSignal.timeout(OPENCODE_TIMEOUT_MS);
     const [server, agents] = await Promise.allSettled([openCodeInfo(signal), listAgents(signal)]);
     return formatDoctor(db, accountId, { server, agents, gateways: breaker.snapshot(), uptimeMs: process.uptime() * 1000 });
   },
 
   tasks: (args, { accountId, db }) => formatTasks(db, accountId, parseTaskLimit(args)),
+
+  /**
+   * A correction for a running task: more input to the task's session, which takes it in at its next step. The
+   * task stays one task in its lane, and its answer is still its one reply.
+   */
+  async steer(args, { accountId, db }) {
+    const [, seq, text] = /^(?:[#＃](\d+)\s*)?([\s\S]*)$/.exec(args)!;
+    if (!text) return STEER_USAGE;
+    const running = db.runningTasks(accountId);
+    if (!running.length) return '没有运行中的任务';
+    if (!seq && running.length > 1) {
+      const defaultBotId = defaultBot(loadBots()).id;
+      const tasks = running.map((t) => `#${t.seq} ${t.bot_id ?? defaultBotId}：${clip(t.input, 20)}`);
+      return ['有多个任务在运行，请用 /steer #编号 <内容> 指定：', ...tasks].join('\n');
+    }
+    const task = seq ? running.find((t) => t.seq === Number(seq)) : running[0];
+    if (!task) return `⚠️ 任务 #${seq} 没有在运行，发送 /status 查看`;
+    if (!task.session_id) return `⚠️ 任务 #${task.seq} 还没有会话，稍后再试`;
+    try {
+      // Bounded, as /doctor is.
+      await steerSession(task.session_id, composeSteer(text), AbortSignal.timeout(OPENCODE_TIMEOUT_MS));
+    } catch (err) {
+      // Not the text: it is the user's, like a message.
+      logger.warn('Steer failed', { taskId: task.id, seq: task.seq, error: requestError(err) });
+      return `⚠️ 修正没有发出：${requestError(err)}`;
+    }
+    logger.info('Steer sent', { taskId: task.id, seq: task.seq, sessionId: task.session_id });
+    return `🎯 已把修正发给任务 #${task.seq}，运行中会在下一个步骤采纳`;
+  },
+
+  /** One queued task never starts; the reply is its notice, as with /stop. A running one is /stop's. */
+  cancel(args, { accountId, db }) {
+    const seq = Number(/^[#＃]?(\d+)$/.exec(args)?.[1]);
+    if (!Number.isSafeInteger(seq) || seq < 1) return CANCEL_USAGE;
+    if (db.cancelQueuedTask(accountId, seq, '用户取消')) return `🗑 已取消任务 #${seq}`;
+    const task = db.taskBySeq(accountId, seq);
+    if (!task) return `⚠️ 没有任务 #${seq}，发送 /tasks 查看`;
+    if (task.status === 'running') return `⚠️ 任务 #${seq} 正在运行，用 /stop 停止`;
+    return `任务 #${seq} 已经结束（${STATUS_LABEL[task.status]}）`;
+  },
 
   stop(args, { accountId, db, queue, broker }) {
     const all = args.toLowerCase() === 'all';
@@ -542,8 +598,27 @@ export const handlers: Record<string, Handler> = {
     return `${dir}\n${lines.join('\n')}`;
   },
 
-  projects(_args, { accountId, db }) {
+  projects(args, { accountId, db }) {
     const base = loadConfig().workingDirectory;
+    const [word, rest] = splitWord(args);
+    const action = word.toLowerCase() || 'list';
+    if ((action === 'add' || action === 'rm') && rest) {
+      try {
+        if (action === 'add') {
+          const [id, dir] = splitWord(rest);
+          const project = addProject(base, PROJECTS_PATH, id, dir || undefined);
+          return `✅ 已添加项目 ${project.id}: ${project.dir}，以 @${project.id} 开头的消息就在该目录运行`;
+        }
+        const removed = removeProject(base, PROJECTS_PATH, rest);
+        // routineProject sends their tasks where a message without a project runs; the routines stay as they are.
+        const routines = db.routines(accountId).filter((r) => r.project_id === removed.id);
+        const note = routines.length ? `；定时任务 ${routines.map((r) => r.name).join('、')} 之后在工作目录运行` : '';
+        return `🗑 已移除项目 ${removed.id}（目录本身不受影响）${note}`;
+      } catch (err) {
+        return `⚠️ ${err instanceof Error ? err.message : String(err)}`;
+      }
+    }
+    if (action !== 'list') return PROJECTS_USAGE;
     const projects = loadProjects(base);
     const lines = projects.length
       ? ['📁 项目（以 @别名 开头指定项目）：', ...projects.map((p) => `- ${p.id}: ${p.dir}（${p.aliases.join(', ')}）`)]

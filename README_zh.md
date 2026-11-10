@@ -4,6 +4,18 @@
 
 连接微信和 [OpenCode](https://opencode.ai) 的桥接程序。你发给 bot 的每条消息都会变成一个任务：本机的守护进程在本地 OpenCode 服务上新开一个会话执行它，再把结果发回聊天。支持文字、图片、权限审批、定时任务，以及多个 bot 和多个项目。
 
+## Demo
+
+```text
+你：  @eng 修一下登录页的 500
+Bot： 工程：已定位到 src/auth/session.ts：过期 token 没有清 cookie。
+      改了 session.ts 和对应测试，npm test 通过。
+你：  继续，补一个 e2e
+Bot： 工程：补了 tests/e2e/login.spec.ts，本地通过。 /status 可以看本次用了多少 token。
+```
+
+以上为示意；bot 默认用中文回复，你用其他语言时它也会跟随。
+
 ## 架构
 
 ```mermaid
@@ -208,3 +220,5 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 ## License
 
 MIT，见 [LICENSE](LICENSE)。基于 [zsxink/wechat-opencode-bot](https://github.com/zsxink/wechat-opencode-bot)。
+
+更多：[贡献指南](CONTRIBUTING.md) · [安全](SECURITY.md) · [Provider 与模型](docs/PROVIDERS.md) · [部署与回滚](docs/DEPLOY.md)

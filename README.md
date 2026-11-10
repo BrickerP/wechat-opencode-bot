@@ -4,6 +4,18 @@ English | [中文](README_zh.md)
 
 A bridge between WeChat and [OpenCode](https://opencode.ai). Each message you send the bot becomes a task: a daemon on your machine runs it in a new session on a local OpenCode server and sends the result back to the chat. It handles text, images, permission approvals, scheduled tasks, several bots and several projects.
 
+## Demo
+
+```text
+You:  @eng 修一下登录页的 500
+Bot:  工程：已定位到 src/auth/session.ts：过期 token 没有清 cookie。
+      改了 session.ts 和对应测试，npm test 通过。
+You:  继续，补一个 e2e
+Bot:  工程：补了 tests/e2e/login.spec.ts，本地通过。 /status 可以看本次用了多少 token。
+```
+
+The transcript is illustrative; the bot's replies are plain text in Chinese unless you write in another language.
+
 ## Architecture
 
 ```mermaid
@@ -208,3 +220,5 @@ Every `node dist/main.js` command loads `env` from the data directory, and varia
 ## License
 
 MIT, see [LICENSE](LICENSE). Based on [zsxink/wechat-opencode-bot](https://github.com/zsxink/wechat-opencode-bot).
+
+More: [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md) · [Providers and models](docs/PROVIDERS.md) · [Deploy and rollback](docs/DEPLOY.md)

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/BrickerP/wechat-opencode-bot/security/policy
+    about: Report it privately as SECURITY.md describes, not in a public issue.
+  - name: Set up a provider or model
+    url: https://github.com/BrickerP/wechat-opencode-bot/blob/main/docs/PROVIDERS.md
+    about: Run the bot on Anthropic, OpenAI, Ollama or your own gateway.

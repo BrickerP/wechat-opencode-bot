@@ -150,7 +150,8 @@ Run `npm run build` after every change. For an always-on bot, `scripts/release.s
 |---|---|
 | `/help` | Show the help |
 | `/status` | Working directory, project, bots, model, permission mode, running and queued tasks, memory; then 24-hour outcomes, tokens used, open breakers, the outbox backlog and the token's age |
-| `/tasks [n]` | The last n tasks (default 5, at most 20), with token usage when recorded |
+| `/tasks [n]` | The last n tasks (default 5, at most 20), with token usage when recorded; ⚠️ marks a task at or over `OWB_TASK_WARN_TOKENS` |
+| `/session <id\|title>` | Read a session on this OpenCode server directly: its last assistant text, as is (cut at 20,000 characters); a title that matches several lists up to 5 ids |
 | `/stop` | Stop the running tasks in both lanes and deny waiting asks; `/stop all` also cancels the queue |
 | `/cancel <n>` | Cancel one queued task |
 | `/steer [#n] <text>` | Send a correction into a running task's session; OpenCode applies it at the next step |
@@ -205,6 +206,7 @@ Every `node dist/main.js` command loads `env` from the data directory, and varia
 | `OWB_ALERT_PING_URL` | empty | URL the watchdog GETs after every healthy run, for an external dead-man's switch such as healthchecks.io |
 | `OWB_SESSION_TTL_DAYS`, `OWB_SESSION_KEEP` | `7`, `300` | Session retention: age in days, and how many of the newest finished tasks keep all their sessions |
 | `OWB_PROGRESS_FIRST_MS`, `OWB_PROGRESS_MIN_GAP_MS`, `OWB_PROGRESS_EVERY_MS`, `OWB_PROGRESS_MAX` | `20000`, `90000`, `300000`, `4` | Progress notes: first after, minimum gap, regular interval, maximum per task |
+| `OWB_TASK_WARN_TOKENS` | `500000` | Prompt tokens (cache included) from which a task is logged as costly and marked ⚠️ in `/tasks` |
 | `OWB_ASR_URL`, `OWB_ASR_MODEL`, `OWB_ASR_API_KEY` | empty, `whisper-1`, empty | OpenAI-compatible transcription endpoint for voice without WeChat's own text; SILK is decoded to WAV first |
 | `OWB_DATA_DIR` | `~/.wechat-opencode-bot` | The data directory |
 | `OWB_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |

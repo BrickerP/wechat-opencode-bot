@@ -15,7 +15,7 @@ process.env.HOME = tmp;
 process.env.OWB_DATA_DIR = join(tmp, 'data');
 
 const { openStateDb } = await import('../tasks/db.js');
-const { composePrompt, parseOrchestratorOutput } = await import('../orchestrator.js');
+const { composePrompt, parseOrchestratorOutput, stripToolMarkup } = await import('../orchestrator.js');
 const { formatStatus, formatTasks } = await import('../commands/handlers.js');
 
 const MINUTE = 60 * 1000;
@@ -177,4 +177,56 @@ test('/tasks shows what each task used and the next step its handoff names', () 
   assert.match(lines[4], /^#1 .+\] 改 parser {2}↑5k ↓250 \$0\.25$/);
   assert.equal(lines[5], '    改了 parser');
   assert.equal(lines[6], `    ↳ next: ${'修'.repeat(60)}…`);
+});
+
+test('/tasks flags a task whose prompt tokens reach OWB_TASK_WARN_TOKENS, keeping its counts', () => {
+  finished('warn', { usage: { input: 499_999, output: 100, cost: 0 } });
+  finished('warn', { usage: { input: 500_000, output: 3_000, cost: 0.4 } });
+  const lines = formatTasks(db, 'warn', 5).split('\n');
+  assert.match(lines[0], /^#2 .+\] 改 parser {2}↑500k ↓3k \$0\.40 {2}⚠️$/);
+  assert.match(lines[2], /^#1 .+\] 改 parser {2}↑500k ↓100$/, 'under the threshold: no mark');
+  process.env.OWB_TASK_WARN_TOKENS = '1000';
+  try {
+    assert.match(formatTasks(db, 'warn', 5).split('\n')[2], /↓100 {2}⚠️$/, 'read on use');
+  } finally {
+    delete process.env.OWB_TASK_WARN_TOKENS;
+  }
+});
+
+test('the reply is the last reply marker with text after it: an empty last section falls back to an earlier one', () => {
+  const out = parseOrchestratorOutput(
+    '<<<WECHAT_REPLY>>>\n第一版回复\n<<<WECHAT_REPLY>>>\n\n<<<WECHAT_MEMORY>>>\n- 无\n<<<WECHAT_SUMMARY>>>\n回答了\n<<<WECHAT_HANDOFF>>>\nnext: 无',
+  );
+  assert.deepEqual([out.reply, out.summary, out.handoff], ['第一版回复', '回答了', 'next: 无']);
+});
+
+test('when every reply section is empty, the text before the first reply marker is the reply', () => {
+  const answerFirst = '那个 medo 架构的学习 session 讲了三层：\n1. 网关\n2. 服务\n3. 存储\n';
+  const out = parseOrchestratorOutput(
+    `${answerFirst}<<<WECHAT_REPLY>>>\n\n<<<WECHAT_MEMORY>>>\n- 用户在学 medo 架构\n<<<WECHAT_SUMMARY>>>\n总结了 medo 架构\n<<<WECHAT_HANDOFF>>>\n-`,
+  );
+  assert.deepEqual(out, { reply: answerFirst.trim(), memory: ['用户在学 medo 架构'], summary: '总结了 medo 架构', handoff: '', files: [] });
+  assert.equal(parseOrchestratorOutput('  \n<<<WECHAT_REPLY>>>\n<<<WECHAT_SUMMARY>>>\nx').reply, '', 'nothing before it either');
+  assert.equal(parseOrchestratorOutput('<<<WECHAT_SUMMARY>>>\n<<<WECHAT_REPLY>>>\n').reply, '', 'markers only');
+  assert.equal(parseOrchestratorOutput('没有标记的整段回复').reply, '没有标记的整段回复');
+});
+
+/** A DeepSeek tool-call tag as it leaks into an answer: "<｜｜DSML｜｜invoke>" or "</｜｜DSML｜｜ invoke>". */
+const dsml = (name: string, close = false) => (close ? `</｜｜DSML｜｜ ${name}>` : `<｜｜DSML｜｜${name}>`);
+
+test('DeepSeek tool markup is stripped from the handoff, the reply and the memory, and a handoff left as "-" is none', () => {
+  const closers = ['parameter', 'invoke', 'calls'].map((name) => dsml(name, true)).join('\n');
+  const tail = parseOrchestratorOutput(answer(`\n<<<WECHAT_HANDOFF>>>\n${HANDOFF}\n${closers}\n`));
+  assert.equal(tail.handoff, HANDOFF, 'stray closing tags after the handoff');
+
+  const call = `${dsml('calls')}${dsml('invoke')}${dsml('parameter')}path${dsml('parameter', true)}${dsml('invoke', true)}${dsml('calls', true)}`;
+  const out = parseOrchestratorOutput(
+    `<<<WECHAT_REPLY>>>\n改好了\n${call}\n\n\n\n还剩一个用例\n<<<WECHAT_MEMORY>>>\n- 用户喜欢简短的回复${dsml('invoke', true)}\n<<<WECHAT_SUMMARY>>>\n修了 parser\n<<<WECHAT_HANDOFF>>>\n- ${dsml('calls', true)}\n`,
+  );
+  assert.deepEqual(out, { reply: '改好了\n\n还剩一个用例', memory: ['用户喜欢简短的回复'], summary: '修了 parser', handoff: '', files: [] });
+});
+
+test('stripToolMarkup leaves text without the markup as it is, trimmed', () => {
+  assert.equal(stripToolMarkup('  a\n\n\n\nb <tag> | ｜ \n'), 'a\n\n\n\nb <tag> | ｜');
+  assert.equal(stripToolMarkup(`a\n${dsml('invoke')}x${dsml('invoke', true)}\n\n\n\nb`), 'a\n\nb');
 });

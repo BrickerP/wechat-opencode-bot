@@ -150,7 +150,8 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 |---|---|
 | `/help` | 显示帮助 |
 | `/status` | 工作目录、项目、bot、模型、权限模式、运行中和排队的任务、记忆；以及 24 小时结果、token 用量、已打开的熔断、待补发数量和消息令牌的时效 |
-| `/tasks [n]` | 最近 n 个任务（默认 5 个，最多 20 个），有记录时附带 token 用量 |
+| `/tasks [n]` | 最近 n 个任务（默认 5 个，最多 20 个），有记录时附带 token 用量；达到 `OWB_TASK_WARN_TOKENS` 的任务标 ⚠️ |
+| `/session <id\|标题>` | 直接读这台 OpenCode 上的会话：原样返回它最后一条助手文本（超过 20000 字截断）；标题匹配多个时列出最多 5 个 id |
 | `/stop` | 停止两条通道里正在运行的任务，并拒绝等待中的权限请求；`/stop all` 同时取消队列 |
 | `/cancel <编号>` | 取消一个排队中的任务 |
 | `/steer [#编号] <内容>` | 给运行中的任务发一条修正；OpenCode 在下一个步骤采纳 |
@@ -205,6 +206,7 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 | `OWB_ALERT_PING_URL` | 空 | watchdog 每次运行结果健康时 GET 这个 URL，供外部的 dead-man's switch（如 healthchecks.io）在收不到 ping 时告警 |
 | `OWB_SESSION_TTL_DAYS`、`OWB_SESSION_KEEP` | `7`、`300` | 会话保留：天数，以及最近多少个已完成任务保留它们的全部会话 |
 | `OWB_PROGRESS_FIRST_MS`、`OWB_PROGRESS_MIN_GAP_MS`、`OWB_PROGRESS_EVERY_MS`、`OWB_PROGRESS_MAX` | `20000`、`90000`、`300000`、`4` | 进度通知：首条时间、最小间隔、常规间隔、每个任务的上限 |
+| `OWB_TASK_WARN_TOKENS` | `500000` | 输入 token（含缓存）达到这个数的任务会记一条警告日志，并在 `/tasks` 里标 ⚠️ |
 | `OWB_ASR_URL`、`OWB_ASR_MODEL`、`OWB_ASR_API_KEY` | 空、`whisper-1`、空 | 语音没有微信自带转写时使用的 OpenAI 兼容转写接口；SILK 会先解码为 WAV |
 | `OWB_DATA_DIR` | `~/.wechat-opencode-bot` | 数据目录 |
 | `OWB_LOG_LEVEL` | `info` | `debug`、`info`、`warn` 或 `error` |

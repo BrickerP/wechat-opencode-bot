@@ -8,8 +8,26 @@ import { DATA_DIR } from '../constants.js';
 import { logger } from '../logger.js';
 import { memoryPath, memoryStats } from '../memory.js';
 import { breaker } from '../model-routing.js';
-import { clip, composeSteer, formatElapsed, formatTime, ORCHESTRATOR_AGENT, ORCHESTRATOR_READ_AGENT, STATUS_LABEL } from '../orchestrator.js';
-import { formatModelRef, listAgents, listModels, openCodeInfo, resolveModelRef, steerSession } from '../opencode/provider.js';
+import {
+  clip,
+  composeSteer,
+  formatElapsed,
+  formatTime,
+  ORCHESTRATOR_AGENT,
+  ORCHESTRATOR_READ_AGENT,
+  STATUS_LABEL,
+  taskWarnTokens,
+} from '../orchestrator.js';
+import {
+  formatModelRef,
+  lastAssistantText,
+  listAgents,
+  listModels,
+  listSessions,
+  openCodeInfo,
+  resolveModelRef,
+  steerSession,
+} from '../opencode/provider.js';
 import type { PermissionBroker } from '../permission.js';
 import {
   addProject,
@@ -51,6 +69,11 @@ const SCHEDULE_FORMS = 'daily09:00（每天，北京时间）、every30m（每 N
 const CANCEL_USAGE = '用法：/cancel <任务编号>，如 /cancel 3；运行中的任务用 /stop';
 const STEER_USAGE = '用法：/steer [#任务编号] <修正内容>，如 /steer #3 先别改测试；只有一个任务在运行时可省略编号';
 const PROJECTS_USAGE = '用法：/projects 查看；/projects add <id> [目录]；/projects rm <id|别名>';
+const SESSION_USAGE = '用法：/session <会话 id 或标题>';
+/** /session lists this many of the sessions a title matches. */
+const SESSION_MATCHES = 5;
+/** /session returns this much of a session's text; notifier.reply splits it into messages. */
+const MAX_SESSION_CHARS = 20_000;
 
 /** The agents config/agents installs: tasks run on the orchestrators, which delegate to the other two. */
 const REQUIRED_AGENTS = [ORCHESTRATOR_AGENT, ORCHESTRATOR_READ_AGENT, 'wechat-general', 'wechat-explore'];
@@ -70,7 +93,8 @@ const HELP_TEXT = `可用命令：
 
 任务：
   /status           查看当前状态（含 24 小时统计与 token 用量、熔断、待补发通知和消息令牌更新时间）
-  /tasks [数量]     查看最近的任务（默认 5 个，含各任务的 token 用量）
+  /tasks [数量]     查看最近的任务（默认 5 个，含各任务的 token 用量，用量高的标 ⚠️）
+  /session <id|标题>  直接读出这台 OpenCode 上某个会话的最后一条助手回复，不新建任务
   /steer [#编号] <内容>  给运行中的任务发修正，它在下一个步骤采纳，不新建任务
   /cancel <编号>    取消一个排队中的任务
   /stop             停止所有正在运行的任务
@@ -301,11 +325,15 @@ export function formatDoctor(db: StateDb, accountId: string, probe: DoctorProbe,
   return ['🩺 自检：', ...checks.map(([mark, text]) => `${mark} ${text}`), `总体: ${issues ? `有 ${issues} 项需要注意` : '正常'}`].join('\n');
 }
 
-/** Shared by /tasks and --tasks. Newest first, each with what it used and the next step its handoff names. */
+/**
+ * Shared by /tasks and --tasks. Newest first, each with what it used and the next step its handoff names. A task
+ * whose prompt tokens reached taskWarnTokens() is flagged ⚠️.
+ */
 export function formatTasks(db: StateDb, accountId: string, limit: number): string {
   const tasks = db.recentTasks(accountId, limit);
   if (!tasks.length) return '暂无任务';
   const defaultBotId = defaultBot(loadBots()).id;
+  const threshold = taskWarnTokens();
   return tasks
     .map((t) => {
       const head = `#${t.seq} ${formatTime(t.created_at)} [${STATUS_LABEL[t.status]}] ${taskInput(t, 40, defaultBotId)}`;
@@ -313,7 +341,8 @@ export function formatTasks(db: StateDb, accountId: string, limit: number): stri
         t.tokens_in || t.tokens_out
           ? `  ${formatTokens(t.tokens_in ?? 0, t.tokens_out ?? 0)}${t.cost_usd ? ` ${formatCost(t.cost_usd)}` : ''}`
           : '';
-      const lines = [head + used];
+      const high = (t.tokens_in ?? 0) >= threshold ? '  ⚠️' : '';
+      const lines = [head + used + high];
       const detail = t.summary || t.error;
       if (detail) lines.push(`    ${clip(detail, 80)}`);
       const next = t.handoff && /^[-*]?[ \t]*next[:：][ \t]*(.+)$/im.exec(t.handoff)?.[1];
@@ -458,6 +487,40 @@ export const handlers: Record<string, Handler> = {
   },
 
   tasks: (args, { accountId, db }) => formatTasks(db, accountId, parseTaskLimit(args)),
+
+  /**
+   * A session's last assistant text, read straight from this OpenCode server, so the user does not need a task to
+   * dig it out. The text goes back as it is, cut at MAX_SESSION_CHARS.
+   */
+  async session(args) {
+    if (!args) return SESSION_USAGE;
+    // Bounded, as /doctor is; the title search pages the session list.
+    const signal = AbortSignal.timeout(OPENCODE_TIMEOUT_MS);
+    let text: string;
+    try {
+      let id = args;
+      if (!args.startsWith('ses_')) {
+        const matches = await listSessions(args, undefined, signal);
+        if (!matches.length) return `没有标题包含「${args}」的会话`;
+        if (matches.length > 1) {
+          const more = matches.length > SESSION_MATCHES ? [`… 还有 ${matches.length - SESSION_MATCHES} 个`] : [];
+          return [
+            `有 ${matches.length} 个会话的标题包含「${args}」，请用 /session <id> 指定：`,
+            ...matches.slice(0, SESSION_MATCHES).map((s) => `${s.id}  ${clip(s.title, 40)}`),
+            ...more,
+          ].join('\n');
+        }
+        id = matches[0].id;
+      }
+      text = await lastAssistantText(id, signal);
+    } catch (err) {
+      logger.warn('Session read failed', { error: requestError(err) });
+      return `⚠️ 读不到这个会话：${requestError(err)}\n它可能不在这台 OpenCode 上；M1/M3 的会话要在它们自己的机器上读`;
+    }
+    if (!text) return '会话里没有可返回的助手文本';
+    if (text.length <= MAX_SESSION_CHARS) return text;
+    return `${text.slice(0, MAX_SESSION_CHARS)}\n\n（已截断，原文 ${text.length} 字）`;
+  },
 
   /**
    * A correction for a running task: more input to the task's session, which takes it in at its next step. The

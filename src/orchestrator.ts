@@ -283,11 +283,27 @@ function cleanFiles(text: string): string[] {
   return [...new Set(paths.filter((path) => path && path !== '-' && path !== '无'))];
 }
 
-/** Split the orchestrator's answer into the WeChat reply, new memory facts, a one-line summary, the handoff and the files. */
-export function parseOrchestratorOutput(text: string): OrchestratorOutput {
-  // Drafts may quote the marker; the last one starts the answer. No marker: the whole text is the reply.
-  const replyAt = text.lastIndexOf(REPLY_MARKER);
-  const body = replyAt === -1 ? text : text.slice(replyAt + REPLY_MARKER.length);
+/** A DeepSeek tool-call tag, as "<｜｜DSML｜｜invoke name=…>" or "</｜｜DSML｜｜ parameter>". */
+const DSML_TAG = /<\/?[｜|]{1,2}DSML[｜|]{1,2}[^>]*>/g;
+/** A whole tool call, from its opening tag to the closing tag of the same name. */
+const DSML_BLOCK = /<[｜|]{1,2}DSML[｜|]{1,2}\s*([\w-]+)[^>]*>[\s\S]*?<\/[｜|]{1,2}DSML[｜|]{1,2}\s*\1\s*>/g;
+const ANY_MARKER = /<<<WECHAT_[A-Z]+>>>/g;
+
+/**
+ * The text without the DeepSeek tool-call markup that can leak into an answer: whole calls first, then any tag
+ * left on its own, then the blank lines they leave behind. Text without that markup only comes back trimmed.
+ */
+export function stripToolMarkup(text: string): string {
+  if (!text.match(DSML_TAG)) return text.trim();
+  return text
+    .replace(DSML_BLOCK, '')
+    .replace(DSML_TAG, '')
+    .replace(/(?:[ \t]*\n){3,}/g, '\n\n')
+    .trim();
+}
+
+/** Where the sections of an answer start: the first memory and summary markers, the last handoff marker and the files marker after them. */
+function sectionStarts(body: string) {
   const memoryAt = body.indexOf(MEMORY_MARKER);
   const summaryAt = body.indexOf(SUMMARY_MARKER);
   // The handoff ends the required sections, so its last marker counts: one the reply quotes cannot cut the reply short.
@@ -295,21 +311,65 @@ export function parseOrchestratorOutput(text: string): OrchestratorOutput {
   // The files come after every other section and run to the end; a files marker before one of them is quoted.
   const lastFilesAt = body.lastIndexOf(FILES_MARKER);
   const filesAt = lastFilesAt > Math.max(memoryAt, summaryAt, handoffAt) ? lastFilesAt : -1;
+  return { memoryAt, summaryAt, handoffAt, filesAt };
+}
 
-  const reply = section(body, 0, memoryAt, summaryAt, handoffAt, filesAt).trim();
+/** The reply part of an answer body: its text up to the first section marker. */
+function replyOf(body: string): string {
+  const { memoryAt, summaryAt, handoffAt, filesAt } = sectionStarts(body);
+  return section(body, 0, memoryAt, summaryAt, handoffAt, filesAt);
+}
+
+/** Where each reply marker starts, first to last. */
+function replyMarkers(text: string): number[] {
+  const at: number[] = [];
+  for (let i = text.indexOf(REPLY_MARKER); i !== -1; i = text.indexOf(REPLY_MARKER, i + REPLY_MARKER.length)) at.push(i);
+  return at;
+}
+
+/**
+ * Split the orchestrator's answer into the WeChat reply, new memory facts, a one-line summary, the handoff and the
+ * files. The sections follow the last reply marker, so a marker quoted in a draft cannot cut the answer. The reply
+ * is the last reply marker's text that is not empty, each running to the next marker; when every one is empty, the
+ * model wrote its answer before the markers, and the text before the first one is the reply. No marker: the whole
+ * text is the reply. DeepSeek tool-call markup is stripped from every field but the files.
+ */
+export function parseOrchestratorOutput(text: string): OrchestratorOutput {
+  const stripped = new Set<string>();
+  const clean = (field: string, raw: string): string => {
+    const out = stripToolMarkup(raw);
+    if (out !== raw.trim()) stripped.add(field);
+    return out;
+  };
+
+  const markers = replyMarkers(text);
+  const body = markers.length ? text.slice(markers.at(-1)! + REPLY_MARKER.length) : text;
+  const { memoryAt, summaryAt, handoffAt, filesAt } = sectionStarts(body);
+
+  let reply = '';
+  for (let i = markers.length - 1; i >= 0 && !reply; i--) {
+    reply = clean('reply', replyOf(text.slice(markers[i] + REPLY_MARKER.length, markers[i + 1] ?? text.length)));
+  }
+  if (!markers.length) reply = clean('reply', replyOf(text));
+  else if (!reply) {
+    reply = clean('reply', text.slice(0, markers[0]).replace(ANY_MARKER, ''));
+    if (reply) logger.warn('Reply markers misplaced; using the text before the marker', { length: reply.length });
+  }
+
   const memory =
     memoryAt === -1
       ? []
-      : trimmedLines(section(body, memoryAt + MEMORY_MARKER.length, summaryAt, handoffAt, filesAt))
+      : trimmedLines(clean('memory', section(body, memoryAt + MEMORY_MARKER.length, summaryAt, handoffAt, filesAt)))
           .map((line) => /^[-*]\s+(.+)$/.exec(line)?.[1].trim() ?? '')
           .filter(Boolean);
   const summary =
     summaryAt === -1
       ? ''
-      : (trimmedLines(section(body, summaryAt + SUMMARY_MARKER.length, memoryAt, handoffAt, filesAt)).find(Boolean) ?? '');
+      : (trimmedLines(clean('summary', section(body, summaryAt + SUMMARY_MARKER.length, memoryAt, handoffAt, filesAt))).find(Boolean) ?? '');
   const handoff =
-    handoffAt === -1 ? '' : cleanHandoff(section(body, handoffAt + HANDOFF_MARKER.length, memoryAt, summaryAt, filesAt));
+    handoffAt === -1 ? '' : cleanHandoff(clean('handoff', section(body, handoffAt + HANDOFF_MARKER.length, memoryAt, summaryAt, filesAt)));
   const files = filesAt === -1 ? [] : cleanFiles(body.slice(filesAt + FILES_MARKER.length));
+  if (stripped.size) logger.warn('Stripped tool markup', { fields: [...stripped] });
   return { reply, memory, summary: clip(summary || reply, MAX_SUMMARY_CHARS), handoff, files };
 }
 
@@ -367,6 +427,8 @@ const PROGRESS_EVERY_MS = Number(process.env.OWB_PROGRESS_EVERY_MS) || 300_000;
 const PROGRESS_MAX = Number(process.env.OWB_PROGRESS_MAX) || 4;
 /** A note names this many of the running tools at most. */
 const PROGRESS_NOTE_TOOLS = 3;
+/** Prompt tokens, cache included, from which a task counts as costly: logged, and flagged in /tasks. Read on use. */
+export const taskWarnTokens = (): number => Number(process.env.OWB_TASK_WARN_TOKENS) || 500_000;
 
 /** The mode is read per request so /permission applies to a task that is already running. */
 async function decidePermission(request: PermissionRequest, io: TaskIO): Promise<PermissionDecision> {
@@ -531,6 +593,11 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
   } catch (err) {
     // openCodeQuery reports its own failures; this covers preparing the prompt.
     result = { text: '', sessionId: '', error: err instanceof Error ? err.message : String(err) };
+  }
+
+  const threshold = taskWarnTokens();
+  if (usage && usage.input >= threshold) {
+    logger.warn('Task input tokens high', { taskId: task.id, seq: task.seq, input: usage.input, threshold });
   }
 
   // Queued ahead of the outcome, so the user reads the notice before the answer.

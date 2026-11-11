@@ -329,6 +329,45 @@ export async function listChildSessions(
 }
 
 /**
+ * Sessions on this server whose title contains query, case-insensitively, as the list pages give them. The list
+ * is read 100 sessions a page through its cursor, at most limit sessions in all; no messages are fetched.
+ */
+export async function listSessions(
+  query: string,
+  limit = 500,
+  signal?: AbortSignal,
+): Promise<Array<{ id: string; title: string; time?: number }>> {
+  const needle = query.toLowerCase();
+  const found: Array<{ id: string; title: string; time?: number }> = [];
+  let cursor: string | undefined;
+  for (let seen = 0; seen < limit; ) {
+    const params = new URLSearchParams({ limit: "100" });
+    if (cursor) params.set("cursor", cursor);
+    const out = await api<{ data: any[]; cursor?: { next?: string } }>(`/api/session?${params.toString()}`, { signal });
+    const page = (out.data || []).slice(0, limit - seen);
+    seen += page.length;
+    for (const s of page) {
+      if (!String(s.title ?? "").toLowerCase().includes(needle)) continue;
+      const time = s.time?.updated ?? s.time?.created;
+      found.push({ id: s.id, title: s.title || s.id, time: typeof time === "number" ? time : undefined });
+    }
+    cursor = out.cursor?.next;
+    if (!cursor || !page.length) break;
+  }
+  return found;
+}
+
+/** The text of the session's newest assistant message that has any, as a turn ends with; "" when none has. */
+export async function lastAssistantText(sessionId: string, signal?: AbortSignal): Promise<string> {
+  const out = await api<{ data: any[] }>(`/api/session/${encodeURIComponent(sessionId)}/message?limit=100&order=desc`, { signal });
+  for (const message of (out.data || []).filter((m) => m?.type === "assistant")) {
+    const text = extractAssistantText(message);
+    if (text) return text;
+  }
+  return "";
+}
+
+/**
  * What a session and its subagent sessions used. OpenCode counts a session's own model calls only, and the
  * orchestrator's subagents start none of their own, so the root and its children are the whole turn.
  * Best effort: undefined when OpenCode cannot say.

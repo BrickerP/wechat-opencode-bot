@@ -546,6 +546,10 @@ function progressSignature(messages: any[]): string {
   );
 }
 
+/** A step that calls a tool says what it does on the way; only a step that calls none can be the answer. */
+const callsTool = (message: any): boolean =>
+  Array.isArray(message?.content) && message.content.some((part: any) => part?.type === "tool");
+
 /**
  * Hands onAssistantText the text of each root step that calls a tool, oldest first, once the model's response for
  * that step has streamed in full. A step is looked at once, by message id; a failed one is left for OpenCode's
@@ -557,8 +561,7 @@ function announceSteps(sessionId: string, assistants: any[], announced: Set<stri
     if (typeof id !== "string" || announced.has(id) || message.error) continue;
     if (!message.time?.streamed && !message.time?.completed) continue;
     announced.add(id);
-    const content = Array.isArray(message.content) ? message.content : [];
-    if (!content.some((part: any) => part?.type === "tool")) continue;
+    if (!callsTool(message)) continue;
     const text = extractAssistantText(message);
     if (!text) continue;
     // Checked when the callback is due, not when it is queued: an abort in between drops the step.
@@ -572,6 +575,8 @@ function announceSteps(sessionId: string, assistants: any[], announced: Set<stri
  * Poll until the turn goes idle, answering permission requests on the way and announcing the root steps that
  * call a tool (announceSteps). Two watchdogs give up on a silent upstream model: no first output within
  * FIRST_RESPONSE_TIMEOUT_MS, or no visible change in the session or its subagent sessions for STALL_TIMEOUT_MS.
+ * The answer is the text of the last step that says or does anything, and only if that step calls no tool: a turn
+ * that ends on a tool step, or on nothing at all, fails rather than pass what was said on the way off as the answer.
  */
 async function waitForTurn(sessionId: string, since: number, options: QueryOptions): Promise<string> {
   const startedAt = Date.now();
@@ -638,11 +643,12 @@ async function waitForTurn(sessionId: string, since: number, options: QueryOptio
         throw new TurnInterrupted("OpenCode 执行被中断");
       }
 
-      for (let i = assistants.length - 1; i >= 0; i--) {
+      // Back from the newest step over those that call no tool; one that only reasoned, or wrote nothing, is passed over.
+      for (let i = assistants.length - 1; i >= 0 && !callsTool(assistants[i]); i--) {
         const text = extractAssistantText(assistants[i]);
         if (text) return text;
       }
-      return "";
+      throw new TurnFailed("OpenCode 执行结束，但模型没有给出最终回复");
     }
 
     const childMessages = (

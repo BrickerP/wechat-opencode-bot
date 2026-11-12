@@ -1,6 +1,6 @@
 # Prompt quality rubric
 
-How to judge what the agents in [config/agents/](../config/agents/) produce, with synthetic cases to read a prompt change against. Checking the prompts' wording against these cases does not prove that a model behaves this way: that takes a separate evaluation that runs the same cases on each model.
+How to judge what the agents in [config/agents/](../config/agents/) produce, with synthetic cases to read a prompt change against. Checking the prompts' wording against these cases does not prove that a model behaves this way: that takes a separate evaluation that runs the same cases on each model, every case isolated as [MODEL-QUALITY.md](MODEL-QUALITY.md#evaluation-not-run) describes.
 
 ## Why
 
@@ -14,8 +14,9 @@ None of this shows that one model is better than another.
 
 ## What the prompts and the bridge agree on
 
-- A non-final orchestrator step, one that calls `subagent`, may carry one short sentence for the user. The bridge forwards the text of a finished root step that called a tool, once.
-- The final step calls no tool and starts with `<<<WECHAT_REPLY>>>`, then `<<<WECHAT_MEMORY>>>`, `<<<WECHAT_SUMMARY>>>`, `<<<WECHAT_HANDOFF>>>` and, only when sending files, `<<<WECHAT_FILES>>>`. `parseOrchestratorOutput` in `src/orchestrator.ts` reads it.
+- A non-final orchestrator step, one that calls `subagent`, may carry one short sentence for the user. It is optional commentary: the bridge forwards the text of a finished root step that called a tool, best-effort, at most 3 per task and 800 characters each, never text with a marker or tool-call markup, and outside the outbox. No case needs it, and the answer is never scored from it.
+- The bridge's own progress notes (elapsed time, running tools, subagent count) are off unless `OWB_PROGRESS_ENABLED=true`. They come from the bridge, not the model, so they neither earn nor lose points.
+- The final step calls no tool and starts with `<<<WECHAT_REPLY>>>`, then `<<<WECHAT_MEMORY>>>`, `<<<WECHAT_SUMMARY>>>`, `<<<WECHAT_HANDOFF>>>` and, only when sending files, `<<<WECHAT_FILES>>>`. `parseOrchestratorOutput` in `src/orchestrator.ts` reads it. It is the only answer, sent once through the outbox; a turn that ends on a step that calls a tool fails with `OpenCode 执行结束，但模型没有给出最终回复`.
 - The parser uses the text before the first reply marker only when every reply section is empty, so whatever is written before an empty reply section becomes the answer.
 - The bridge keeps at most 5 memory bullets per task, 300 characters each, cuts the summary at 100 and the handoff at 1200 characters, and sends at most 3 files. The prompts ask for a summary under 80 and a handoff under 800 characters.
 
@@ -33,9 +34,9 @@ Score each dimension 0 (fails), 1 (partly) or 2 (meets).
 
 Any of these fails the case:
 
-- Deployed, verified, done or tests pass without evidence behind it.
+- A positive claim without evidence behind it: deployed, 已部署, 部署成功, 已上线, verified, done, tests pass or 测试通过. A truthful negative, such as 尚未确认部署 or 未确认是否上线, is not such a claim: judge what the reply asserts, not the words it uses.
 - An answer from a machine or project other than the one the user meant.
-- An empty reply, or the answer written before the reply marker.
+- An empty reply, no final step, or the answer written before the reply marker.
 - A marker string or tool-call markup inside the reply.
 - A secret, token or one-off result in memory or the handoff.
 
@@ -66,7 +67,7 @@ Input: `总结一下我今天的工作`, time 2026-11-12 18:30. One repository h
 
 Before: runs `git log --all` in every worktree, so each commit shows up three times; spends its steps on a zsh loop over the worktree paths; replies "v1.4.0 已上线".
 
-After: progress text `我先核对今天各仓库的提交和标签，再按工作主题整理。`, then one `wechat-explore` brief: each repository once, not once per worktree; 2026-11-12 00:00 to now, Asia/Shanghai, by author and by committer date; branch, merge and tag for each item, with hashes; what the scan did not cover.
+After: optionally the progress text `我先核对今天各仓库的提交和标签，再按工作主题整理。`, then one `wechat-explore` brief: each repository once, not once per worktree; 2026-11-12 00:00 to now, Asia/Shanghai, by author and by committer date; branch, merge and tag for each item, with hashes; what the scan did not cover.
 
     <<<WECHAT_REPLY>>>
     今天（11-12）git 里能看到的工作：
@@ -125,7 +126,7 @@ Input: `v1.4.0 上线了吗？`. The first report: `current` points to the v1.4.
 
 Before: picks one source and says "已上线" or "没上线", or pastes both without saying which holds.
 
-After: progress text `部署记录和当前版本对不上，我再核对一下正在运行的版本。`, then one targeted `wechat-explore` check: which release the running process started from, and when. If that settles it:
+After: optionally the progress text `部署记录和当前版本对不上，我再核对一下正在运行的版本。`, then one targeted `wechat-explore` check: which release the running process started from, and when. If that settles it:
 
     <<<WECHAT_REPLY>>>
     v1.4.0 已经上线：current 指向 v1.4.0，正在运行的进程是 11-12 18:02 从这个版本启动的。部署日志最后一条还是 v1.3.2，这次切换没有记进日志，原因还没查。
@@ -162,4 +163,4 @@ Logs work the same way: quote the few lines that matter, without marker strings,
 ## Using the rubric
 
 - After changing a prompt, walk each case through the new text: name the line that produces the "after" behaviour, and any line that still allows the "before".
-- Reading shows what the prompt asks for, not what a model does. Live quality needs the same inputs run on each model and scored with this rubric, in a separate evaluation.
+- Reading shows what the prompt asks for, not what a model does. Live quality needs the same inputs run on each model and scored with this rubric, in a separate evaluation: each case in a fresh synthetic fixture with its own temporary home and data directory, the same seed, no WeChat sends and no live memory, as [MODEL-QUALITY.md](MODEL-QUALITY.md#evaluation-not-run) describes.

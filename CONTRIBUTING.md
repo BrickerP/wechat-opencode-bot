@@ -19,6 +19,8 @@ npm test
 
 `npm test` runs the compiled tests in `dist/tests/`, so build first. To run one file: `npm run build && node --test dist/tests/bots.test.js`. CI runs the same four steps on Node 26, plus a gitleaks scan of the whole history.
 
+When the four steps pass, CI also uploads `dist/` with a `BUILD_COMMIT` file as the artifact `wechat-opencode-bot-build-<commit>`. A release packages the artifact of a push to `main` and compiles nothing; see [docs/DEPLOY.md](docs/DEPLOY.md#release).
+
 ## Where things are
 
 - `src/`: the daemon. `main.ts` holds the CLI and the inbound messages, `orchestrator.ts` runs a task, `tests/` holds the tests.
@@ -43,7 +45,7 @@ Leave the model change from step 2 out of your pull request unless the pull requ
 1. Edit the prompt in `config/agents/`, never the links in `~/.config/opencode/agents/`.
 2. Try it. In a checkout without `current/`, `scripts/install-agents.sh --apply` links the repo's `config/agents/`, so after `opencode reload` a `--simulate` run uses your edit.
 3. Keep the output markers. `src/orchestrator.ts` parses `<<<WECHAT_REPLY>>>` and the markers after it, so changing a marker takes a code change and a test in the same pull request.
-4. On an always-on bot, ship it as a release: `scripts/release.sh vX.Y.Z`, then `scripts/deploy.sh --apply vX.Y.Z`. Prompts and code switch together, and the deploy reloads OpenCode when the prompts changed. After the first deploy, rerun `scripts/install-agents.sh --apply` so the links follow `current/`.
+4. On an always-on bot, ship it as a release once it is on `main` and CI has passed for that commit: download the commit's artifact and run `scripts/release.sh vX.Y.Z <artifact-dir>`, then `scripts/deploy.sh --apply vX.Y.Z`, as [docs/DEPLOY.md](docs/DEPLOY.md#release) shows. `release.sh` packages CI's `dist/` and compiles nothing. Prompts and code switch together, and the deploy reloads OpenCode when the prompts changed. After the first deploy, rerun `scripts/install-agents.sh --apply` so the links follow `current/`.
 
 [config/agents/README.md](config/agents/README.md) explains how the prompts are deployed and rolled back.
 

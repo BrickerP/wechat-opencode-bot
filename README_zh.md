@@ -47,9 +47,9 @@ flowchart LR
 2. `y`/`n` 回答正在等待的权限请求，`/` 命令直接得到回复。其余消息都变成任务：守护进程下载第一张图片，把文字分派给一个 bot 和一个项目，再把任务存进 `state.db`。前面还有任务时，它会回复 `⏳ 已排队：任务 #N（前面还有 X 个任务）` 和预计等待时间。
 3. 通道的 worker 取出最早排队的任务，在项目根目录（没有项目时在聊天的工作目录）新开一个 OpenCode 会话。OpenCode 会加载该目录的 `AGENTS.md` 和 `opencode.json`，其中的规则优先于记忆和最近任务。
 4. 会话从不复用，所以上下文由 prompt 携带：时间、附件、bot 的角色、项目、聊天记忆，以及最近 8 个任务（最近 2 个附回复摘录）。
-5. orchestrator 把工作交给 `wechat-explore` 或 `wechat-general`，同时最多 3 个，每个任务最多 6 个。权限请求发到微信；长任务最多发 4 条进度通知。
+5. orchestrator 把工作交给 `wechat-explore` 或 `wechat-general`，同时最多 3 个，每个任务最多 6 个。权限请求发到微信。orchestrator 在调用子 agent 前写的一句简短说明可以作为过程说明发到聊天；守护进程自己的进度通知（已运行时长、正在运行的工具、子 agent 数量）默认关闭。
 6. orchestrator 的输出以 `<<<WECHAT_REPLY>>>`、`<<<WECHAT_MEMORY>>>`、`<<<WECHAT_SUMMARY>>>` 收尾，可选带 `<<<WECHAT_HANDOFF>>>` 和 `<<<WECHAT_FILES>>>` 段。守护进程保留回复、把最多 5 条带日期的事实写进记忆，保存摘要、交接、token 用量和文件路径，并在文字之后发送文件。
-7. 2 小时内的下一个任务会收到上一个任务的 handoff（文件、命令、未完成项、下一步），所以“继续”不必只靠摘要重新摸索。结果加上 bot 的回复前缀后按 2048 字分段进入待发队列；失败显示 `⚠️ 任务 #N 失败：…`，重启中断显示 `⏹ 任务 #N 已中断…`。
+7. 2 小时内的下一个任务会收到上一个任务的 handoff（文件、命令、未完成项、下一步），所以“继续”不必只靠摘要重新摸索。结果加上 bot 的回复前缀后只进入待发队列一次，按 2048 字分段；失败显示 `⚠️ 任务 #N 失败：…`，重启中断显示 `⏹ 任务 #N 已中断…`。
 
 ### 路由
 
@@ -72,6 +72,7 @@ flowchart LR
 - 每个账号有一条 `write` 通道和一条 `read` 通道，各自同时只跑一个任务。每条通道按到达顺序执行任务，任务从 `state.db` 原子领取。
 - 只读 bot 指 `subagent` 为 `wechat-explore` 的非默认 bot，比如 `research`。它的任务走 read 通道，运行在 `wechat-orchestrator-read` 上；后者只能派 `wechat-explore`，所以能和写任务并行而不改文件。只读是 OpenCode 的权限规则，不是沙箱：`wechat-explore` 仍能执行 shell 命令。
 - 其余任务（包括 `@all`）都走 write 通道。排队超过 24 小时的任务会过期。重启会中断正在运行的任务及其会话；排队中的任务照常执行。
+- 发给同一个聊天的回复逐条发出，不论来自哪条通道。运行中任务的过程说明和进度通知（默认关闭）也要排队；任务结束时仍在等待的会被丢弃，所以它们不会晚于任务结果到达。
 
 ### 模型路由与容错
 
@@ -80,7 +81,8 @@ flowchart LR
 - 上游失败会在备用模型上重试一次：设置了 `OPENCODE_FALLBACK_MODEL` 就用它，否则用内置链路里第一个属于其他 provider（网关）的模型。上游失败包括 429 或额度不足、5xx 或过载、超时、连接错误、鉴权以外的 `provider.*` 错误，以及模型首次输出前沉默 120 秒、或两次进展之间沉默 180 秒。重试的 prompt 会提醒第一次尝试可能已改过文件；你只会看到最终结果。
 - 不重试：鉴权、权限、4xx 和未知错误，本地服务的错误，以及单次尝试 30 分钟的上限。
 - 每个网关有一个熔断器，状态只在内存里。连续 3 次上游失败会打开它：新任务直接用备用模型，聊天收到一条通知。10 分钟后下一个任务会再试这个网关；成功则关闭熔断，失败则等待时间翻倍，最长 1 小时。另外，30 分钟内 3 个任务失败会发一条 `🚨` 告警，之后 30 分钟内不再发。
-- 任务运行满 1 分钟时发 `⏳ 任务 #N 运行中…`，之后在派出新子 agent 时或每 5 分钟再发，间隔至少 90 秒，每个任务最多 4 条。
+- 过程说明：orchestrator 在调用子 agent 前写的那句话，会在该步骤的响应完成后加上 bot 的回复前缀发到聊天。每个任务最多 3 条（含重试），每条截断到 800 字；含分段标记或工具调用标记的文字、以及重试时重复的文字不会发送。它尽力而为：不进待发队列，也从不重试。最终回复只经待发队列发送一次。
+- 进度通知属于诊断信息，默认关闭。设置 `OWB_PROGRESS_ENABLED=true` 后，任务运行 20 秒时发 `⏳ 任务 #N 运行中…`，附已运行时长、正在运行的工具和已派出的子 agent 数；之后在派出新子 agent 时或每 5 分钟再发，间隔至少 90 秒，每个任务最多 4 条。即使开启，`OWB_PROGRESS_MAX=0` 也会关掉它们。
 - 每个结果在发送前先存入待发队列（`pending_notices`），按从旧到新的顺序发出。发送失败后依次等待 30 秒、2 分钟、10 分钟、1 小时，等待结束后在你的下一条消息或某个任务结束时重试。
 
 ### 状态与保留
@@ -142,7 +144,9 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 | `node dist/main.js --tasks [n]` | 最近 n 个任务 |
 | `node dist/main.js --notify "<text>"` | 给聊天发一条消息。退出码 2（`no_context_token`）或 3（`send_failed`）表示它留在待发队列里 |
 
-每次改动后都要 `npm run build`。常驻运行时，`scripts/release.sh` 和 `scripts/deploy.sh` 把构建安装为 `releases/<tag>`，并让 `current` 符号链接指向其中一个；launchd 经 `run-bot.sh` 运行 `node current/dist/main.js --daemon`。`run-bot.sh` 和 `run-server.sh` 会 `cd` 到写死的目录，先改好它们，再按 [docs/DEPLOY.md](docs/DEPLOY.md) 操作。部署之后重新执行 `scripts/install-agents.sh --apply`，让 agent 链接跟随 `current/`。
+在源码目录里，每次改动后都要先 `npm run build`，再使用这些命令。
+
+常驻运行的 bot 改用 release。CI 构建每次推送到 `main` 的提交，把 `dist/` 和记录提交哈希的 `BUILD_COMMIT` 文件作为 artifact `wechat-opencode-bot-build-<commit>` 上传。`scripts/release.sh <tag> <artifact-dir>` 把已提交的 HEAD 和这个 artifact 的 `dist/` 打包，只在 `BUILD_COMMIT` 等于 HEAD 的哈希时才打包，不编译也不跑测试。artifact 要取自该提交推送到 `main` 后成功的那次 CI 运行：pull request 的运行构建的是 GitHub 临时生成的合并提交，所以 `release.sh` 会拒绝它的 artifact。`scripts/deploy.sh` 把 release 安装为 `releases/<tag>`，并让 `current` 符号链接指向它；launchd 经 `run-bot.sh` 运行 `node current/dist/main.js --daemon`。`run-bot.sh` 和 `run-server.sh` 会 `cd` 到写死的目录，先改好它们，再按 [docs/DEPLOY.md](docs/DEPLOY.md#release) 操作。部署之后重新执行 `scripts/install-agents.sh --apply`，让 agent 链接跟随 `current/`。
 
 ### 命令
 
@@ -189,7 +193,7 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 
 ### 环境变量
 
-每个 `node dist/main.js` 命令都会加载数据目录里的 `env`，环境里已有的变量优先。`OWB_DATA_DIR` 必须直接在环境里设置。数值型的 `OWB_*` 和 `*_TIMEOUT_MS` 变量取 `0` 或非数字时使用默认值。
+每个 `node dist/main.js` 命令都会加载数据目录里的 `env`，环境里已有的变量优先。`OWB_DATA_DIR` 必须直接在环境里设置。数值型的 `OWB_*` 和 `*_TIMEOUT_MS` 变量取 `0` 或非数字时使用默认值；`OWB_PROGRESS_MAX` 例外，取 `0` 时不发任何进度通知。
 
 | 变量 | 默认值 | 含义 |
 |---|---|---|
@@ -205,7 +209,8 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 | `OWB_ALERT_WEBHOOK` | 空 | watchdog 的每条告警也以纯文本 POST 到这个 URL，例如 ntfy 主题或 Slack 代理 |
 | `OWB_ALERT_PING_URL` | 空 | watchdog 每次运行结果健康时 GET 这个 URL，供外部的 dead-man's switch（如 healthchecks.io）在收不到 ping 时告警 |
 | `OWB_SESSION_TTL_DAYS`、`OWB_SESSION_KEEP` | `7`、`300` | 会话保留：天数，以及最近多少个已完成任务保留它们的全部会话 |
-| `OWB_PROGRESS_FIRST_MS`、`OWB_PROGRESS_MIN_GAP_MS`、`OWB_PROGRESS_EVERY_MS`、`OWB_PROGRESS_MAX` | `20000`、`90000`、`300000`、`4` | 进度通知：首条时间、最小间隔、常规间隔、每个任务的上限 |
+| `OWB_PROGRESS_ENABLED` | 空 | 取 `true` 时开启诊断用的进度通知，其他值都不开启。过程说明不受它影响 |
+| `OWB_PROGRESS_FIRST_MS`、`OWB_PROGRESS_MIN_GAP_MS`、`OWB_PROGRESS_EVERY_MS`、`OWB_PROGRESS_MAX` | `20000`、`90000`、`300000`、`4` | 进度通知（需 `OWB_PROGRESS_ENABLED=true`）：首条时间、最小间隔、常规间隔、每个任务的上限；`OWB_PROGRESS_MAX=0` 时一条都不发 |
 | `OWB_TASK_WARN_TOKENS` | `500000` | 输入 token（含缓存）达到这个数的任务会记一条警告日志，并在 `/tasks` 里标 ⚠️ |
 | `OWB_ASR_URL`、`OWB_ASR_MODEL`、`OWB_ASR_API_KEY` | 空、`whisper-1`、空 | 语音没有微信自带转写时使用的 OpenAI 兼容转写接口；SILK 会先解码为 WAV |
 | `OWB_DATA_DIR` | `~/.wechat-opencode-bot` | 数据目录 |

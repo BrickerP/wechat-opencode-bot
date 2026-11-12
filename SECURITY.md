@@ -42,4 +42,4 @@ Include the commit you tested, what an attacker needs (an allowlisted WeChat acc
 
 ## Supported versions
 
-Only the latest release gets fixes. There are no published releases yet, so in practice that is the latest commit on `main`, or a release built from it with `scripts/release.sh`. Fixes are not backported to older commits.
+Only the latest release gets fixes. There are no published releases yet, so in practice that is the latest commit on `main`, or a release packaged from its CI artifact with `scripts/release.sh`. Fixes are not backported to older commits.

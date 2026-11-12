@@ -1,6 +1,7 @@
 // The work-activity collector, run as the CLI it is on git fixtures in temp directories: a repository and its linked
 // worktrees are one entry, the day is [start, end) in committer time, --author matches exactly, dirty worktrees are
 // reported apart from commits, what cannot be read leaves a warning, and nothing local makes deploymentVerified true.
+// Every task's prompt gives the orchestrator the collector's path, as collector: in <context>.
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
 import {
@@ -66,6 +67,13 @@ const ENV: NodeJS.ProcessEnv = {
   LC_ALL: 'C',
   TZ: 'America/Los_Angeles',
 };
+
+// The prompt test's config and logs follow HOME, its state, memory and registries OWB_DATA_DIR: keep them away from the
+// real bot. ENV above is already built, so the collector's environment stays as it is.
+process.env.HOME = tmp;
+process.env.OWB_DATA_DIR = join(tmp, 'data');
+const { composePrompt, WORK_ACTIVITY_COLLECTOR } = await import('../orchestrator.js');
+const { openStateDb } = await import('../tasks/db.js');
 
 const DATE = '2026-11-12';
 /** Unix seconds of an ISO time. */
@@ -364,4 +372,15 @@ test('a repository over the commit limit is cut, warned about and marked truncat
   assert.equal(activity.truncated, true);
   const warning = `kept ${COMMIT_LIMIT} of ${COMMIT_LIMIT + 1} matching commits in ${join(busy, '.git')}`;
   assert.ok(activity.warnings.includes(warning), activity.warnings.join('\n'));
+});
+
+test("every task prompt gives this collector's absolute path in <context>, as collector:", () => {
+  // dist/orchestrator.js resolves ../scripts/ as this test resolves ../../scripts/: the repository's copy here, and
+  // the copy that release.sh puts beside dist/ in an installed release.
+  assert.equal(WORK_ACTIVITY_COLLECTOR, SCRIPT);
+  assert.ok(lstatSync(WORK_ACTIVITY_COLLECTOR).isFile());
+  const db = openStateDb(join(tmp, 'state.db'));
+  const prompt = composePrompt(db, db.createTask('acc', '总结今天的工作').task, tmp, { paths: [], carried: false });
+  const context = /<context>\n([\s\S]*?)\n<\/context>/.exec(prompt)?.[1] ?? '';
+  assert.ok(context.split('\n').includes(`collector: ${SCRIPT}`), prompt);
 });

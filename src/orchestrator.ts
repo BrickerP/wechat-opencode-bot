@@ -1,5 +1,6 @@
 import { existsSync, lstatSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync, type Stats } from 'node:fs';
 import { extname, isAbsolute, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { maybeAlertFailures } from './alerts.js';
 import { defaultBot, loadBots, resolveBot, type Bot } from './bots.js';
 import { loadConfig } from './config.js';
@@ -150,6 +151,11 @@ const ALL_GUIDANCE =
   'The user addressed everyone (@all): give independent parts to the specialists, at most 3 subagents at once, then merge them into one reply.';
 const SHARED_MEMORY_GUIDANCE =
   'Your WECHAT_MEMORY bullets go to the shared memory that every persona reads: keep cross-persona user preferences there. Never store repo instructions.';
+/**
+ * The work-activity collector beside this build: scripts/ next to dist/, in a checkout and in an installed release.
+ * <context> gives its absolute path, since a task's session opens in the user's workspace, not here.
+ */
+export const WORK_ACTIVITY_COLLECTOR = fileURLToPath(new URL('../scripts/collect-work-activity.mjs', import.meta.url));
 
 export const STATUS_LABEL: Record<TaskStatus, string> = {
   queued: '排队中',
@@ -216,6 +222,7 @@ export function composePrompt(db: StateDb, task: TaskRow, workspace: string, att
   const bots = loadBots();
   const { bot, all } = resolveBot(task.bot_id, bots);
   const context = [`workspace: ${workspace}`, `time: ${formatTime(Date.now())} (Asia/Shanghai)`, `task: #${task.seq}`];
+  if (existsSync(WORK_ACTIVITY_COLLECTOR)) context.push(`collector: ${WORK_ACTIVITY_COLLECTOR}`);
   if (retry) {
     context.push('retry: an earlier attempt at this task stopped midway and may have made changes; check the current state before redoing anything that writes');
   }

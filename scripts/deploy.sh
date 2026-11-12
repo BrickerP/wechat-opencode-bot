@@ -177,7 +177,7 @@ elif [ -f "$TARBALL" ]; then
   fi
   echo "release   $TAG, $TARBALL (checksum ok)"
 else
-  die "no release $TAG; build it with scripts/release.sh $TAG"
+  die "no release $TAG; download CI's artifact of the commit and run scripts/release.sh $TAG <artifact-dir>"
 fi
 release_info() { if [ -d "$DEST" ]; then cat "$DEST/RELEASE"; else tar -xOzf "$TARBALL" RELEASE; fi; }
 echo "commit    $(release_info 2>/dev/null | sed -n 's/^commit=//p')"

@@ -146,9 +146,21 @@ export function createNotifier(db: StateDb, api: WeChatApi, sender: Sender) {
     }
   }
 
-  /** Daemon IO: outcomes go out through the outbox, then a done task's files; permission asks wait for the user's y/n. */
+  /**
+   * Daemon IO: outcomes go out through the outbox, then a done task's files; commentary and progress notes are
+   * best-effort, queued behind what this account is already sending; permission asks wait for the user's y/n.
+   */
   function taskIO(task: TaskRow, broker: PermissionBroker): TaskIO {
     const accountId = task.account_id;
+    /**
+     * A note on the running task, dropped if the task has finished by the time its turn comes. The outcome goes out
+     * on the same per-account chain, so a note never follows it.
+     */
+    const note = (text: string): Promise<boolean> =>
+      serial(accountId, async () => {
+        if (db.getTask(task.id)?.status !== 'running') return false;
+        return sendChunks(accountId, splitMessage(text).map((chunk) => ({ text: chunk })));
+      });
     return {
       async deliver(finished) {
         const sent = await flush(accountId);
@@ -161,9 +173,12 @@ export function createNotifier(db: StateDb, api: WeChatApi, sender: Sender) {
         }
         await sendFiles(accountId, finished.id, files);
       },
-      // Progress notes are best-effort replies: one that fails to send is not worth a retry.
+      // Commentary and progress notes are best-effort: one that fails to send is not worth a retry.
+      async commentary(text) {
+        await note(text);
+      },
       async progress(text) {
-        await reply(accountId, text);
+        await note(text);
       },
       async onPermission(request) {
         const label = taskLabel(task);

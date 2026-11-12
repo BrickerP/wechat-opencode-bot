@@ -1,6 +1,6 @@
 # Deploy
 
-The bot runs from a release: a tarball built from one commit and unpacked in `releases/<tag>/`. The `current` symlink points at the release that runs, and launchd starts the bot through the repo's `run-bot.sh`. After the [one-time migration](#one-time-migration), `run-bot.sh` starts `current/dist/main.js`, so a deploy or a rollback is a symlink switch plus a restart.
+The bot runs from a release: a tarball of one commit and the `dist/` that CI built from it, unpacked in `releases/<tag>/`. The `current` symlink points at the release that runs, and launchd starts the bot through the repo's `run-bot.sh`. After the [one-time migration](#one-time-migration), `run-bot.sh` starts `current/dist/main.js`, so a deploy or a rollback is a symlink switch plus a restart.
 
 `deploy.sh`, `rollback.sh` and the `install-*.sh` scripts are dry runs by default: they print what they would do. Add `--apply` to do it.
 
@@ -8,7 +8,7 @@ The bot runs from a release: a tarball built from one commit and unpacked in `re
 
 | Path | What it is |
 |---|---|
-| `releases/wechat-bot-<tag>.tgz`, `.tgz.sha256` | A release, built by `scripts/release.sh` |
+| `releases/wechat-bot-<tag>.tgz`, `.tgz.sha256` | A release, packaged by `scripts/release.sh` from a CI artifact |
 | `releases/<tag>/` | An installed release: `dist/`, production `node_modules/`, `config/agents/`, `scripts/healthcheck.sh`, and a `RELEASE` file naming its commit |
 | `current` | Symlink to `releases/<tag>` |
 | `run-bot.sh`, `run-server.sh` | The launchd wrappers. launchd runs the repo's copies, not the ones inside a release |
@@ -20,21 +20,29 @@ git ignores `releases/` and `current`.
 
 ## Release
 
+A release packages the committed HEAD with the `dist/` that CI built from that same commit. Release a commit on `main` once the CI run of its push has passed:
+
 ```bash
-scripts/release.sh v1.2.0
+git switch main && git pull --ff-only
+commit=$(git rev-parse HEAD)
+gh run list -w ci.yml -e push -b main -c "$commit" -s success --json databaseId,url
+artifact=$(mktemp -d)
+gh run download <databaseId> -n "wechat-opencode-bot-build-$commit" -D "$artifact"
+scripts/release.sh v1.2.0 "$artifact"
 ```
 
-- It builds from the committed HEAD (`git archive`), so it refuses to run while the working tree has changes.
-- It runs `npm ci`, typecheck, build and test in a temp dir. The repo's own `dist/` and `node_modules/` stay untouched.
-- It writes `releases/wechat-bot-v1.2.0.tgz` and its `.sha256`, and refuses a tag that already has a tarball.
-- It creates no git tag and pushes nothing.
+- If `gh run list` shows nothing, CI for that commit has not finished, has failed, or was cancelled by a later push to `main`: wait for the run, or pull again and release the newer commit once its run passes.
+- Take the push run's artifact. A pull-request run builds GitHub's temporary merge commit, so its artifact and `BUILD_COMMIT` name that commit instead, and `release.sh` refuses it.
+- Download the artifact outside the repo: `release.sh` refuses to run while the working tree has changes, untracked files included.
+- `release.sh` compiles and tests nothing. It checks that `BUILD_COMMIT` holds exactly HEAD's hash, that `dist/main.js` exists and that `dist/` holds only plain files and directories. Then it takes `dist/` from the artifact and `package.json`, `package-lock.json`, `run-bot.sh`, `run-server.sh`, `config/agents/` and `scripts/healthcheck.sh` from HEAD (`git archive`), and adds a `RELEASE` file with the tag, the commit and the time it was packaged.
+- It writes `releases/wechat-bot-v1.2.0.tgz` and its `.sha256`, and refuses a tag that already has a tarball. It creates no git tag and pushes nothing. CI keeps each artifact for 14 days.
 
 ## Deploy
 
 ```bash
 scripts/deploy.sh v1.2.0            # dry run: prints the plan
 scripts/deploy.sh --apply v1.2.0
-scripts/deploy.sh --apply /path/to/wechat-bot-v1.2.0.tgz   # built elsewhere; its .sha256 must sit next to it
+scripts/deploy.sh --apply /path/to/wechat-bot-v1.2.0.tgz   # packaged elsewhere; its .sha256 must sit next to it
 ```
 
 The dry run shows the release and its commit, where `current` points, what `run-bot.sh` starts, whether the agents link through `current`, and the plan. `--apply` then works through the plan in this order:
@@ -85,10 +93,10 @@ It does not restore `state.db`. Migrations so far only add nullable columns, so 
 
 Today `run-bot.sh` starts `dist-roster/main.js`, a build snapshot in the repo checkout, and a deploy leaves the bot alone. This switch makes `run-bot.sh` start `current/dist/main.js`. It takes about 10 minutes; do it while no task runs.
 
-1. Commit everything, then build the first release: `scripts/release.sh v1.0.0`
+1. Commit everything and push it to `main`. Once CI passes, package the first release from its artifact as in [Release](#release): `scripts/release.sh v1.0.0 <artifact-dir>`
 2. Dry run: `scripts/deploy.sh v1.0.0`. It shows `run-bot.sh starts dist-roster/main.js` and the migration note.
 3. Switch: `scripts/deploy.sh --apply --migrate-wrapper v1.0.0`. On top of a normal deploy, it backs up `run-bot.sh` to `~/.wechat-opencode-bot/backups/run-bot.sh.pre-v1.0.0-<time>` and rewrites its `exec node` line to `exec node current/dist/main.js --daemon`. If the health gate fails, it puts the old `run-bot.sh` back and restarts the old build.
-4. Commit `run-bot.sh`: `git diff run-bot.sh` shows the one changed line. `scripts/release.sh` refuses to run until you do.
+4. Commit `run-bot.sh` and push it to `main`: `git diff run-bot.sh` shows the one changed line. `scripts/release.sh` refuses to run until you commit it, and the next release needs CI's artifact of that commit.
 5. Link the agents through `current`: `scripts/install-agents.sh`, then `scripts/install-agents.sh --apply`. The v1.0.0 prompts are copies of the live ones, so it reports `same content` and needs no reload.
 6. Check the launchd jobs: `scripts/install-launchd.sh` should report the server and bot plists as `unchanged`.
 
@@ -116,7 +124,7 @@ The bot runs write tasks on the `wechat-orchestrator` agent, which hands work to
   (set -a; . ~/.wechat-opencode-bot/env; set +a; opencode reload --server "${OPENCODE_URL:-http://127.0.0.1:4096}")
   ```
 
-- To change a prompt, edit `config/agents/<name>.md`, commit, then release and deploy. See [config/agents/README.md](../config/agents/README.md).
+- To change a prompt, edit `config/agents/<name>.md` and get the commit onto `main`, then package CI's artifact of it as in [Release](#release) and deploy. See [config/agents/README.md](../config/agents/README.md).
 - `install-agents.sh` backs up what it replaces to `~/.wechat-opencode-bot/backups/agents-<time>/`. Never keep a backup inside `~/.config/opencode/agents/`: OpenCode also loads `.md` files in its subdirectories as agents, hidden ones included.
 - `wechat-ducc.md` is not part of the setup: no agent delegates to Ducc, and `install-agents.sh` does not create it. The old file in a live agents directory can be deleted.
 
@@ -217,7 +225,9 @@ The daemon checks for due routines every 30 seconds (`ROUTINE_TICK_MS` in `src/c
 
 `.github/workflows/ci.yml` runs on every push and pull request to `main`:
 
-- `test`: `npm ci`, typecheck, build and test on Node 26.
+- `test`: `npm ci`, typecheck, build and test on Node 26. When all four pass, it writes `BUILD_COMMIT` with `git rev-parse HEAD` and uploads `dist/` and `BUILD_COMMIT` as the artifact `wechat-opencode-bot-build-<commit>`, kept for 14 days.
 - `gitleaks`: scans the whole git history for secrets with gitleaks 8.30.1, pinned by checksum.
 
-CI deploys nothing: releases are built and deployed on the machine that runs the bot.
+A push run builds the pushed commit. A pull-request run builds GitHub's temporary merge of the branch into `main`, and its artifact names that merge commit; release from a push run's artifact instead. A newer run on the same ref cancels one still in progress.
+
+CI deploys nothing: `scripts/release.sh` packages its artifact and `scripts/deploy.sh` installs the release on the machine that runs the bot.

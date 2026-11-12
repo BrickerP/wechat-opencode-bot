@@ -26,6 +26,14 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
       - run: npm test
+      - run: git rev-parse HEAD > BUILD_COMMIT
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wechat-opencode-bot-build-${{ github.sha }}
+          path: |
+            dist/
+            BUILD_COMMIT
+          retention-days: 14
 
   gitleaks:
     runs-on: ubuntu-latest

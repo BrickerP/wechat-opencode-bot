@@ -24,6 +24,13 @@ export interface QueryOptions {
    * which tools are running in the session and in them (each name once, at most PROGRESS_TOOLS).
    */
   onProgress?: (update: { elapsedMs: number; children: number; idleMs: number; tools: string[] }) => void;
+  /**
+   * Called once per message with the public text of a root step that calls a tool, as soon as the model has
+   * finished that step's response: what the orchestrator says while it works. A step without a tool call is an
+   * answer, left to the result. Never reasoning, subagent sessions, tool input or output, a failed step, or
+   * anything once the signal aborts; a callback that throws or rejects is only logged.
+   */
+  onAssistantText?: (update: { messageId: string; text: string }) => void | Promise<void>;
 }
 
 export interface PermissionRequest {
@@ -540,14 +547,37 @@ function progressSignature(messages: any[]): string {
 }
 
 /**
- * Poll until the turn goes idle, answering permission requests on the way. Two watchdogs give up on a
- * silent upstream model: no first output within FIRST_RESPONSE_TIMEOUT_MS, or no visible change in the
- * session or its subagent sessions for STALL_TIMEOUT_MS.
+ * Hands onAssistantText the text of each root step that calls a tool, oldest first, once the model's response for
+ * that step has streamed in full. A step is looked at once, by message id; a failed one is left for OpenCode's
+ * retry of the same message.
+ */
+function announceSteps(sessionId: string, assistants: any[], announced: Set<string>, options: QueryOptions): void {
+  for (const message of assistants) {
+    const id = message?.id;
+    if (typeof id !== "string" || announced.has(id) || message.error) continue;
+    if (!message.time?.streamed && !message.time?.completed) continue;
+    announced.add(id);
+    const content = Array.isArray(message.content) ? message.content : [];
+    if (!content.some((part: any) => part?.type === "tool")) continue;
+    const text = extractAssistantText(message);
+    if (!text) continue;
+    // Checked when the callback is due, not when it is queued: an abort in between drops the step.
+    Promise.resolve()
+      .then(() => (options.signal?.aborted ? undefined : options.onAssistantText?.({ messageId: id, text })))
+      .catch((err) => logger.debug("Assistant text callback failed", { sessionId, messageId: id, error: String(err) }));
+  }
+}
+
+/**
+ * Poll until the turn goes idle, answering permission requests on the way and announcing the root steps that
+ * call a tool (announceSteps). Two watchdogs give up on a silent upstream model: no first output within
+ * FIRST_RESPONSE_TIMEOUT_MS, or no visible change in the session or its subagent sessions for STALL_TIMEOUT_MS.
  */
 async function waitForTurn(sessionId: string, since: number, options: QueryOptions): Promise<string> {
   const startedAt = Date.now();
   const deadline = startedAt + TURN_TIMEOUT_MS;
   const handledPermissions = new Set<string>();
+  const announced = new Set<string>();
   let progress = "";
   let progressAt = startedAt;
 
@@ -592,6 +622,11 @@ async function waitForTurn(sessionId: string, since: number, options: QueryOptio
 
     const out = await api<{ data: any[] }>(`/api/session/${sessionId}/message?limit=100&order=desc`);
     const turn = (out.data || []).filter((m) => (m?.time?.created ?? 0) >= since);
+    const assistants = turn
+      .filter((m) => m?.type === "assistant")
+      .sort((a, b) => (a.time?.created ?? 0) - (b.time?.created ?? 0));
+    // Before the idle check, so a step that came in the same poll as the end of the turn is told ahead of the answer.
+    if (options.onAssistantText) announceSteps(sessionId, assistants, announced, options);
 
     const idle = turn.find((m) => m?.type === "idle");
     if (idle) {
@@ -602,10 +637,6 @@ async function waitForTurn(sessionId: string, since: number, options: QueryOptio
       if (idle.outcome === "interrupted") {
         throw new TurnInterrupted("OpenCode 执行被中断");
       }
-
-      const assistants = turn
-        .filter((m) => m?.type === "assistant")
-        .sort((a, b) => (a.time?.created ?? 0) - (b.time?.created ?? 0));
 
       for (let i = assistants.length - 1; i >= 0; i--) {
         const text = extractAssistantText(assistants[i]);

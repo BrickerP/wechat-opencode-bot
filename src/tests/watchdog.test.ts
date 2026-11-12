@@ -1,7 +1,7 @@
 // runTask against a fake OpenCode server: the first-response and stall watchdogs, the one-shot fallback to
-// another gateway and the breaker that skips a failing one, the progress notes of a long task, the directory
-// each session opens in, the bot a task speaks as and the model it runs on, the orchestrator agent of each lane,
-// and the handoff, the usage and the attachments a task records.
+// another gateway and the breaker that skips a failing one, the progress notes of a long task (diagnostics, off
+// unless OWB_PROGRESS_ENABLED), the directory each session opens in, the bot a task speaks as and the model it runs
+// on, the orchestrator agent of each lane, and the handoff, the usage and the attachments a task records.
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
@@ -168,6 +168,8 @@ process.env.OWB_DATA_DIR = join(tmp, 'data');
 process.env.OPENCODE_SERVER_PASSWORD = '';
 process.env.OPENCODE_FIRST_RESPONSE_TIMEOUT_MS = String(FIRST_MS);
 process.env.OPENCODE_STALL_TIMEOUT_MS = String(STALL_MS);
+// The progress notes are off by default; the tests here check them, so they turn them on.
+process.env.OWB_PROGRESS_ENABLED = 'true';
 process.env.OWB_PROGRESS_FIRST_MS = '300';
 process.env.OWB_PROGRESS_MIN_GAP_MS = '200';
 process.env.OWB_PROGRESS_EVERY_MS = '1000';
@@ -285,6 +287,18 @@ test('a task that finishes quickly sends no progress note', async () => {
   const { task, progress } = await run(['answer']);
   assert.equal(task.status, 'done');
   assert.deepEqual(progress, []);
+});
+
+test('without OWB_PROGRESS_ENABLED a long task sends no progress note', async (t) => {
+  delete process.env.OWB_PROGRESS_ENABLED;
+  t.after(() => {
+    process.env.OWB_PROGRESS_ENABLED = 'true';
+  });
+  // With the notes on, the silent primary alone brings one, as the cap test below shows.
+  const { task, delivered, progress } = await run(['silent', 'answer']);
+  assert.equal(task.status, 'done');
+  assert.deepEqual(progress, []);
+  assert.equal(delivered.length, 1);
 });
 
 test('progress notes stop at the cap over both attempts, and a note that fails to send is dropped', async () => {

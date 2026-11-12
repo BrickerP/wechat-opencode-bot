@@ -45,8 +45,13 @@ export const isImageFile = (path: string): boolean => IMAGE_EXTENSIONS.has(exten
 export interface TaskIO {
   /** Reports a finished task; the daemon hands its text to the outbox, then sends a done task's files best-effort. */
   deliver(task: TaskRow): Promise<void>;
-  /** Best-effort note while a long task runs; a failed one is dropped, never queued for retry. */
+  /** The bridge's own note on a long task, sent only with OWB_PROGRESS_ENABLED; best-effort like commentary. */
   progress?(text: string): void | Promise<void>;
+  /**
+   * What the orchestrator says while it works, ahead of its answer. Best-effort: a failed one is dropped, never
+   * queued for retry, and one still waiting to go out when the task finishes is not sent.
+   */
+  commentary?(text: string): void | Promise<void>;
   onPermission?(request: PermissionRequest): Promise<PermissionDecision>;
 }
 
@@ -287,6 +292,8 @@ function cleanFiles(text: string): string[] {
 const DSML_TAG = /<\/?[｜|]{1,2}DSML[｜|]{1,2}[^>]*>/g;
 /** A whole tool call, from its opening tag to the closing tag of the same name. */
 const DSML_BLOCK = /<[｜|]{1,2}DSML[｜|]{1,2}\s*([\w-]+)[^>]*>[\s\S]*?<\/[｜|]{1,2}DSML[｜|]{1,2}\s*\1\s*>/g;
+/** Any piece of that markup, a tag cut off before its ">" too. */
+const DSML_MARK = /[｜|]{1,2}DSML[｜|]{1,2}/;
 const ANY_MARKER = /<<<WECHAT_[A-Z]+>>>/g;
 
 /**
@@ -417,16 +424,22 @@ export function checkTaskFiles(paths: string[], workspace: string): CheckedFiles
 
 const EDIT_ACTION = /edit|write|patch/i;
 
+/** The bridge's progress notes are diagnostics, sent only when OWB_PROGRESS_ENABLED is "true". Read on use. */
+const progressEnabled = (): boolean => process.env.OWB_PROGRESS_ENABLED?.trim().toLowerCase() === 'true';
 /** A long task gets its first progress note once an attempt has run this long. */
 const PROGRESS_FIRST_MS = Number(process.env.OWB_PROGRESS_FIRST_MS) || 20_000;
 /** Progress notes are at least this far apart. */
 const PROGRESS_MIN_GAP_MS = Number(process.env.OWB_PROGRESS_MIN_GAP_MS) || 90_000;
 /** After the first note, only new subagent sessions or this much time bring another. */
 const PROGRESS_EVERY_MS = Number(process.env.OWB_PROGRESS_EVERY_MS) || 300_000;
-/** Progress notes per task, over all its attempts. */
-const PROGRESS_MAX = Number(process.env.OWB_PROGRESS_MAX) || 4;
+/** Progress notes per task, over all its attempts; 0 sends none. */
+const PROGRESS_MAX = /^\d+$/.test(process.env.OWB_PROGRESS_MAX ?? '') ? Number(process.env.OWB_PROGRESS_MAX) : 4;
 /** A note names this many of the running tools at most. */
 const PROGRESS_NOTE_TOOLS = 3;
+/** What the orchestrator says while it works reaches the user this many times per task, over all its attempts. */
+const COMMENTARY_MAX = 3;
+/** Longer commentary is cut to this many characters. */
+const COMMENTARY_MAX_CHARS = 800;
 /** Prompt tokens, cache included, from which a task counts as costly: logged, and flagged in /tasks. Read on use. */
 export const taskWarnTokens = (): number => Number(process.env.OWB_TASK_WARN_TOKENS) || 500_000;
 
@@ -463,7 +476,7 @@ export function formatQueueAck(seq: number, ahead: number, durations: number[]):
 /**
  * The onProgress handler of one task, shared by its attempts so the limits hold for the whole task: a note
  * once an attempt has run PROGRESS_FIRST_MS, then on new subagent sessions or every PROGRESS_EVERY_MS. A note
- * names the tools running at the time and counts the subagent sessions.
+ * names the tools running at the time and counts the subagent sessions. runTask uses it only with OWB_PROGRESS_ENABLED.
  * Notes go out through io.progress, never the outbox, and a failed one is only logged.
  */
 function progressNotes(task: TaskRow, io: TaskIO, running: () => boolean) {
@@ -483,8 +496,30 @@ function progressNotes(task: TaskRow, io: TaskIO, running: () => boolean) {
     const delegated = children > 0 ? `，已派出 ${children} 个子任务` : '';
     const text = `⏳ 任务 #${task.seq} 运行中（${formatElapsed(startedAt, now)}）${doing}${delegated}`;
     Promise.resolve()
-      .then(() => io.progress?.(text))
+      .then(() => (running() ? io.progress?.(text) : undefined))
       .catch((err) => logger.debug('Progress note failed', { taskId: task.id, error: String(err) }));
+  };
+}
+
+/**
+ * The onAssistantText handler of one task, shared by its attempts: the orchestrator's own words on a step that
+ * calls a tool, in its bot's voice, at most COMMENTARY_MAX times and COMMENTARY_MAX_CHARS each. Text with a WECHAT
+ * marker is answer text and stays with the result. Text with any tool-call markup is dropped whole, since stripping
+ * the tags would leave what the call carried. Words the task has already said (a retry repeating them) are not sent
+ * again. The task must still be running when a note is handed to io.commentary, not only when it is chosen.
+ * Commentary never goes to the outbox, and a failed one is only logged.
+ */
+function commentaryNotes(task: TaskRow, io: TaskIO, running: () => boolean) {
+  const said = new Set<string>();
+  return ({ messageId, text }: { messageId: string; text: string }): void => {
+    const note = text.trim();
+    if (!io.commentary || !note || note.match(ANY_MARKER) || DSML_MARK.test(note)) return;
+    const bounded = note.length > COMMENTARY_MAX_CHARS ? `${note.slice(0, COMMENTARY_MAX_CHARS).trimEnd()}…` : note;
+    if (said.size >= COMMENTARY_MAX || said.has(bounded) || !running()) return;
+    said.add(bounded);
+    Promise.resolve()
+      .then(() => (running() ? io.commentary?.(`${resolveBot(task.bot_id).bot.prefix}${bounded}`) : undefined))
+      .catch((err) => logger.debug('Commentary failed', { taskId: task.id, messageId, error: String(err) }));
   };
 }
 
@@ -493,8 +528,9 @@ function progressNotes(task: TaskRow, io: TaskIO, running: () => boolean) {
  * else its bot's model, else the orchestrator agent's own. A model whose gateway fails or goes silent gets
  * one retry on fallbackModel, behind another gateway, and the user hears only the final outcome.
  * Repeated upstream failures open that gateway's breaker: later tasks start on the fallback until the
- * cooldown is over, and the user gets one notice when that begins. While it runs, a long task sends a few
- * best-effort progress notes (progressNotes).
+ * cooldown is over, and the user gets one notice when that begins. While it runs, what the orchestrator writes on
+ * a step that calls a tool reaches the user best-effort (commentaryNotes); the bridge's own progress notes
+ * (progressNotes) are diagnostics behind OWB_PROGRESS_ENABLED.
  * A task that was finished elsewhere meanwhile (/stop, restart) is not reported again.
  */
 export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: AbortSignal): Promise<void> {
@@ -526,7 +562,8 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
     const attachments = resolveAttachments(db, task);
     // /stop and restarts finish the task elsewhere; only a failing or silent model is worth a second try.
     const running = () => !signal.aborted && db.getTask(task.id)?.status === 'running';
-    const onProgress = progressNotes(task, io, running);
+    const onProgress = progressEnabled() ? progressNotes(task, io, running) : undefined;
+    const onAssistantText = commentaryNotes(task, io, running);
     const attempt = async (next: string | undefined, retry: boolean): Promise<QueryResult> => {
       model = next;
       attempts++;
@@ -541,6 +578,7 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
         onPermission: (request) => decidePermission(request, io),
         onSession: (sessionId) => db.setTaskSession(task.id, sessionId),
         onProgress,
+        onAssistantText,
       });
       addUsage(out.usage);
       return out;

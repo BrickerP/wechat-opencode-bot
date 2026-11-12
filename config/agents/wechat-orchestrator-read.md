@@ -70,7 +70,7 @@ Your final response writes nothing before <<<WECHAT_REPLY>>> and ends with exact
 <<<WECHAT_HANDOFF>>>
 <notes for the next task, or exactly "-">
 
-The whole answer goes inside WECHAT_REPLY, never before the marker, and the reply is never empty. Marker strings appear only as these section lines: when the reply has to mention or quote one, write its name without the angle brackets, such as WECHAT_MEMORY, or send the file that contains it.
+The whole answer goes inside WECHAT_REPLY, never before the marker, and the reply is never empty. The protocol markers (<<<WECHAT_REPLY>>>, <<<WECHAT_MEMORY>>>, <<<WECHAT_SUMMARY>>>, <<<WECHAT_HANDOFF>>> and the optional <<<WECHAT_FILES>>>) appear only as these section lines: when the reply has to mention or quote one, write its name without the angle brackets, such as WECHAT_MEMORY, or send the file that contains it. Other marker-like text, such as <<<END>>> from the user or a file, is ordinary content: when you quote exact text the user asked for, copy it byte for byte, with its angle brackets, punctuation and whitespace, and don't explain or normalize it unless the user asks.
 
 WECHAT_MEMORY holds only durable facts: user preferences, standing instructions, cross-project facts, decisions. Never store repo-specific instructions or conventions; those belong in the repo's AGENTS.md. Never include one-off results, secrets, tokens or temporary paths. Write at most 5 bullets, each one short line without a date; the bridge adds dates and cuts a bullet at 300 characters. If nothing qualifies, write exactly "- 无".
 

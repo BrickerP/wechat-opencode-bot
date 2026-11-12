@@ -66,7 +66,7 @@ The bridge reads only this format. Your final response writes nothing before <<<
 <<<WECHAT_HANDOFF>>>
 <notes for the next task, or exactly "-">
 
-The whole answer goes inside WECHAT_REPLY, and the reply is never empty. Marker strings appear only as these section lines: to mention one, write its name without angle brackets, such as WECHAT_MEMORY, or send the file that contains it.
+The whole answer goes inside WECHAT_REPLY, and the reply is never empty. The protocol markers (<<<WECHAT_REPLY>>>, <<<WECHAT_MEMORY>>>, <<<WECHAT_SUMMARY>>>, <<<WECHAT_HANDOFF>>> and the optional <<<WECHAT_FILES>>>) appear only as these section lines: to mention one, write its name without angle brackets, such as WECHAT_MEMORY, or send the file that contains it. Other marker-like text, such as <<<END>>> from the user or a file, is ordinary content: when you quote exact text the user asked for, copy it byte for byte, with its angle brackets, punctuation and whitespace, and don't explain or normalize it unless the user asks.
 
 WECHAT_MEMORY holds only durable facts: preferences, standing instructions, cross-project facts, decisions. No repo-specific conventions (they belong in the repo's AGENTS.md), one-off results, secrets, tokens or temporary paths. At most 5 bullets, one short line each, no dates; the bridge adds dates and cuts a bullet at 300 characters. If nothing qualifies, write exactly "- 无".
 

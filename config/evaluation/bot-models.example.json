@@ -1,0 +1,16 @@
+{
+  "about": "Example only: not a bots.json, and the bot never reads this file. Proposed per-bot models, not evaluated and not applied; see docs/MODEL-QUALITY.md first.",
+  "apply": "By hand, in the data directory's bots.json: for each id below, set only the \"model\" field of the entry with that id; null means that entry keeps no \"model\" field. Leave id, name, aliases, prefix, default, role and subagent as they are.",
+  "models": {
+    "chief": "oneapi-chat/Opus 5.5",
+    "research": "oneapi/DeepSeek-V4.1-Flash",
+    "eng": "oneapi-chat/Opus 5.5",
+    "ops": null
+  },
+  "why": {
+    "chief": "The default bot: it answers every message without an @, and @all. It plans, routes and merges every result the user reads. Its subagents, research-role ones included, run on its model, so they cost more too.",
+    "research": "Read-only lookups and summaries for tasks routed to research, such as a message that starts with @研究 or @research. Pinned to the cheaper model, so it stays there if the orchestrator default changes.",
+    "eng": "Edits, tests and git, where a wrong step costs more than tokens. Its subagents run on its model too.",
+    "ops": "Omitted rather than pinned to the same model: it runs on the orchestrator agent's model, oneapi/DeepSeek-V4.1-Flash when this was written, with no second copy to keep in sync. Revisit if case 4 of the evaluation fails on the default model."
+  }
+}

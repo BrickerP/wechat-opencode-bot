@@ -61,7 +61,7 @@ cp -pR "$ARTIFACT/dist" "$STAGE/dist"
 for file in package.json package-lock.json run-bot.sh run-server.sh; do cp -p "$SRC/$file" "$STAGE/"; done
 mkdir "$STAGE/config" "$STAGE/scripts"
 cp -pR "$SRC/config/agents" "$STAGE/config/agents"
-cp -p "$SRC/scripts/healthcheck.sh" "$STAGE/scripts/"
+cp -p "$SRC/scripts/healthcheck.sh" "$SRC/scripts/collect-work-activity.mjs" "$STAGE/scripts/"
 printf 'tag=%s\ncommit=%s\npackaged=%s\n' "$TAG" "$COMMIT" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STAGE/RELEASE"
 
 mkdir -p "$OUT"

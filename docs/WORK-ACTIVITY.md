@@ -1,6 +1,6 @@
 # Work activity from local git
 
-`scripts/collect-work-activity.mjs` lists, as JSON, one calendar day's commits in the git repositories under a directory, and which of their worktrees have uncommitted changes. It is a standalone Node.js script that uses only Node's built-in modules: run it from a checkout of this repository, with Git 2.31 or later on `PATH`.
+`scripts/collect-work-activity.mjs` lists, as JSON, one calendar day's commits in the git repositories under a directory, and which of their worktrees have uncommitted changes. It is a standalone Node.js script that uses only Node's built-in modules and needs Git 2.31 or later on `PATH`. Run it from a checkout of this repository or from a release, which ships it as `releases/<tag>/scripts/collect-work-activity.mjs`. The bot gives the orchestrators the absolute path of the copy beside its own `dist/`, when that file exists, as `collector:` in each task's `<context>`, and they pass it to `wechat-explore` for a one-day work summary.
 
 It only reads. It never fetches or pushes, its git calls take no optional locks, and the one file it writes is the `--output` file.
 

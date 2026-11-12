@@ -1,6 +1,6 @@
 # Model quality
 
-Status on 2026-11-12: a proposal. Nothing is applied, and the five cases below have not been run. [`config/evaluation/bot-models.example.json`](../config/evaluation/bot-models.example.json) suggests a model per bot; the bot never reads that file. When this was written, the production bots set no `model`. In the example, only chief and eng change model: research's value equals today's default, and ops keeps none.
+Status on 2026-11-12: a proposal, not applied. The five cases below were run in a synthetic harness, see [Results on 2026-11-12](#results-on-2026-11-12): on the default `oneapi/DeepSeek-V4.1-Flash`, the prompts that v0.2.5 ships passed all five, and `oneapi-chat/Opus 5.5` failed every run with HTTP 502, so the example's choice of Opus is not evaluated. [`config/evaluation/bot-models.example.json`](../config/evaluation/bot-models.example.json) suggests a model per bot; the bot never reads that file. When this was written, the production bots set no `model`. In the example, only chief and eng change model: research's value equals today's default, and ops keeps none.
 
 ## How a task gets its model
 
@@ -24,7 +24,7 @@ Fallback stays as configured. After an upstream failure, such as a 429, a 5xx or
 
 To revert, remove or restore only those `model` fields. Do not copy the backup over `bots.json`: that also undoes any later edit.
 
-## Evaluation (not run)
+## Evaluation
 
 Run the same five cases before and after a change, and change one thing per pass: the model or the prompts. Write each message without an @, so chief answers. `lab-07` must not resolve, so a probe by the bot fails as well.
 
@@ -65,10 +65,25 @@ For every case and pass, record:
 
 `usage.input` in `Task finished` adds up the prompt of every model call in the task, subagents and a retry included, cache reads and writes too. It grows with every step and is not the size of one context window. A configured model name or a lower token count is not a pass: only the criteria and the human judgment are. Apply the example only after the "after" pass passes all five cases, with its time and tokens next to the result.
 
-| Case | Before | After |
+### Results on 2026-11-12
+
+These runs did not follow the procedure above. A synthetic harness sent each case straight to the local OpenCode server, in a session whose directory was a new temporary one: its `.opencode/agents/` held renamed copies of the four agent files under test, and an `AGENTS.md` told the agents to use only the facts in the message. The prompt had a fixed `<context>`, a short `<persona>` for chief, and empty `<memory>` and `<recent_tasks>`. The harness approved each permission request once, where `--simulate` denies them. The messages were variants of the five cases, such as a greeting that also asked for no tool calls, and the lines `RAW-LINE-1`, `<<<INTERNAL_MARKER>>>` and `RAW-LINE-2` for case 5. Automatic checks on each reply, looser than the criteria above, decided pass or fail; no human judgment is recorded. OpenCode's record of every session showed the requested provider, model and variant.
+
+| Case | Before: prompts of `df84f3b` | After: prompts of `c3e7775` |
 |---|---|---|
-| 1 Greeting | not run | not run |
-| 2 Work summary | not run | not run |
-| 3 Ambiguous remote session | not run | not run |
-| 4 Offline machine | not run | not run |
-| 5 Public raw excerpt | not run | not run |
+| 1 Greeting | pass, 10.2 s | pass, 7.2 s |
+| 2 Work summary | pass, 10.3 s | pass, 11.0 s |
+| 3 Ambiguous remote session | fail: empty reply, 9.8 s | pass, 10.2 s |
+| 4 Offline machine | pass, 31.1 s, 1 child session | pass, 10.7 s |
+| 5 Public raw excerpt | pass, 8.9 s | pass, 7.1 s, `<<<INTERNAL_MARKER>>>` kept verbatim |
+
+Both passes ran on `oneapi/DeepSeek-V4.1-Flash#max`, each case once: 4 of 5 before and 5 of 5 after. The bots set no variant, so their tasks do not necessarily run on `max`.
+
+- The check of case 2 first failed the after reply, which only says that CI, build, deployment and verification are unconfirmed, such as 不能说明已部署. The corrected check passes it.
+- Three earlier runs that afternoon are not in the table: their before prompts match these by token count, and their after prompts were about 110 tokens shorter, an earlier draft. The before prompts answered case 3 in all three, so its empty reply above is one failure in four runs.
+- No run of the after pass started a child session, and the orchestrator may call no tool but `subagent`, so no agent in that pass could call a memory tool. The child session of case 4 before was not checked for a memory read.
+- Tokens, from each root session without its children: input with cache reads was 5,822 to 5,921 per case after and 4,813 to 4,908 before, as the after prompts are longer, except 11,067 for case 4 before, which delegated. Output with reasoning was 121 to 895 after and 133 to 1,273 before.
+
+`c3e7775` is not on `main`; its `config/agents/` is the same as in `4a52007`, the commit on `main` that v0.2.5 was packaged from.
+
+`oneapi-chat/Opus 5.5#max` failed all ten of its runs, the five cases with the before prompts and with the earlier draft of the after prompts, with `provider.internal: HTTP 502` after 81 to 94 s. A probe of its default variant failed the same way after about 90 s. Its quality could not be judged, so nothing is applied: the bots keep no `model` and run on the default `oneapi/DeepSeek-V4.1-Flash` until the `oneapi-chat` route answers and Opus passes all five cases.

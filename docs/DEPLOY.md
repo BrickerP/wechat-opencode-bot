@@ -9,7 +9,7 @@ The bot runs from a release: a tarball of one commit and the `dist/` that CI bui
 | Path | What it is |
 |---|---|
 | `releases/wechat-bot-<tag>.tgz`, `.tgz.sha256` | A release, packaged by `scripts/release.sh` from a CI artifact |
-| `releases/<tag>/` | An installed release: `dist/`, production `node_modules/`, `config/agents/`, `scripts/healthcheck.sh`, and a `RELEASE` file naming its commit |
+| `releases/<tag>/` | An installed release: `dist/`, production `node_modules/`, `config/agents/`, `scripts/` with `healthcheck.sh` and `collect-work-activity.mjs`, and a `RELEASE` file naming its commit |
 | `current` | Symlink to `releases/<tag>` |
 | `run-bot.sh`, `run-server.sh` | The launchd wrappers. launchd runs the repo's copies, not the ones inside a release |
 | `config/agents/` | OpenCode agent prompts, see [Agents](#agents) |
@@ -34,7 +34,7 @@ scripts/release.sh v1.2.0 "$artifact"
 - If `gh run list` shows nothing, CI for that commit has not finished, has failed, or was cancelled by a later push to `main`: wait for the run, or pull again and release the newer commit once its run passes.
 - Take the push run's artifact. A pull-request run builds GitHub's temporary merge commit, so its artifact and `BUILD_COMMIT` name that commit instead, and `release.sh` refuses it.
 - Download the artifact outside the repo: `release.sh` refuses to run while the working tree has changes, untracked files included.
-- `release.sh` compiles and tests nothing. It checks that `BUILD_COMMIT` holds exactly HEAD's hash, that `dist/main.js` exists and that `dist/` holds only plain files and directories. Then it takes `dist/` from the artifact and `package.json`, `package-lock.json`, `run-bot.sh`, `run-server.sh`, `config/agents/` and `scripts/healthcheck.sh` from HEAD (`git archive`), and adds a `RELEASE` file with the tag, the commit and the time it was packaged.
+- `release.sh` compiles and tests nothing. It checks that `BUILD_COMMIT` holds exactly HEAD's hash, that `dist/main.js` exists and that `dist/` holds only plain files and directories. Then it takes `dist/` from the artifact and `package.json`, `package-lock.json`, `run-bot.sh`, `run-server.sh`, `config/agents/`, `scripts/healthcheck.sh` and `scripts/collect-work-activity.mjs` from HEAD (`git archive`), and adds a `RELEASE` file with the tag, the commit and the time it was packaged.
 - It writes `releases/wechat-bot-v1.2.0.tgz` and its `.sha256`, and refuses a tag that already has a tarball. It creates no git tag and pushes nothing. CI keeps each artifact for 14 days.
 
 ## Deploy

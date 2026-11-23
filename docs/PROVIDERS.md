@@ -18,7 +18,7 @@ The subagents have no `model:` line and run on their parent's model.
 
 With 1 and 2 unset, the bot creates the session without a model and assumes `OPENCODE_DEFAULT_MODEL` for routing, that is for the breakers and the fallback. Keep it equal to the orchestrators' `model:`, or failures are charged to the wrong provider.
 
-An upstream failure, such as a 429, a 5xx or a timeout, gets one retry on `OPENCODE_FALLBACK_MODEL`. Without that variable, the retry takes the first model of the built-in chain whose provider differs from the primary's: `oneapi-chat-gpt/gpt-6-astra`, `oneapi/DeepSeek-V4.1-Flash`, then `oneapi-gemini/Gemini 4 Argon`. Each provider id is one gateway with its own breaker; [Model routing](DEPLOY.md#model-routing) has the details.
+An upstream failure, such as a 429, a 5xx or a timeout, gets one retry on `OPENCODE_FALLBACK_MODEL`. Without that variable there is no retry. The bot checks the fallback against the server's model list at startup, in `/doctor` and right before it would use it, and does not try one the server no longer lists. Each provider id is one gateway with its own breaker; [Model routing](DEPLOY.md#model-routing) has the details.
 
 ## Credentials
 
@@ -104,14 +104,14 @@ OPENCODE_FALLBACK_MODEL=<a model on another provider>
 
 A gateway that serves several APIs, such as OpenAI's and Anthropic's, gets one provider id per API, each with the matching `package` from [OpenCode's provider docs](https://opencode.ai/docs/providers). The bot treats each id as a separate gateway with its own breaker, but ids on one host share that host's outages: a fallback to another id on the same host fails with it.
 
-The `oneapi` defaults are the maintainer's gateways, set up this way: one provider id per API, on two hosts. Without `OPENCODE_FALLBACK_MODEL`, the orchestrators' `oneapi/DeepSeek-V4.1-Flash` falls back to `oneapi-chat-gpt/gpt-6-astra`, which runs on the other host.
+The `oneapi` defaults are the maintainer's gateways, set up this way: one provider id per API, on two hosts. The maintainer's `OPENCODE_FALLBACK_MODEL` names a model on the other host than the orchestrators' `oneapi/DeepSeek-V4.1-Flash`.
 
 Configs written for OpenCode 1, the maintainer's included, put providers under a `provider` key, with an `npm` package such as `@ai-sdk/openai-compatible` and an `options` block. OpenCode 2 still accepts that key but marks it deprecated. Do not mix the shapes: the schema rejects `npm` and `options` under `providers`, and `package` and `settings` under `provider`.
 
 ## Switch the bot's models
 
 1. Set `model:` in both `config/agents/wechat-orchestrator.md` and `config/agents/wechat-orchestrator-read.md` to your default model.
-2. In `~/.wechat-opencode-bot/env`, set `OPENCODE_DEFAULT_MODEL` to the same model, and `OPENCODE_FALLBACK_MODEL` to a model on a different provider. Without a fallback, the retry goes to `oneapi-chat-gpt/gpt-6-astra` and fails, and while your provider's breaker is open, every new task starts on that fallback and fails. With a single provider, pick another of its models: that helps when one model is overloaded, not when the provider is down.
+2. In `~/.wechat-opencode-bot/env`, set `OPENCODE_DEFAULT_MODEL` to the same model, and `OPENCODE_FALLBACK_MODEL` to a model on a different provider. Without a fallback, upstream failures are not retried. With a single provider, pick another of its models: that helps when one model is overloaded, not when the provider is down.
 3. Change or remove any `model` in `~/.wechat-opencode-bot/bots.json` that names a provider you lack. The built-in bots set none.
 4. Load the prompts: `scripts/install-agents.sh --apply`, then the `opencode reload` command it prints. On a bot deployed from releases, release and deploy the commit with the change instead, as [config/agents/README.md](../config/agents/README.md) describes.
 5. Restart the daemon so it reads `env` again, and the server if its keys changed. [launchd](DEPLOY.md#launchd) has the commands.
@@ -120,7 +120,7 @@ Configs written for OpenCode 1, the maintainer's included, put providers under a
 
 1. `/models` in WeChat lists the models the server can reach, by provider. Yours must be among them.
 2. `/model <provider/model>` checks the name against the server and uses it for the chat's next tasks. `/model default` goes back to each bot's `model`, or the orchestrator's when the bot sets none.
-3. `/doctor` checks the server, the four agents, the message token, the outbox, the databases, the breakers and the routines. It never calls a model, so a bad key still passes.
+3. `/doctor` checks the server, the four agents, the message token, the outbox, the databases, the fallback model, the breakers and the routines. It never calls a model, so a bad key still passes.
 4. `node dist/main.js --simulate "只回复 ok"` runs one real task and prints the reply. It ignores the chat's `/model`, so it tests the default bot's model, or the orchestrator's.
 5. Each `Task finished` line in `~/.wechat-opencode-bot/logs/` records `model`, `attempts`, `fallback` and `errorKind`. `fallback: true` means the task ran on the fallback, because the primary failed or its breaker was open.
 

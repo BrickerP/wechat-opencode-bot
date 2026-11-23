@@ -7,7 +7,7 @@ import { loadConfig, saveConfig, type PermissionMode } from '../config.js';
 import { DATA_DIR } from '../constants.js';
 import { logger } from '../logger.js';
 import { memoryPath, memoryStats } from '../memory.js';
-import { breaker } from '../model-routing.js';
+import { breaker, checkFallback, type FallbackCheck } from '../model-routing.js';
 import {
   clip,
   composeSteer,
@@ -122,7 +122,7 @@ Bot：
   /permission [模式] 查看或设置权限模式
 
 其他：
-  /doctor           自检：OpenCode 与 agent、消息令牌、待补发、数据库、熔断和定时任务
+  /doctor           自检：OpenCode 与 agent、消息令牌、待补发、数据库、备用模型、熔断和定时任务
   /help             显示帮助
   /version          查看版本
 
@@ -259,6 +259,8 @@ export interface DoctorProbe {
   agents: PromiseSettledResult<Array<{ id: string }>>;
   /** breaker.snapshot(): the breakers live in the daemon's memory. */
   gateways: Gateway[];
+  /** checkFallback(): OPENCODE_FALLBACK_MODEL against GET /api/model. */
+  fallback: FallbackCheck;
   /** How long the daemon has been up. */
   uptimeMs: number;
 }
@@ -280,6 +282,13 @@ function requestError(err: unknown): string {
   if (err.name === 'TimeoutError') return `${OPENCODE_TIMEOUT_MS / 1000} 秒无响应`;
   const code = (err.cause as { code?: unknown } | undefined)?.code;
   return clip(code ? `${err.message} (${code})` : err.message, 80);
+}
+
+/** The fallback line: an unset one is a choice worth a look, a configured one the server lacks is broken. */
+function fallbackCheck(fallback: FallbackCheck): Check {
+  if (fallback.state === 'ok') return ['✅', `备用模型: ${fallback.model}`];
+  if (fallback.state === 'unset') return ['⚠️', '备用模型: 未设置 OPENCODE_FALLBACK_MODEL（上游失败不会重试）'];
+  return ['❌', `备用模型: ${fallback.configured} ${fallback.reason}，上游失败不会重试（在 ${join(DATA_DIR, 'env')} 更新 OPENCODE_FALLBACK_MODEL）`];
 }
 
 /**
@@ -313,6 +322,7 @@ export function formatDoctor(db: StateDb, accountId: string, probe: DoctorProbe,
   checks.push(stateDb ? ['✅', `state.db: ${formatSize(stateDb.size)}`] : ['❌', `state.db: 未找到 ${STATE_DB_PATH}`]);
   const openCodeDb = statSync(OPENCODE_DB_PATH, { throwIfNoEntry: false });
   if (openCodeDb) checks.push(['✅', `opencode.db: ${formatSize(openCodeDb.size)}（OpenCode 的会话库）`]);
+  checks.push(fallbackCheck(probe.fallback));
   checks.push([gateways.some((g) => g.openUntil > now) ? '⚠️' : '✅', `熔断: ${openBreakers(gateways, now)}`]);
   const day = dayHealth(db, accountId, now);
   checks.push([day.failed ? '⚠️' : '✅', day.text]);
@@ -482,8 +492,11 @@ export const handlers: Record<string, Handler> = {
   async doctor(_args, { accountId, db }) {
     // Bounded: messages are handled one at a time, so a hung OpenCode would hold up every later one.
     const signal = AbortSignal.timeout(OPENCODE_TIMEOUT_MS);
-    const [server, agents] = await Promise.allSettled([openCodeInfo(signal), listAgents(signal)]);
-    return formatDoctor(db, accountId, { server, agents, gateways: breaker.snapshot(), uptimeMs: process.uptime() * 1000 });
+    const [[server, agents], fallback] = await Promise.all([
+      Promise.allSettled([openCodeInfo(signal), listAgents(signal)]),
+      checkFallback(signal),
+    ]);
+    return formatDoctor(db, accountId, { server, agents, fallback, gateways: breaker.snapshot(), uptimeMs: process.uptime() * 1000 });
   },
 
   tasks: (args, { accountId, db }) => formatTasks(db, accountId, parseTaskLimit(args)),

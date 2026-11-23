@@ -58,6 +58,8 @@ function handle(req: IncomingMessage, res: ServerResponse): void {
   req.resume().on('end', () => {
     const url = new URL(req.url ?? '/', 'http://fake');
     const send = (data: unknown) => void res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ data }));
+    // The fallback the tests configure, which runTask checks against this list before a retry.
+    if (url.pathname === '/api/model') return send([{ id: 'gpt-6-astra', providerID: 'oneapi-chat-gpt', variants: [] }]);
     if (url.pathname === '/api/session') {
       if (req.method === 'GET') return send(sessions.filter((s) => s.parentID === url.searchParams.get('parentID')));
       return send({ id: addSession({ reads: turns.shift() ?? [] }).id });
@@ -98,7 +100,7 @@ process.env.OWB_PROGRESS_FIRST_MS = '1';
 process.env.OWB_PROGRESS_MIN_GAP_MS = '1';
 process.env.OWB_PROGRESS_EVERY_MS = '1';
 process.env.OWB_PROGRESS_MAX = '0';
-delete process.env.OPENCODE_FALLBACK_MODEL;
+process.env.OPENCODE_FALLBACK_MODEL = 'oneapi-chat-gpt/gpt-6-astra';
 delete process.env.OPENCODE_DEFAULT_MODEL;
 delete process.env.OWB_BREAKER_THRESHOLD;
 delete process.env.OWB_BREAKER_COOLDOWN_MS;

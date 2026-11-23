@@ -7,7 +7,7 @@ import { loadConfig } from './config.js';
 import { DATA_DIR } from './constants.js';
 import { logger } from './logger.js';
 import { appendMemory, memoryPath, readMemory } from './memory.js';
-import { breaker, DEFAULT_MODEL, fallbackModel, providerOf } from './model-routing.js';
+import { breaker, checkFallback, DEFAULT_MODEL, providerOf, type FallbackCheck } from './model-routing.js';
 import { openCodeQuery, type PermissionDecision, type PermissionRequest, type QueryResult, type Usage } from './opencode/provider.js';
 import { isRealPathInside } from './projects.js';
 import type { StateDb, TaskRow, TaskStatus, TaskUsage } from './tasks/db.js';
@@ -533,9 +533,9 @@ function commentaryNotes(task: TaskRow, io: TaskIO, running: () => boolean) {
 /**
  * Run one task in a fresh orchestrator session and report the outcome. The task runs on the chat's /model,
  * else its bot's model, else the orchestrator agent's own. A model whose gateway fails or goes silent gets
- * one retry on fallbackModel, behind another gateway, and the user hears only the final outcome.
- * Repeated upstream failures open that gateway's breaker: later tasks start on the fallback until the
- * cooldown is over, and the user gets one notice when that begins. While it runs, what the orchestrator writes on
+ * one retry on OPENCODE_FALLBACK_MODEL, if the server lists it at that moment, and the user hears only the
+ * final outcome. Repeated upstream failures open that gateway's breaker: later tasks start on the fallback until
+ * the cooldown is over, and the user gets one notice when that begins. While it runs, what the orchestrator writes on
  * a step that calls a tool reaches the user best-effort (commentaryNotes); the bridge's own progress notes
  * (progressNotes) are diagnostics behind OWB_PROGRESS_ENABLED.
  * A task that was finished elsewhere meanwhile (/stop, restart) is not reported again.
@@ -603,9 +603,19 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
     // /model overrides every bot; with neither, the session gets no model and routing assumes DEFAULT_MODEL.
     const primary = user?.model ?? resolveBot(task.bot_id).bot.model;
     const primaryProvider = providerOf(primary ?? DEFAULT_MODEL);
-    const fallback = fallbackModel(primary ?? DEFAULT_MODEL);
-    // While the primary's breaker is open, tasks start on the fallback; after the cooldown they try the primary again.
-    usedFallback = fallback !== undefined && breaker.isOpen(primaryProvider);
+    /** The fallback as the server lists it now; a configured one it does not list is logged. */
+    const checkNow = async (): Promise<FallbackCheck> => {
+      const check = await checkFallback();
+      if (check.state === 'missing') {
+        logger.warn('Fallback model unavailable', { taskId: task.id, seq: task.seq, model: check.configured, reason: check.reason });
+      }
+      return check;
+    };
+    // While the primary's breaker is open, tasks start on the fallback; after the cooldown they try the primary
+    // again. Without a usable fallback they stay on the primary: an open breaker must not send them nowhere.
+    const opening = breaker.isOpen(primaryProvider) ? await checkNow() : undefined;
+    let fallback = opening?.state === 'ok' ? opening.model : undefined;
+    usedFallback = fallback !== undefined;
     if (usedFallback) {
       logger.warn('Gateway breaker open, skipping primary model', {
         taskId: task.id,
@@ -617,7 +627,9 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
     result = await attempt(usedFallback ? fallback : primary, false);
     if (result.upstream && running()) {
       const opened = recordFailure();
-      if (!usedFallback && fallback) {
+      const check = usedFallback ? undefined : await checkNow();
+      fallback = check?.state === 'ok' ? check.model : undefined;
+      if (fallback) {
         logger.warn('retry with fallback model', {
           taskId: task.id,
           seq: task.seq,
@@ -632,6 +644,9 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
         result = await attempt(fallback, true);
         if (result.upstream && running()) recordFailure();
         if (result.error && !result.interrupted) result.error = `备用模型重试后仍失败：${result.error}`;
+      } else if (check?.state === 'missing' && result.error && !result.interrupted) {
+        // Up front, so the clipped error still says why there was no retry.
+        result.error = `未重试：备用模型 ${check.configured} ${check.reason}，请更新 OPENCODE_FALLBACK_MODEL。${result.error}`;
       }
     }
     if (!result.error) breaker.recordSuccess(providerOf(model ?? DEFAULT_MODEL));

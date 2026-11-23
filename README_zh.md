@@ -78,9 +78,9 @@ flowchart LR
 
 - 任务优先使用聊天里 `/model` 设置的模型；没有时使用 `bots.json` 中该 bot 的 `model`；都没有时使用 orchestrator 自己的 `model:`，路由假定它等于 `OPENCODE_DEFAULT_MODEL`。子 agent 没有 `model:` 行，沿用父会话的模型。
 - `bots.json` 的每个 bot 可以选填 `model`（`provider/model[#variant]`）；`/model` 会覆盖所有 bot，`/model default` 恢复各 bot 自己的 model。
-- 上游失败会在备用模型上重试一次：设置了 `OPENCODE_FALLBACK_MODEL` 就用它，否则用内置链路里第一个属于其他 provider（网关）的模型。上游失败包括 429 或额度不足、5xx 或过载、超时、连接错误、鉴权以外的 `provider.*` 错误，以及模型首次输出前沉默 120 秒、或两次进展之间沉默 180 秒。重试的 prompt 会提醒第一次尝试可能已改过文件；你只会看到最终结果。
+- 上游失败会在 `OPENCODE_FALLBACK_MODEL` 上重试一次，前提是设置了它、且服务器此刻的模型列表（`GET /api/model`）里有它；模型可能在 bot 运行期间被移除，所以每次使用前、启动时和 `/doctor` 都会核对。设置了但列表里没有的备用模型不会被尝试，任务的错误会说明原因；没有设置时，上游失败不重试。上游失败包括 429 或额度不足、5xx 或过载、超时、连接错误、鉴权以外的 `provider.*` 错误，以及模型首次输出前沉默 120 秒、或两次进展之间沉默 180 秒。重试的 prompt 会提醒第一次尝试可能已改过文件；你只会看到最终结果。
 - 不重试：鉴权、权限、4xx 和未知错误，本地服务的错误，以及单次尝试 30 分钟的上限。
-- 每个网关有一个熔断器，状态只在内存里。连续 3 次上游失败会打开它：新任务直接用备用模型，聊天收到一条通知。10 分钟后下一个任务会再试这个网关；成功则关闭熔断，失败则等待时间翻倍，最长 1 小时。另外，30 分钟内 3 个任务失败会发一条 `🚨` 告警，之后 30 分钟内不再发。
+- 每个网关有一个熔断器，状态只在内存里。连续 3 次上游失败会打开它：只要服务器列出了备用模型，新任务就直接用备用模型，聊天收到一条通知；没有可用的备用模型时，任务仍用主模型。10 分钟后下一个任务会再试这个网关；成功则关闭熔断，失败则等待时间翻倍，最长 1 小时。另外，30 分钟内 3 个任务失败会发一条 `🚨` 告警，之后 30 分钟内不再发。
 - 过程说明：orchestrator 在调用子 agent 前写的那句话，会在该步骤的响应完成后加上 bot 的回复前缀发到聊天。每个任务最多 3 条（含重试），每条截断到 800 字；含分段标记或工具调用标记的文字、以及重试时重复的文字不会发送。它尽力而为：不进待发队列，也从不重试。最终回复只经待发队列发送一次。
 - 进度通知属于诊断信息，默认关闭。设置 `OWB_PROGRESS_ENABLED=true` 后，任务运行 20 秒时发 `⏳ 任务 #N 运行中…`，附已运行时长、正在运行的工具和已派出的子 agent 数；之后在派出新子 agent 时或每 5 分钟再发，间隔至少 90 秒，每个任务最多 4 条。即使开启，`OWB_PROGRESS_MAX=0` 也会关掉它们。
 - 每个结果在发送前先存入待发队列（`pending_notices`），按从旧到新的顺序发出。发送失败后依次等待 30 秒、2 分钟、10 分钟、1 小时，等待结束后在你的下一条消息或某个任务结束时重试。
@@ -165,7 +165,7 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 | `/bots` | 列出 bot：id、别名、回复前缀、model、是否默认 |
 | `/model [model]` | 查看或设置之后任务的模型，覆盖所有 bot：`provider/model[#variant]` 或只写 id；`/model default` 恢复各 bot 自己的 model |
 | `/models` | 列出服务上的模型 |
-| `/doctor` | 自检：OpenCode、agent、消息令牌、待补发、数据库、熔断、定时任务和运行时长 |
+| `/doctor` | 自检：OpenCode、agent、消息令牌、待补发、数据库、备用模型、熔断、定时任务和运行时长 |
 | `/panic` | 停止并取消所有任务、拒绝等待中的审批、切到 `plan`、停用所有定时任务 |
 | `/permission [mode]` | 查看或设置 `default`、`acceptEdits`、`plan` 或 `auto` |
 | `/routine …` | 列出定时任务，或对某一个执行 `add`、`rm`、`on`、`off`、`run` |
@@ -202,7 +202,7 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 | `OPENCODE_SERVER_PASSWORD` | 空 | 服务密码，以用户 `opencode` 的 Basic auth 发送 |
 | `WECHAT_ALLOWED_IDS` | 绑定的账号 | bot 接收消息的微信用户 id，逗号分隔 |
 | `OPENCODE_DEFAULT_MODEL` | `oneapi/DeepSeek-V4.1-Flash` | 没有 `/model` 时路由假定的模型；与 orchestrator 的 `model:` 保持一致 |
-| `OPENCODE_FALLBACK_MODEL` | 内置链路 | 那一次重试使用的模型，即使与主模型在同一个 provider 上 |
+| `OPENCODE_FALLBACK_MODEL` | 无 | 上游失败后那一次重试使用的模型，即使与主模型在同一个 provider 上。只在服务器列出它时使用；启动时、`/doctor` 和每次使用前都会核对。未设置：不重试 |
 | `OPENCODE_FIRST_RESPONSE_TIMEOUT_MS`、`OPENCODE_STALL_TIMEOUT_MS` | `120000`、`180000` | 首次输出前、两次进展之间允许的沉默时长 |
 | `OWB_BREAKER_THRESHOLD`、`OWB_BREAKER_COOLDOWN_MS` | `3`、`600000` | 打开熔断所需的连续上游失败次数，以及首次冷却时长 |
 | `OWB_FAILURE_ALERT_COUNT`、`OWB_FAILURE_ALERT_WINDOW_MS`、`OWB_FAILURE_ALERT_COOLDOWN_MS` | `3`、`1800000`、`1800000` | 窗口内触发告警的失败任务数、窗口长度、告警后的静默时长 |

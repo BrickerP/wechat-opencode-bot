@@ -1,7 +1,9 @@
-// Model routing: the cross-gateway fallback and the per-gateway circuit breaker.
+// Model routing: the fallback the owner configured, checked against the server's model list, and the per-gateway
+// circuit breaker.
 import assert from 'node:assert/strict';
 import { beforeEach, test } from 'node:test';
-import { breaker, fallbackModel, providerOf, resetModelRouting } from '../model-routing.js';
+import { breaker, configuredFallback, decideFallback, providerOf, resetModelRouting } from '../model-routing.js';
+import type { ProviderModel } from '../opencode/provider.js';
 
 const MINUTE = 60 * 1000;
 
@@ -19,24 +21,39 @@ function open(provider: string, now: number): void {
   assert.equal(breaker.recordFailure(provider, now), true, 'the third failure opens it');
 }
 
-test('the fallback model is behind another gateway', () => {
+/** What the server lists, as listModels returns it. */
+const LISTED: ProviderModel[] = [
+  { id: 'DeepSeek-V4.1-Flash', modelID: 'DeepSeek-V4.1-Flash', providerID: 'oneapi', name: 'DeepSeek', variants: [] },
+  { id: 'Claude Sonnet 5.5', modelID: 'Claude Sonnet 5.5', providerID: 'oneapi-claude', name: 'Sonnet', variants: ['low', 'max'] },
+];
+
+test('the fallback is OPENCODE_FALLBACK_MODEL and nothing else; blank means none', () => {
   assert.equal(providerOf('oneapi-claude/Claude Sonnet 5.5#high'), 'oneapi-claude');
-  assert.equal(fallbackModel('oneapi/DeepSeek-V4.1-Flash'), 'oneapi-chat-gpt/gpt-6-astra');
-  assert.equal(fallbackModel('oneapi-chat-gpt/gpt-6-astra'), 'oneapi/DeepSeek-V4.1-Flash');
-  const fallback = fallbackModel('oneapi-chat/Opus 5.5');
-  assert.ok(fallback);
-  assert.notEqual(providerOf(fallback), 'oneapi-chat');
+  assert.equal(configuredFallback(), undefined, 'no built-in model stands in');
+  process.env.OPENCODE_FALLBACK_MODEL = '  ';
+  assert.equal(configuredFallback(), undefined);
+  process.env.OPENCODE_FALLBACK_MODEL = ' oneapi/DeepSeek-V4.1-Flash ';
+  assert.equal(configuredFallback(), 'oneapi/DeepSeek-V4.1-Flash', 'even on the primary gateway');
 });
 
-test('OPENCODE_FALLBACK_MODEL wins, even on the same gateway', () => {
-  try {
-    process.env.OPENCODE_FALLBACK_MODEL = ' ';
-    assert.equal(fallbackModel('oneapi/DeepSeek-V4.1-Flash'), 'oneapi-chat-gpt/gpt-6-astra', 'a blank override is ignored');
-    process.env.OPENCODE_FALLBACK_MODEL = 'oneapi/DeepSeek-V4.1-Flash';
-    assert.equal(fallbackModel('oneapi/DeepSeek-V4.1-Flash'), 'oneapi/DeepSeek-V4.1-Flash');
-  } finally {
-    delete process.env.OPENCODE_FALLBACK_MODEL;
-  }
+test('a configured fallback is used only if the server lists it, in its canonical form', () => {
+  assert.deepEqual(decideFallback(undefined, LISTED), { state: 'unset' });
+  assert.deepEqual(decideFallback('oneapi-claude/Claude Sonnet 5.5', LISTED), { state: 'ok', model: 'oneapi-claude/Claude Sonnet 5.5' });
+  assert.deepEqual(decideFallback('Claude Sonnet 5.5', LISTED), { state: 'ok', model: 'oneapi-claude/Claude Sonnet 5.5' }, 'a bare id');
+  assert.deepEqual(decideFallback('oneapi-claude/Claude Sonnet 5.5#max', LISTED), {
+    state: 'ok',
+    model: 'oneapi-claude/Claude Sonnet 5.5#max',
+  });
+  const missing = { state: 'missing', reason: '不在 OpenCode 的模型列表里' };
+  assert.deepEqual(decideFallback('oneapi-claude/Claude Sonnet 5.5#huge', LISTED), { ...missing, configured: 'oneapi-claude/Claude Sonnet 5.5#huge' });
+  // The model the retry of 2026-11-22 went to, after it had been removed from the server.
+  assert.deepEqual(decideFallback('oneapi-chat-gpt/gpt-6-astra', LISTED), { ...missing, configured: 'oneapi-chat-gpt/gpt-6-astra' });
+});
+
+test('a fallback the server could not be asked about is not used, and the reason says why', () => {
+  const check = decideFallback('oneapi/DeepSeek-V4.1-Flash', new Error('GET /api/model -> HTTP 503: Location plugins did not finish activating'));
+  assert.equal(check.state, 'missing');
+  assert.match(check.state === 'missing' ? check.reason : '', /^无法读取 OpenCode 的模型列表（GET \/api\/model -> HTTP 503/);
 });
 
 test('three failures in a row open the breaker, until the cooldown is over', () => {

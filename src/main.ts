@@ -13,6 +13,7 @@ import { backupStateDb } from './backup.js';
 import { isReadOnlyBot } from './bots.js';
 import { acquireDaemonLock, lockHolder, releaseDaemonLock } from './lifecycle.js';
 import { logger } from './logger.js';
+import { checkFallbackAtStartup } from './model-routing.js';
 import { createNotifier, runNotify } from './notify.js';
 import { formatQueueAck, IMAGE_ONLY_INPUT, runTask, saveAttachment } from './orchestrator.js';
 import { initOpenCode, interruptSession } from './opencode/provider.js';
@@ -49,6 +50,24 @@ function promptUser(question: string, defaultValue?: string): Promise<string> {
       resolve(answer.trim() || defaultValue || '');
     });
   });
+}
+
+/**
+ * Says at startup whether an upstream failure will be retried, and on what. The daemon starts either way; tasks
+ * check the fallback again before they use it.
+ */
+async function reportFallback(): Promise<void> {
+  const check = await checkFallbackAtStartup();
+  if (check.state === 'ok') {
+    console.log(`备用模型: ${check.model}`);
+    logger.info('Fallback model listed', { model: check.model });
+  } else if (check.state === 'unset') {
+    console.log('备用模型: 未设置 OPENCODE_FALLBACK_MODEL，上游失败不会重试');
+    logger.info('No fallback model: upstream failures are not retried');
+  } else {
+    console.warn(`⚠️ 备用模型 ${check.configured} ${check.reason}，上游失败不会重试；请更新 OPENCODE_FALLBACK_MODEL`);
+    logger.warn('Fallback model unavailable', { model: check.configured, reason: check.reason });
+  }
 }
 
 async function runSetup(): Promise<void> {
@@ -120,6 +139,7 @@ async function runDaemon(): Promise<void> {
     console.error('\n' + (err instanceof Error ? err.message : String(err)));
     process.exit(1);
   }
+  await reportFallback();
 
   const { accountId } = account;
   const allowedIds = (process.env.WECHAT_ALLOWED_IDS || account.userId || '')

@@ -1,5 +1,5 @@
-// runTask against a fake OpenCode server: the first-response and stall watchdogs, the one-shot fallback to
-// another gateway and the breaker that skips a failing one, the progress notes of a long task (diagnostics, off
+// runTask against a fake OpenCode server: the first-response and stall watchdogs, the one-shot retry on the
+// configured fallback and the breaker that skips a failing gateway, the progress notes of a long task (diagnostics, off
 // unless OWB_PROGRESS_ENABLED), the directory each session opens in, the bot a task speaks as and the model it runs
 // on, the orchestrator agent of each lane, and the handoff, the usage and the attachments a task records.
 import assert from 'node:assert/strict';
@@ -20,10 +20,17 @@ const TOOL_MS = 5000;
 const PROGRESS_MAX = 2;
 const REPLY = '<<<WECHAT_REPLY>>>\nok\n<<<WECHAT_MEMORY>>>\n- 无\n<<<WECHAT_SUMMARY>>>\nok';
 const FACT = '用户喜欢简短的回复';
-/** The session model of the fallback for the default oneapi/DeepSeek-V4.1-Flash. */
+/** The session model of the fallback the tests configure. */
 const GPT = { providerID: 'oneapi-chat-gpt', id: 'gpt-6-astra' };
-/** The session model of oneapi/DeepSeek-V4.1-Flash, which is also the fallback for a GPT model. */
+/** The session model of oneapi/DeepSeek-V4.1-Flash, the default model. */
 const DEEPSEEK = { providerID: 'oneapi', id: 'DeepSeek-V4.1-Flash' };
+/** What the fake server lists on GET /api/model; the fallback is checked against it before every use. */
+const MODELS = [
+  { id: 'DeepSeek-V4.1-Flash', providerID: 'oneapi', variants: [] },
+  { id: 'gpt-6-astra', providerID: 'oneapi-chat-gpt', variants: ['high'] },
+  { id: 'claude-opus-5-5', providerID: 'oneapi-chat', variants: [] },
+];
+const FALLBACK = 'oneapi-chat-gpt/gpt-6-astra';
 const HANDOFF = 'files: /repo/src/a.ts\nnext: 跑一遍测试';
 /** The paths the 'send-files' script lists after its handoff. */
 const attachments: string[] = [];
@@ -135,6 +142,7 @@ function handle(req: IncomingMessage, res: ServerResponse): void {
   req.on('end', () => {
     const url = new URL(req.url ?? '/', 'http://fake');
     const send = (data: unknown) => void res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ data }));
+    if (url.pathname === '/api/model') return send(MODELS);
     if (url.pathname === '/api/session') {
       if (req.method === 'GET') return send(sessions.filter((s) => s.parentID === url.searchParams.get('parentID')));
       const { model, agent, location } = JSON.parse(body);
@@ -174,7 +182,8 @@ process.env.OWB_PROGRESS_FIRST_MS = '300';
 process.env.OWB_PROGRESS_MIN_GAP_MS = '200';
 process.env.OWB_PROGRESS_EVERY_MS = '1000';
 process.env.OWB_PROGRESS_MAX = String(PROGRESS_MAX);
-delete process.env.OPENCODE_FALLBACK_MODEL;
+// Most tests here retry on this fallback; the ones about a missing or unset fallback change it and put it back.
+process.env.OPENCODE_FALLBACK_MODEL = FALLBACK;
 delete process.env.OPENCODE_DEFAULT_MODEL;
 delete process.env.OWB_BREAKER_THRESHOLD;
 delete process.env.OWB_BREAKER_COOLDOWN_MS;
@@ -236,6 +245,7 @@ beforeEach(() => {
   // Gateway state lives in memory for the whole process; each test starts with every breaker closed.
   resetModelRouting();
   delete process.env.OWB_BREAKER_THRESHOLD;
+  process.env.OPENCODE_FALLBACK_MODEL = FALLBACK;
 });
 
 after(() => {
@@ -406,8 +416,8 @@ test('a read-lane task runs on the read-only orchestrator, its retry too; a writ
   assert.deepEqual((await run(['answer'])).roots.map((s) => s.agent), ['wechat-orchestrator']);
 });
 
-test("a task runs on its bot's model unless /model picks one, and a failing bot model falls back behind another gateway", async (t) => {
-  // eng runs Claude; ops runs a GPT variant, so its fallback differs from the default model's.
+test("a task runs on its bot's model unless /model picks one, and a failing bot model retries on the fallback", async (t) => {
+  // eng runs Claude; ops runs a variant of the fallback's model, and its retry runs on the fallback as configured.
   const models: Record<string, string> = { eng: 'oneapi-chat/claude-opus-5-5', ops: 'oneapi-chat-gpt/gpt-6-astra#high' };
   const bots = loadBots();
   const registry = readFileSync(BOTS_PATH, 'utf-8');
@@ -423,9 +433,43 @@ test("a task runs on its bot's model unless /model picks one, and a failing bot 
   };
   assert.deepEqual(await sessionModels(['answer'], 'eng'), [{ providerID: 'oneapi-chat', id: 'claude-opus-5-5' }]);
   assert.deepEqual(await sessionModels(['answer']), [undefined], "a bot without a model runs the agent's own");
-  assert.deepEqual(await sessionModels(['provider-error', 'answer'], 'ops'), [{ ...GPT, variant: 'high' }, DEEPSEEK]);
+  assert.deepEqual(await sessionModels(['provider-error', 'answer'], 'ops'), [{ ...GPT, variant: 'high' }, GPT]);
   db.setModel('test', 'oneapi/DeepSeek-V4.1-Flash');
   assert.deepEqual(await sessionModels(['answer'], 'eng'), [DEEPSEEK], '/model wins over the bot model');
+});
+
+test('a fallback the server no longer lists is not tried, and the error says why', async () => {
+  process.env.OPENCODE_FALLBACK_MODEL = 'oneapi-chat-gpt/gone';
+  const { task, roots, delivered } = await run(['provider-error', 'answer']);
+  assert.equal(task.status, 'failed');
+  assert.equal(roots.length, 1, 'no second session');
+  assert.match(
+    task.error ?? '',
+    /^未重试：备用模型 oneapi-chat-gpt\/gone 不在 OpenCode 的模型列表里，请更新 OPENCODE_FALLBACK_MODEL。OpenCode 执行失败: provider\.internal/,
+  );
+  assert.equal(delivered.length, 1);
+});
+
+test('without a fallback an upstream failure is not retried, and the error is the primary model’s', async () => {
+  delete process.env.OPENCODE_FALLBACK_MODEL;
+  const { task, roots } = await run(['provider-error', 'answer']);
+  assert.equal(task.status, 'failed');
+  assert.equal(roots.length, 1);
+  assert.equal(task.error, 'OpenCode 执行失败: provider.internal: control plan is unavailable');
+});
+
+test('an open breaker without a usable fallback leaves tasks on the primary, and promises no switch', async () => {
+  process.env.OWB_BREAKER_THRESHOLD = '1';
+  process.env.OPENCODE_FALLBACK_MODEL = 'oneapi-chat-gpt/gone';
+  const notices = db.pendingNotices('test').length;
+  const first = await run(['quota']);
+  assert.equal(first.task.status, 'failed');
+  sessions.length = 0;
+  const second = await run(['answer']);
+  assert.equal(second.task.status, 'done');
+  assert.deepEqual(second.roots.map((s) => s.model), [undefined], 'the primary, though its breaker is open');
+  const said = db.pendingNotices('test').slice(notices).map((n) => n.text);
+  assert.ok(!said.some((text) => text.includes('已切到备用模型')), `no notice about a switch that did not happen: ${said.join(' | ')}`);
 });
 
 /** The tokens in, the tokens out and the cost a task recorded. */

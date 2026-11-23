@@ -23,7 +23,7 @@ export function maybeAlertFailures(db: StateDb, accountId: string, now: number =
     if (failed < threshold()) return false;
     db.addNotice(
       accountId,
-      `🚨 最近 ${Math.ceil(span / 60_000)} 分钟有 ${failed} 个任务失败，发送 /status 查看；网关故障会自动切换备用模型。`,
+      `🚨 最近 ${Math.ceil(span / 60_000)} 分钟有 ${failed} 个任务失败，发送 /status 或 /doctor 查看。`,
     );
     lastAlert.set(accountId, now);
     logger.warn('Failure alert queued', { accountId, failed, windowMs: span });

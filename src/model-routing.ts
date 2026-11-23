@@ -1,3 +1,5 @@
+import { findModelRef, formatModelRef, listModels, type ProviderModel } from './opencode/provider.js';
+
 /** Why a turn failed. Only upstream kinds (the gateway or its model) are worth a model on another gateway. */
 export type ErrorKind = 'auth' | 'quota' | 'timeout' | 'transport' | 'server' | 'bad_request' | 'unknown';
 
@@ -7,23 +9,59 @@ export type ErrorKind = 'auth' | 'quota' | 'timeout' | 'transport' | 'server' | 
  */
 export const DEFAULT_MODEL = process.env.OPENCODE_DEFAULT_MODEL || 'oneapi/DeepSeek-V4.1-Flash';
 
-/** Retry candidates, best first: the first one behind another gateway wins. */
-const FALLBACK_CHAIN = ['oneapi-chat-gpt/gpt-6-astra', 'oneapi/DeepSeek-V4.1-Flash', 'oneapi-gemini/Gemini 4 Argon'];
-
 const MAX_COOLDOWN_MS = 60 * 60 * 1000;
 
 /** The gateway, i.e. the OpenCode provider, of "provider/model[#variant]". */
 export const providerOf = (model: string): string => model.trim().split('/', 1)[0];
 
 /**
- * The model to try when primary's gateway fails: OPENCODE_FALLBACK_MODEL when set, even on the same gateway,
- * otherwise the first FALLBACK_CHAIN model behind another gateway. Undefined when there is none.
+ * The model the owner chose for the one retry after an upstream failure: OPENCODE_FALLBACK_MODEL, even on the
+ * primary's gateway. Read on every call. Undefined when unset or blank: upstream failures are then not retried.
  */
-export function fallbackModel(primary: string): string | undefined {
-  const override = process.env.OPENCODE_FALLBACK_MODEL?.trim();
-  if (override) return override;
-  const gateway = providerOf(primary);
-  return FALLBACK_CHAIN.find((model) => providerOf(model) !== gateway);
+export function configuredFallback(): string | undefined {
+  return process.env.OPENCODE_FALLBACK_MODEL?.trim() || undefined;
+}
+
+/** Whether the configured fallback can be used now, and if not, why. */
+export type FallbackCheck =
+  | { state: 'unset' }
+  | { state: 'ok'; model: string }
+  | { state: 'missing'; configured: string; reason: string };
+
+/**
+ * The configured fallback against the server's model list (or the error listing it failed with). A listed model
+ * comes back in its canonical "provider/model[#variant]" form, as /model stores it.
+ */
+export function decideFallback(configured: string | undefined, models: ProviderModel[] | Error): FallbackCheck {
+  if (!configured) return { state: 'unset' };
+  if (models instanceof Error) return { state: 'missing', configured, reason: `无法读取 OpenCode 的模型列表（${models.message.slice(0, 80)}）` };
+  const ref = findModelRef(models, configured);
+  return ref ? { state: 'ok', model: formatModelRef(ref) } : { state: 'missing', configured, reason: '不在 OpenCode 的模型列表里' };
+}
+
+/**
+ * The fallback as it stands now: models get removed from the server while the bot runs (on 2026-11-22 a retry
+ * went to one that was gone), so this asks the server each time a fallback is about to be used. Never throws.
+ */
+export async function checkFallback(signal?: AbortSignal): Promise<FallbackCheck> {
+  const configured = configuredFallback();
+  if (!configured) return { state: 'unset' };
+  const models = await listModels(signal).catch((err: unknown) => (err instanceof Error ? err : new Error(String(err))));
+  return decideFallback(configured, models);
+}
+
+/**
+ * checkFallback at startup, while the server may still answer 503 for a few seconds as its plugins activate:
+ * a failed listing is tried again until about waitMs have passed. Never throws.
+ */
+export async function checkFallbackAtStartup(waitMs = 30_000, pauseMs = 2_000): Promise<FallbackCheck> {
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    const check = await checkFallback();
+    const listingFailed = check.state === 'missing' && check.reason.startsWith('无法读取');
+    if (!listingFailed || Date.now() + pauseMs > deadline) return check;
+    await new Promise((resolve) => setTimeout(resolve, pauseMs));
+  }
 }
 
 // ── circuit breaker ──────────────────────────────────────────────────────

@@ -258,8 +258,8 @@ export function parseModelRef(model: string): { providerID: string; id: string; 
   return { providerID, id, variant };
 }
 
-export async function listModels(): Promise<ProviderModel[]> {
-  const out = await api<{ data: any[] }>("/api/model");
+export async function listModels(signal?: AbortSignal): Promise<ProviderModel[]> {
+  const out = await api<{ data: any[] }>("/api/model", { signal });
   return (out.data || []).map((m) => ({
     id: m.id,
     modelID: m.modelID || m.id,
@@ -275,9 +275,11 @@ export async function listModels(): Promise<ProviderModel[]> {
 
 export type ModelRef = { providerID: string; id: string; variant?: string };
 
-/** Validate a user-supplied model ("provider/model[#variant]" or a bare model id) against the server's model list. */
-export async function resolveModelRef(model: string): Promise<ModelRef | undefined> {
-  const models = await listModels();
+/**
+ * A model ("provider/model[#variant]" or a bare model id) as one of the given server models, or undefined. A
+ * variant must be one the model lists, when it lists any.
+ */
+export function findModelRef(models: ProviderModel[], model: string): ModelRef | undefined {
   const ref = parseModelRef(model);
   const bare = model.trim();
   const hit = ref
@@ -286,6 +288,11 @@ export async function resolveModelRef(model: string): Promise<ModelRef | undefin
   if (!hit) return undefined;
   if (ref?.variant && hit.variants.length && !hit.variants.includes(ref.variant)) return undefined;
   return { providerID: hit.providerID, id: hit.id, variant: ref?.variant };
+}
+
+/** Validate a user-supplied model ("provider/model[#variant]" or a bare model id) against the server's model list. */
+export async function resolveModelRef(model: string): Promise<ModelRef | undefined> {
+  return findModelRef(await listModels(), model);
 }
 
 export function formatModelRef(ref: ModelRef): string {

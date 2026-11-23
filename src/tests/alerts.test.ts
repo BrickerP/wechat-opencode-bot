@@ -24,7 +24,7 @@ const file = join(tmp, 'state.db');
 const db = openStateDb(file);
 const raw = new DatabaseSync(file);
 const alert = (failed: number, minutes = 30): string =>
-  `🚨 最近 ${minutes} 分钟有 ${failed} 个任务失败，发送 /status 查看；网关故障会自动切换备用模型。`;
+  `🚨 最近 ${minutes} 分钟有 ${failed} 个任务失败，发送 /status 或 /doctor 查看。`;
 
 beforeEach(() => resetAlerts());
 

@@ -78,9 +78,9 @@ flowchart LR
 
 - A task runs on the chat's `/model`, else on its bot's `model` from `bots.json`, else on the orchestrator's own `model:`, which routing takes to be `OPENCODE_DEFAULT_MODEL`. Subagents have no `model:` line and run on their parent's model.
 - `bots.json` accepts an optional `model` per bot (`provider/model[#variant]`); `/model` overrides every bot, and `/model default` returns to each bot's own model.
-- An upstream failure gets one retry on the fallback model: `OPENCODE_FALLBACK_MODEL` if set, else the first model of the built-in chain on another provider (gateway). Upstream means 429 or quota, 5xx or overloaded, timeouts, connection errors, `provider.*` errors other than auth, and a model silent for 120 s before its first output or 180 s between signs of progress. The retry's prompt warns that the first attempt may have changed files; you only see the final outcome.
+- An upstream failure gets one retry on `OPENCODE_FALLBACK_MODEL`, if it is set and the server lists it at that moment (`GET /api/model`); models get removed while the bot runs, so it is checked before each use, at startup and by `/doctor`. A fallback that is set but not listed is not tried, and the task's error says so; without one, upstream failures are not retried. Upstream means 429 or quota, 5xx or overloaded, timeouts, connection errors, `provider.*` errors other than auth, and a model silent for 120 s before its first output or 180 s between signs of progress. The retry's prompt warns that the first attempt may have changed files; you only see the final outcome.
 - Not retried: auth, permission, 4xx and unknown errors, errors of the local server, and the 30-minute cap on one attempt.
-- Each gateway has a breaker, kept in memory. 3 upstream failures in a row open it: new tasks start on the fallback and the chat gets one notice. After 10 minutes the next task tries the gateway again; a success closes the breaker, a failure doubles the wait, up to 1 hour. Separately, 3 failed tasks within 30 minutes send one `🚨` alert, then none for 30 minutes.
+- Each gateway has a breaker, kept in memory. 3 upstream failures in a row open it: new tasks start on the fallback and the chat gets one notice, as long as the server lists a fallback; without one, tasks stay on the primary. After 10 minutes the next task tries the gateway again; a success closes the breaker, a failure doubles the wait, up to 1 hour. Separately, 3 failed tasks within 30 minutes send one `🚨` alert, then none for 30 minutes.
 - Commentary: a sentence the orchestrator writes before a subagent call reaches the chat with the bot's reply prefix once that step's response is complete. At most 3 per task, retries included, each cut at 800 characters; text with a marker or tool-call markup, or that a retry repeats, is not sent. It is best-effort: it skips the outbox and is never retried. The final answer goes out once, through the outbox.
 - Progress notes are diagnostics and off by default. With `OWB_PROGRESS_ENABLED=true`, a task sends `⏳ 任务 #N 运行中…` with the elapsed time, the running tools and how many subagents it has started after 20 s, then again when a new subagent starts or every 5 minutes, at least 90 s apart and at most 4 per task. `OWB_PROGRESS_MAX=0` turns them off even then.
 - Every result is stored in the outbox (`pending_notices`) before it is sent, and notices go out oldest first. A failed send waits 30 s, 2 min, 10 min, then 1 h, and is retried after that on your next message or when a task finishes.
@@ -165,7 +165,7 @@ An always-on bot runs a release instead. CI builds every push to `main` and uplo
 | `/bots` | List the bots: id, aliases, reply prefix, model, default |
 | `/model [model]` | Show or set the model for the next tasks, overriding every bot: `provider/model[#variant]` or a bare id; `/model default` returns to each bot's own model |
 | `/models` | List the server's models |
-| `/doctor` | Self-check: OpenCode, agents, message token, outbox, databases, breakers, routines and uptime |
+| `/doctor` | Self-check: OpenCode, agents, message token, outbox, databases, fallback model, breakers, routines and uptime |
 | `/panic` | Stop and cancel every task, deny waiting asks, switch to `plan` and disable every routine |
 | `/permission [mode]` | Show or set `default`, `acceptEdits`, `plan` or `auto` |
 | `/routine …` | List routines, or `add`, `rm`, `on`, `off` or `run` one |
@@ -202,7 +202,7 @@ Every `node dist/main.js` command loads `env` from the data directory, and varia
 | `OPENCODE_SERVER_PASSWORD` | empty | Server password, sent as Basic auth for the user `opencode` |
 | `WECHAT_ALLOWED_IDS` | the bound account | WeChat user ids the bot listens to, comma-separated |
 | `OPENCODE_DEFAULT_MODEL` | `oneapi/DeepSeek-V4.1-Flash` | The model routing assumes without `/model`; keep it equal to the orchestrators' `model:` |
-| `OPENCODE_FALLBACK_MODEL` | the built-in chain | The model for the one retry, even on the same provider |
+| `OPENCODE_FALLBACK_MODEL` | none | The model for the one retry after an upstream failure, even on the same provider. Used only while the server lists it; checked at startup, by `/doctor` and before each use. Unset: no retry |
 | `OPENCODE_FIRST_RESPONSE_TIMEOUT_MS`, `OPENCODE_STALL_TIMEOUT_MS` | `120000`, `180000` | Silence allowed before the first output, and between signs of progress |
 | `OWB_BREAKER_THRESHOLD`, `OWB_BREAKER_COOLDOWN_MS` | `3`, `600000` | Upstream failures in a row that open a breaker, and its first cooldown |
 | `OWB_FAILURE_ALERT_COUNT`, `OWB_FAILURE_ALERT_WINDOW_MS`, `OWB_FAILURE_ALERT_COOLDOWN_MS` | `3`, `1800000`, `1800000` | Failed tasks in the window that send an alert, the window, and the pause after an alert |

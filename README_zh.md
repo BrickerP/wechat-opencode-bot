@@ -46,7 +46,7 @@ flowchart LR
 1. 守护进程长轮询 iLink，忽略不在 `WECHAT_ALLOWED_IDS` 里的人。每条消息都会刷新这个聊天的 `context_token`，每次回复都要用到它。
 2. `y`/`n` 回答正在等待的权限请求，`/` 命令直接得到回复。其余消息都变成任务：守护进程下载第一张图片，把文字分派给一个 bot 和一个项目，再把任务存进 `state.db`。前面还有任务时，它会回复 `⏳ 已排队：任务 #N（前面还有 X 个任务）` 和预计等待时间。
 3. 通道的 worker 取出最早排队的任务，在项目根目录（没有项目时在聊天的工作目录）新开一个 OpenCode 会话。OpenCode 会加载该目录的 `AGENTS.md` 和 `opencode.json`，其中的规则优先于记忆和最近任务。
-4. 会话从不复用，所以上下文由 prompt 携带：时间、附件、bot 的角色、项目、聊天记忆，以及最近 8 个任务（最近 2 个附回复摘录）。
+4. 会话从不复用，所以上下文由 prompt 携带：时间、附件、bot 的角色、项目、聊天记忆，以及最近 8 个任务（各带会话 id，最近 2 个附回复摘录）。消息需要某个早先任务做过什么时，编排器让 `wechat-explore` 用 `--session <id>`（prompt 里给出路径）读那个会话，而不是去搜。
 5. orchestrator 把工作交给 `wechat-explore` 或 `wechat-general`，同时最多 3 个，每个任务最多 6 个。权限请求发到微信。orchestrator 在调用子 agent 前写的一句简短说明可以作为过程说明发到聊天；守护进程自己的进度通知（已运行时长、正在运行的工具、子 agent 数量）默认关闭。
 6. orchestrator 的输出以 `<<<WECHAT_REPLY>>>`、`<<<WECHAT_MEMORY>>>`、`<<<WECHAT_SUMMARY>>>` 收尾，可选带 `<<<WECHAT_HANDOFF>>>` 和 `<<<WECHAT_FILES>>>` 段。守护进程保留回复、把最多 5 条带日期的事实写进记忆，保存摘要、交接、token 用量和文件路径，并在文字之后发送文件。
 7. 2 小时内的下一个任务会收到上一个任务的 handoff（文件、命令、未完成项、下一步），所以“继续”不必只靠摘要重新摸索。结果加上 bot 的回复前缀后只进入待发队列一次，按 2048 字分段；失败显示 `⚠️ 任务 #N 失败：…`，重启中断显示 `⏹ 任务 #N 已中断…`。
@@ -143,6 +143,7 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 | `node dist/main.js --status` | 守护进程的 pid 和 `/status` 报告（不含熔断） |
 | `node dist/main.js --tasks [n]` | 最近 n 个任务 |
 | `node dist/main.js --notify "<text>"` | 给聊天发一条消息。退出码 2（`no_context_token`）或 3（`send_failed`）表示它留在待发队列里 |
+| `node dist/main.js --session <id\|标题>` | 只读：打印一个会话的最后一条助手文本，以及它每个子会话的标题和最后文本，最多 20000 字。什么都没找到时退出码为 1。编排器的子 agent 用它回顾早先的任务 |
 
 在源码目录里，每次改动后都要先 `npm run build`，再使用这些命令。
 

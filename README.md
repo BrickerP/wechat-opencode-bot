@@ -46,7 +46,7 @@ flowchart LR
 1. The daemon long-polls iLink and ignores anyone not in `WECHAT_ALLOWED_IDS`. Each message refreshes the chat's `context_token`, which every reply needs.
 2. `y`/`n` answers a waiting permission ask and a `/` command gets a direct reply. Anything else becomes a task: the daemon downloads the first image, routes the text to a bot and a project, and stores the task in `state.db`. With tasks ahead it replies `⏳ 已排队：任务 #N（前面还有 X 个任务）` and an estimate.
 3. The lane's worker takes the oldest queued task and opens a new OpenCode session at the project root, or in the chat's working directory. OpenCode loads that directory's `AGENTS.md` and `opencode.json`, whose rules take precedence over memory and recent tasks.
-4. Sessions are never resumed, so the prompt carries the context: time, attachments, the bot's role, the project, the chat's memory and the last 8 tasks, with reply excerpts for the latest 2.
+4. Sessions are never resumed, so the prompt carries the context: time, attachments, the bot's role, the project, the chat's memory and the last 8 tasks, each with its session id and with reply excerpts for the latest 2. When a message needs what an earlier task did, the orchestrator has `wechat-explore` read that session with `--session <id>` (its path is in the prompt), instead of searching for it.
 5. The orchestrator hands the work to `wechat-explore` or `wechat-general`, at most 3 at once and 6 per task. Permission asks go to WeChat. A short sentence the orchestrator writes before a subagent call can reach the chat as commentary; the daemon's own progress notes (elapsed time, running tools, subagent count) are off by default.
 6. The orchestrator ends its output with `<<<WECHAT_REPLY>>>`, `<<<WECHAT_MEMORY>>>`, `<<<WECHAT_SUMMARY>>>`, an optional `<<<WECHAT_HANDOFF>>>` and optional `<<<WECHAT_FILES>>>` sections. The daemon keeps the reply, adds up to 5 dated facts to memory, stores the summary, handoff, token usage and file paths, and sends the files after the text.
 7. The next task within 2 hours gets the previous task's handoff (files, commands, open work, next step), so "继续" does not start from the summary alone. The result goes to the outbox once, in 2048-character chunks; a failure reads `⚠️ 任务 #N 失败：…`, a restart `⏹ 任务 #N 已中断…`.
@@ -143,6 +143,7 @@ When OpenCode asks for approval, the daemon applies the mode in `config.env`, re
 | `node dist/main.js --status` | The daemon's pid and the `/status` report, without breakers |
 | `node dist/main.js --tasks [n]` | The last n tasks |
 | `node dist/main.js --notify "<text>"` | Send a message to the chat. Exit code 2 (`no_context_token`) or 3 (`send_failed`) leaves it in the outbox |
+| `node dist/main.js --session <id\|title>` | Read only: print a session's last assistant text and each of its subagent sessions' title and last text, cut at 20,000 characters. Exit code 1 when nothing was found. The orchestrators' subagents run it to recall an earlier task |
 
 In a checkout, run `npm run build` after every change before you use these commands.
 

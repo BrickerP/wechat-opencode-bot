@@ -55,6 +55,8 @@ export interface TaskRow {
   cost_usd: number | null;
   /** JSON array of the absolute paths a done task sends after its text, all checked to be in its workspace; null when none. */
   files: string | null;
+  /** How a done task's orchestrator said it ended: done, needs_input, blocked or failed; null otherwise. */
+  outcome: string | null;
   /** 1-based position of the task in the account's history (computed). */
   seq: number;
 }
@@ -264,6 +266,11 @@ export function openStateDb(file: string = STATE_DB_PATH) {
       // A done task can send files after its text. Older tasks sent none.
       if (!hasColumn('tasks', 'files')) db.exec('ALTER TABLE tasks ADD COLUMN files TEXT');
       db.exec('PRAGMA user_version = 10');
+    }
+    if (version < 11) {
+      // A done task records how its orchestrator said it ended (wechat_report's status). Older tasks have none.
+      if (!hasColumn('tasks', 'outcome')) db.exec('ALTER TABLE tasks ADD COLUMN outcome TEXT');
+      db.exec('PRAGMA user_version = 11');
     }
   });
 
@@ -544,14 +551,15 @@ export function openStateDb(file: string = STATE_DB_PATH) {
         notified?: boolean;
         files?: string[];
         usage?: TaskUsage;
+        outcome?: string;
       } = {},
     ): boolean {
       return immediate(() => {
         const out = run(
-          `UPDATE tasks SET status = ?, finished_at = ?, result = ?, summary = ?, error = ?, notified = ?, files = ?
+          `UPDATE tasks SET status = ?, finished_at = ?, result = ?, summary = ?, error = ?, notified = ?, files = ?, outcome = ?
            WHERE id = ? AND status = 'running'`,
           status, Date.now(), fields.result ?? null, fields.summary ?? null, fields.error ?? null, fields.notified ? 1 : 0,
-          fields.files?.length ? JSON.stringify(fields.files) : null, id,
+          fields.files?.length ? JSON.stringify(fields.files) : null, fields.outcome ?? null, id,
         );
         const { usage } = fields;
         if (usage) run('UPDATE tasks SET tokens_in = ?, tokens_out = ?, cost_usd = ? WHERE id = ?', usage.input, usage.output, usage.cost, id);

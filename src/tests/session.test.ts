@@ -1,6 +1,7 @@
-// /session: a session's last assistant text, read straight from this OpenCode server by id or by a title the
-// session list matches, so the user does not need a task to dig it out; and --session, the same read with every
-// subagent session's report, which the orchestrators' subagents run to recall an earlier task by its id.
+// /session: what a session last answered (its newest wechat_report's reply, else its last assistant text), read
+// straight from this OpenCode server by id or by a title the session list matches, so the user does not need a task
+// to dig it out; and --session, the same read with every subagent session's report, which the orchestrators'
+// subagents run to recall an earlier task by its id.
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -42,15 +43,22 @@ const MESSAGES: Record<string, unknown[]> = {
   ses_arch: [
     // Still running a tool: the turn's text is in the message before it.
     { type: 'assistant', content: [{ type: 'tool', name: 'read', state: { status: 'running' } }] },
-    { type: 'assistant', content: [text('medo 的架构分三层'), { type: 'tool', name: 'read' }, text('<<<WECHAT_REPLY>>>\n就这些')] },
+    { type: 'assistant', content: [text('medo 的架构分三层'), { type: 'tool', name: 'read' }, text('就这些')] },
     { type: 'user', content: [text('讲讲 medo 架构')] },
     { type: 'assistant', content: [text('更早的回复')] },
   ],
   ses_deploy: [{ type: 'assistant', content: [text('部署走流水线')] }],
   ses_empty: [{ type: 'user', content: [text('在吗')] }],
   ses_long: [{ type: 'assistant', content: [text(LONG)] }],
-  // A bot task's orchestrator and its two subagents, one of which wrote no text.
-  ses_task: [{ type: 'assistant', content: [text('编排器的回答')] }],
+  // A bot task's orchestrator, whose answer is its report and not the text it wrote after it, and its two subagents,
+  // one of which wrote no text.
+  ses_task: [
+    { type: 'assistant', content: [text('已经上报。')] },
+    {
+      type: 'assistant',
+      content: [{ type: 'tool', id: 'call_1', name: 'wechat_report', state: { status: 'completed', input: { status: 'done', reply: '编排器的回答', summary: '答了' } } }],
+    },
+  ],
   ses_sub1: [{ type: 'assistant', content: [text('子任务一的报告')] }],
   ses_sub2: [{ type: 'user', content: [text('只有简报')] }],
 };
@@ -116,10 +124,11 @@ test('listSessions pages the list through its cursor and matches titles case-ins
   assert.deepEqual(requests, [LIST_1]);
 });
 
-test("lastAssistantText joins the text parts of the newest assistant message that has any, and is '' without one", async () => {
-  assert.equal(await lastAssistantText('ses_arch'), 'medo 的架构分三层\n<<<WECHAT_REPLY>>>\n就这些');
+test("lastAssistantText: the newest wechat_report's reply, else the newest assistant text, '' without either", async () => {
+  assert.equal(await lastAssistantText('ses_arch'), 'medo 的架构分三层\n就这些');
   assert.deepEqual(requests, ['/api/session/ses_arch/message?limit=100&order=desc']);
   assert.equal(await lastAssistantText('ses_empty'), '');
+  assert.equal(await lastAssistantText('ses_task'), '编排器的回答', 'the report, over the text written after it');
 });
 
 test('/session reads a session by id, or by the one title that matches, and returns its text as it is', async () => {
@@ -130,7 +139,7 @@ test('/session reads a session by id, or by the one title that matches, and retu
   // On the second page only.
   assert.equal(await routeCommand('/session 部署', ctx), '部署走流水线');
   assert.deepEqual(requests, [LIST_1, LIST_2, '/api/session/ses_deploy/message?limit=100&order=desc']);
-  assert.equal(await routeCommand('/session 架构的学习', ctx), 'medo 的架构分三层\n<<<WECHAT_REPLY>>>\n就这些', 'markers and all');
+  assert.equal(await routeCommand('/session 架构的学习', ctx), 'medo 的架构分三层\n就这些');
   assert.match(await routeCommand('/help', ctx), /^ {2}\/session <id\|标题> {2}直接读出/m);
 });
 

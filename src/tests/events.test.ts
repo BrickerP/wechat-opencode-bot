@@ -85,7 +85,8 @@ function handle(req: IncomingMessage, res: ServerResponse): void {
 let play: (session: FakeSession) => void = () => {};
 const answer = (s: FakeSession): void => {
   const at = Date.now();
-  s.messages.push(message('assistant', { time: { created: at, streamed: at }, content: [{ type: 'text', text: 'ok' }] }), message('idle', { outcome: 'succeeded' }));
+  const report = { type: 'tool', id: 'call_report', name: 'wechat_report', state: { status: 'completed', input: { status: 'done', reply: 'ok', summary: 'ok' } } };
+  s.messages.push(message('assistant', { time: { created: at, streamed: at }, content: [report] }), message('idle', { outcome: 'succeeded' }));
 };
 
 const tmp = mkdtempSync(join(tmpdir(), 'owb-events-'));
@@ -163,7 +164,7 @@ test('a model that streams reasoning for longer than both watchdogs, with no sna
   const started = Date.now();
   const result = await openCodeQuery({ prompt: 'hi', cwd: tmp });
   assert.equal(result.error, undefined);
-  assert.equal(result.text, 'ok');
+  assert.equal(result.report?.reply, 'ok');
   assert.ok(Date.now() - started >= STREAM_MS, 'it waited for the answer');
 });
 
@@ -177,5 +178,5 @@ test("a subagent's streaming keeps the turn alive while the root only waits on i
   };
   const result = await openCodeQuery({ prompt: 'hi', cwd: tmp });
   assert.equal(result.error, undefined);
-  assert.equal(result.text, 'ok');
+  assert.equal(result.report?.reply, 'ok');
 });

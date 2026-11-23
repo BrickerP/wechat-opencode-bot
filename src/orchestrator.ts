@@ -21,10 +21,6 @@ const RECENT_TASKS = 8;
 const MAX_SUMMARY_CHARS = 100;
 const MAX_ERROR_CHARS = 200;
 
-const REPLY_MARKER = '<<<WECHAT_REPLY>>>';
-const MEMORY_MARKER = '<<<WECHAT_MEMORY>>>';
-const SUMMARY_MARKER = '<<<WECHAT_SUMMARY>>>';
-const FILES_MARKER = '<<<WECHAT_FILES>>>';
 
 /** The files a task may send after its text, and the size of each. */
 const MAX_FILES = 3;
@@ -45,8 +41,8 @@ export interface TaskIO {
   /** The bridge's own note on a long task, sent only with OWB_PROGRESS_ENABLED; best-effort like commentary. */
   progress?(text: string): void | Promise<void>;
   /**
-   * What the orchestrator says while it works, ahead of its answer. Best-effort: a failed one is dropped, never
-   * queued for retry, and one still waiting to go out when the task finishes is not sent.
+   * What the orchestrator tells the user while it works (its wechat_reply calls), ahead of its answer. Best-effort: a
+   * failed one is dropped, never queued for retry, and one still waiting to go out when the task finishes is not sent.
    */
   commentary?(text: string): void | Promise<void>;
   onPermission?(request: PermissionRequest): Promise<PermissionDecision>;
@@ -170,6 +166,15 @@ export const STATUS_LABEL: Record<TaskStatus, string> = {
   interrupted: '已中断',
 };
 
+/** How the orchestrator said a done task ended, when it was not plain done (wechat_report's status). */
+const OUTCOME_LABEL: Record<string, string> = { needs_input: '等你回复', blocked: '受阻', failed: '没做成' };
+
+/** The task's status as /tasks, <recent_tasks> and the task router show it: "完成·等你回复" for a done task that asked. */
+export const taskStatusLabel = (task: TaskRow): string =>
+  task.status === 'done' && task.outcome && OUTCOME_LABEL[task.outcome]
+    ? `${STATUS_LABEL.done}·${OUTCOME_LABEL[task.outcome]}`
+    : STATUS_LABEL[task.status];
+
 /** Oldest first. */
 function formatRecentTasks(tasks: TaskRow[], defaultBotId: string): string {
   if (!tasks.length) return '(暂无)';
@@ -182,7 +187,7 @@ function formatRecentTasks(tasks: TaskRow[], defaultBotId: string): string {
       // Rows from before bots, like messages that named none, went to the default bot.
       const to = t.bot_id && t.bot_id !== defaultBotId ? `（对 ${t.bot_id}）` : '';
       const lines = [
-        `#${t.seq} ${formatTime(t.created_at)} [${STATUS_LABEL[t.status]}]${project}${session} 用户${to}: ${clip(t.input, MAX_INPUT_CHARS)}`,
+        `#${t.seq} ${formatTime(t.created_at)} [${taskStatusLabel(t)}]${project}${session} 用户${to}: ${clip(t.input, MAX_INPUT_CHARS)}`,
       ];
       if (t.summary) lines.push(`摘要: ${t.summary}`);
       if (t.error) lines.push(`错误: ${clip(t.error, MAX_ERROR_CHARS)}`);
@@ -274,7 +279,7 @@ export function composeContinuation(task: TaskRow, attachments: Attachments, mem
     `<context>\n${context.join('\n')}\n</context>`,
     `<memory>\n${formatMemories(memories)}\n</memory>`,
     `<user_message>\n${messageText(task)}\n</user_message>`,
-    'This message follows up on the work in this session. Answer it in the output format as before.',
+    'This message follows up on the work in this session. End your turn with wechat_report, as before.',
   ].join('\n\n');
 }
 
@@ -283,9 +288,14 @@ export function composeRetry(error: string): string {
   return [
     `<retry>\nYour previous attempt stopped: ${clip(error, MAX_ERROR_CHARS)}\n</retry>`,
     'It may already have changed files or started work, and its last step may be cut off. Check the current state, ' +
-      'then continue from where it stopped instead of starting over. Answer in the output format as before.',
+      'then continue from where it stopped instead of starting over. End your turn with wechat_report, as before.',
   ].join('\n\n');
 }
+
+/** One more turn for a turn that ended without wechat_report, the only answer that reaches the user. */
+const REPORT_NUDGE =
+  'Your turn ended without calling wechat_report, so the user got nothing. Call wechat_report now, once, with your ' +
+  'whole answer for the user, and end the turn.';
 
 /**
  * What a follow-up or /steer sends into a running task's session. The session has the task's prompt already; the
@@ -295,122 +305,12 @@ export function composeSteer(text: string): string {
   return [
     `<user_correction>\n${text}\n</user_correction>`,
     'The user sent this while the task runs. It changes the task in <user_message>: apply it from here on, ' +
-      'and check work already done or delegated where it matters. Only your last answer reaches the user, so if you ' +
-      'have already answered, answer again in full, in the output format as before.',
+      'and check work already done or delegated where it matters. Only your last wechat_report reaches the user, so if you ' +
+      'have already reported, call wechat_report again with the whole answer.',
   ].join('\n\n');
 }
 
 // ── output ───────────────────────────────────────────────────────────────
-
-export interface OrchestratorOutput {
-  reply: string;
-  memory: string[];
-  summary: string;
-  /** Paths to send after the reply, as listed and not yet checked (checkTaskFiles); [] when there are none. */
-  files: string[];
-}
-
-/** Text from start up to the next marker position after it, or the end. */
-function section(body: string, start: number, ...markers: number[]): string {
-  return body.slice(start, Math.min(body.length, ...markers.filter((at) => at >= start)));
-}
-
-const trimmedLines = (text: string): string[] => text.split('\n').map((line) => line.trim());
-
-/** One path per line, without a "-" bullet or backticks; "-" or "无" means there are none. A repeated path counts once. */
-function cleanFiles(text: string): string[] {
-  const paths = trimmedLines(text).map((line) => line.replace(/^[-*]\s+/, '').replace(/^`(.+)`$/, '$1').trim());
-  return [...new Set(paths.filter((path) => path && path !== '-' && path !== '无'))];
-}
-
-/** A DeepSeek tool-call tag, as "<｜｜DSML｜｜invoke name=…>" or "</｜｜DSML｜｜ parameter>". */
-const DSML_TAG = /<\/?[｜|]{1,2}DSML[｜|]{1,2}[^>]*>/g;
-/** A whole tool call, from its opening tag to the closing tag of the same name. */
-const DSML_BLOCK = /<[｜|]{1,2}DSML[｜|]{1,2}\s*([\w-]+)[^>]*>[\s\S]*?<\/[｜|]{1,2}DSML[｜|]{1,2}\s*\1\s*>/g;
-/** Any piece of that markup, a tag cut off before its ">" too. */
-const DSML_MARK = /[｜|]{1,2}DSML[｜|]{1,2}/;
-const ANY_MARKER = /<<<WECHAT_[A-Z]+>>>/g;
-
-/**
- * The text without the DeepSeek tool-call markup that can leak into an answer: whole calls first, then any tag
- * left on its own, then the blank lines they leave behind. Text without that markup only comes back trimmed.
- */
-export function stripToolMarkup(text: string): string {
-  if (!text.match(DSML_TAG)) return text.trim();
-  return text
-    .replace(DSML_BLOCK, '')
-    .replace(DSML_TAG, '')
-    .replace(/(?:[ \t]*\n){3,}/g, '\n\n')
-    .trim();
-}
-
-/** Where the sections of an answer start: the first memory marker, the last summary marker and the files marker after them. */
-function sectionStarts(body: string) {
-  const memoryAt = body.indexOf(MEMORY_MARKER);
-  // The summary ends the required sections, so its last marker counts: one the reply quotes cannot cut the reply short.
-  const summaryAt = body.lastIndexOf(SUMMARY_MARKER);
-  // The files come after every other section and run to the end; a files marker before one of them is quoted.
-  const lastFilesAt = body.lastIndexOf(FILES_MARKER);
-  const filesAt = lastFilesAt > Math.max(memoryAt, summaryAt) ? lastFilesAt : -1;
-  return { memoryAt, summaryAt, filesAt };
-}
-
-/** The reply part of an answer body: its text up to the first section marker. */
-function replyOf(body: string): string {
-  const { memoryAt, summaryAt, filesAt } = sectionStarts(body);
-  return section(body, 0, memoryAt, summaryAt, filesAt);
-}
-
-/** Where each reply marker starts, first to last. */
-function replyMarkers(text: string): number[] {
-  const at: number[] = [];
-  for (let i = text.indexOf(REPLY_MARKER); i !== -1; i = text.indexOf(REPLY_MARKER, i + REPLY_MARKER.length)) at.push(i);
-  return at;
-}
-
-/**
- * Split the orchestrator's answer into the WeChat reply, new memory facts, a one-line summary and the files. The
- * sections follow the last reply marker, so a marker quoted in a draft cannot cut the answer. The reply is the last
- * reply marker's text that is not empty, each running to the next marker; when every one is empty, the model wrote
- * its answer before the markers, and the text before the first one is the reply. No marker: the whole text is the
- * reply. DeepSeek tool-call markup is stripped from every field but the files.
- */
-export function parseOrchestratorOutput(text: string): OrchestratorOutput {
-  const stripped = new Set<string>();
-  const clean = (field: string, raw: string): string => {
-    const out = stripToolMarkup(raw);
-    if (out !== raw.trim()) stripped.add(field);
-    return out;
-  };
-
-  const markers = replyMarkers(text);
-  const body = markers.length ? text.slice(markers.at(-1)! + REPLY_MARKER.length) : text;
-  const { memoryAt, summaryAt, filesAt } = sectionStarts(body);
-
-  let reply = '';
-  for (let i = markers.length - 1; i >= 0 && !reply; i--) {
-    reply = clean('reply', replyOf(text.slice(markers[i] + REPLY_MARKER.length, markers[i + 1] ?? text.length)));
-  }
-  if (!markers.length) reply = clean('reply', replyOf(text));
-  else if (!reply) {
-    reply = clean('reply', text.slice(0, markers[0]).replace(ANY_MARKER, ''));
-    if (reply) logger.warn('Reply markers misplaced; using the text before the marker', { length: reply.length });
-  }
-
-  const memory =
-    memoryAt === -1
-      ? []
-      : trimmedLines(clean('memory', section(body, memoryAt + MEMORY_MARKER.length, summaryAt, filesAt)))
-          .map((line) => /^[-*]\s+(.+)$/.exec(line)?.[1].trim() ?? '')
-          .filter(Boolean);
-  const summary =
-    summaryAt === -1
-      ? ''
-      : (trimmedLines(clean('summary', section(body, summaryAt + SUMMARY_MARKER.length, memoryAt, filesAt))).find(Boolean) ?? '');
-  const files = filesAt === -1 ? [] : cleanFiles(body.slice(filesAt + FILES_MARKER.length));
-  if (stripped.size) logger.warn('Stripped tool markup', { fields: [...stripped] });
-  return { reply, memory, summary: clip(summary || reply, MAX_SUMMARY_CHARS), files };
-}
 
 /** The attachments a task may send, and the listed paths it may not, each with the reason. */
 export interface CheckedFiles {
@@ -468,9 +368,9 @@ const PROGRESS_EVERY_MS = Number(process.env.OWB_PROGRESS_EVERY_MS) || 300_000;
 const PROGRESS_MAX = /^\d+$/.test(process.env.OWB_PROGRESS_MAX ?? '') ? Number(process.env.OWB_PROGRESS_MAX) : 4;
 /** A note names this many of the running tools at most. */
 const PROGRESS_NOTE_TOOLS = 3;
-/** What the orchestrator says while it works reaches the user this many times per task, over all its attempts. */
+/** The orchestrator's wechat_reply calls reach the user this many times per task, over all its attempts. */
 const COMMENTARY_MAX = 3;
-/** Longer commentary is cut to this many characters. */
+/** A longer one is cut to this many characters. */
 const COMMENTARY_MAX_CHARS = 800;
 /** Prompt tokens, cache included, from which a task counts as costly: logged, and flagged in /tasks. Read on use. */
 export const taskWarnTokens = (): number => Number(process.env.OWB_TASK_WARN_TOKENS) || 500_000;
@@ -534,24 +434,23 @@ function progressNotes(task: TaskRow, io: TaskIO, running: () => boolean) {
 }
 
 /**
- * The onAssistantText handler of one task, shared by its attempts: the orchestrator's own words on a step that
- * calls a tool, in its bot's voice, at most COMMENTARY_MAX times and COMMENTARY_MAX_CHARS each. Text with a WECHAT
- * marker is answer text and stays with the result. Text with any tool-call markup is dropped whole, since stripping
- * the tags would leave what the call carried. Words the task has already said (a retry repeating them) are not sent
- * again. The task must still be running when a note is handed to io.commentary, not only when it is chosen.
- * Commentary never goes to the outbox, and a failed one is only logged.
+ * The onReply handler of one task, shared by its attempts and turns: each note the orchestrator sends with
+ * wechat_reply reaches the user once, in its bot's voice, at most COMMENTARY_MAX times and
+ * COMMENTARY_MAX_CHARS each. Words the task has already said (a retry repeating them) are not sent again. The task must
+ * still be running when a note is handed to io.commentary, not only when it is chosen. Commentary never goes to the
+ * outbox, and a failed one is only logged.
  */
 function commentaryNotes(task: TaskRow, io: TaskIO, running: () => boolean) {
   const said = new Set<string>();
-  return ({ messageId, text }: { messageId: string; text: string }): void => {
+  return ({ id, text }: { id: string; text: string }): void => {
     const note = text.trim();
-    if (!io.commentary || !note || note.match(ANY_MARKER) || DSML_MARK.test(note)) return;
+    if (!io.commentary || !note) return;
     const bounded = note.length > COMMENTARY_MAX_CHARS ? `${note.slice(0, COMMENTARY_MAX_CHARS).trimEnd()}…` : note;
     if (said.size >= COMMENTARY_MAX || said.has(bounded) || !running()) return;
     said.add(bounded);
     Promise.resolve()
       .then(() => (running() ? io.commentary?.(`${resolveBot(task.bot_id).bot.prefix}${bounded}`) : undefined))
-      .catch((err) => logger.debug('Commentary failed', { taskId: task.id, messageId, error: String(err) }));
+      .catch((err) => logger.debug('Commentary failed', { taskId: task.id, callId: id, error: String(err) }));
   };
 }
 
@@ -578,11 +477,11 @@ export function joinRunningTask(taskId: string, text: string): boolean {
  * the same session switches to it and continues from where the attempt stopped, and the user hears only the final
  * outcome. Repeated upstream failures open that gateway's breaker: later tasks start on the fallback until the
  * cooldown is over, and the user gets one notice when that begins. Follow-ups that join the task while it runs
- * (joinRunningTask) go into its session. While it runs, what the orchestrator writes on a step that calls a tool
- * reaches the user best-effort (commentaryNotes); the bridge's own progress notes (progressNotes) are diagnostics
- * behind OWB_PROGRESS_ENABLED.
+ * (joinRunningTask) go into its session. The answer is the last turn's wechat_report, whose reply, summary, files
+ * and status the task records; while it runs, the orchestrator's wechat_reply notes reach the user best-effort
+ * (commentaryNotes), and the bridge's own progress notes (progressNotes) are diagnostics behind OWB_PROGRESS_ENABLED.
  * Memory lives in the owner's agentmemory engine: the memories that match the message go into the task's prompt,
- * and a done task's WECHAT_MEMORY facts are saved there, unless io.readOnlyMemory (agentmemory.ts).
+ * and a done task's reported memory facts are saved there, unless io.readOnlyMemory (agentmemory.ts).
  * A task that was finished elsewhere meanwhile (/stop, restart) is not reported again.
  */
 export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: AbortSignal): Promise<void> {
@@ -640,7 +539,7 @@ async function runOpenTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Abort
     // /stop and restarts finish the task elsewhere; only a failing or silent model is worth a second try.
     const running = () => !signal.aborted && db.getTask(task.id)?.status === 'running';
     const onProgress = progressEnabled() ? progressNotes(task, io, running) : undefined;
-    const onAssistantText = commentaryNotes(task, io, running);
+    const onReply = commentaryNotes(task, io, running);
     const query = (prompt: string, next: string | undefined, session: string | undefined, retry: boolean) =>
       openCodeQuery({
         prompt,
@@ -656,8 +555,9 @@ async function runOpenTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Abort
         onPermission: (request) => decidePermission(request, io),
         onSession: (id) => db.setTaskSession(task.id, id),
         onProgress,
-        onAssistantText,
+        onReply,
         followUps,
+        reportNudge: REPORT_NUDGE,
       });
     /**
      * One attempt on model next. A retry (failed set) continues the failed attempt's session and a follow-up task the
@@ -745,7 +645,7 @@ async function runOpenTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Abort
     if (!result.error) breaker.recordSuccess(providerOf(model ?? DEFAULT_MODEL));
   } catch (err) {
     // openCodeQuery reports its own failures; this covers preparing the prompt.
-    result = { text: '', sessionId: '', error: err instanceof Error ? err.message : String(err) };
+    result = { sessionId: '', error: err instanceof Error ? err.message : String(err) };
   }
 
   const threshold = taskWarnTokens();
@@ -763,18 +663,20 @@ async function runOpenTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Abort
     // Also ahead of the outcome, so the flush in deliver sends it now.
     maybeAlertFailures(db, task.account_id);
   } else {
-    const output = parseOrchestratorOutput(result.text);
-    const { files, dropped } = checkTaskFiles(output.files, workspace);
+    // openCodeQuery gives every query that did not fail the report of its last turn.
+    const report = result.report!;
+    const { files, dropped } = checkTaskFiles(report.files, workspace);
     for (const { path, reason } of dropped) logger.warn('Attachment dropped', { taskId: task.id, path, reason });
     // The user hears how many did not come; the log says which and why.
     const note = dropped.length ? `（有 ${dropped.length} 个附件未发送：路径不在工作区、类型/大小不支持或超过 ${MAX_FILES} 个）` : '';
-    const reply = [output.reply, note].filter(Boolean).join('\n');
-    if (!db.finishTask(task.id, 'done', { result: reply, summary: output.summary, files, usage })) return;
+    const reply = [report.reply, note].filter(Boolean).join('\n');
+    const summary = clip(report.summary || report.reply, MAX_SUMMARY_CHARS);
+    if (!db.finishTask(task.id, 'done', { result: reply, summary, files, usage, outcome: report.status })) return;
     if (!io.readOnlyMemory) {
       // Only a memory the prompt showed whole may be replaced. The writes run beside the delivery, so the reply never
       // waits for the memory engine.
       const updatable = new Set(memories.filter((m) => m.full).map((m) => m.id));
-      saving = saveMemories(output.memory, updatable).then((writes) => {
+      saving = saveMemories(report.memory, updatable).then((writes) => {
         if (writes.saved || writes.updated || writes.failed) logger.info('Memory written', { taskId: task.id, seq: task.seq, ...writes });
       });
     }

@@ -33,6 +33,10 @@ const server = createServer((req, res) => {
   const send = (body: unknown) => void res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(body));
   if (req.url === '/api/info') return send({ version: '2.2.1', pid: 1 });
   if (req.url === '/api/agent') return send({ location: { directory: tmp }, data: AGENTS.map((id) => ({ id, name: id })) });
+  // The bridge plugin, as OpenCode lists one that failed to load.
+  if (req.url === '/api/plugin') {
+    return send({ data: [{ id: 'oneapi-retry', state: { status: 'active' } }, { id: 'wechat-bridge', state: { status: 'failed', error: 'SyntaxError: Unexpected token' } }] });
+  }
   const prompt = req.method === 'POST' ? /^\/api\/session\/([^/]+)\/prompt$/.exec(req.url ?? '') : null;
   if (!prompt) return void res.writeHead(404).end();
   let body = '';
@@ -82,7 +86,7 @@ const sized = (text: string): string => text.replace(/^✅ state\.db: [\d.]+ (B|
 /** Lets every pending promise callback run, so a lane can claim its next task. */
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
-test('/doctor asks the running OpenCode for its version and agents, and names the agent it lacks with the fix', async () => {
+test('/doctor asks the running OpenCode for its version, agents and plugins, and names what it lacks with the fix', async () => {
   db.saveContextToken('doc', 'wx-doc', TOKEN);
   const doctor = await routeCommand('/doctor', { accountId: 'doc', db } as CommandContext);
   assert.ok(!doctor.includes(TOKEN), 'the token itself is a credential');
@@ -92,6 +96,9 @@ test('/doctor asks the running OpenCode for its version and agents, and names th
       '🩺 自检：',
       '✅ OpenCode: 已连接（v2.2.1）',
       '❌ Agent: 缺少 wechat-explore',
+      '   修复: scripts/install-agents.sh --apply，再 reload：',
+      `   (set -a; . ${join(tmp, 'data', 'env')}; set +a; opencode reload --server "\${OPENCODE_URL:-http://127.0.0.1:4096}")`,
+      '❌ 插件: wechat-bridge 加载失败（SyntaxError: Unexpected token），任务给不出回复',
       '   修复: scripts/install-agents.sh --apply，再 reload：',
       `   (set -a; . ${join(tmp, 'data', 'env')}; set +a; opencode reload --server "\${OPENCODE_URL:-http://127.0.0.1:4096}")`,
       '⚠️ 事件流: 未启用（进展只靠轮询判断，长时间推理可能被误判为无进展）',
@@ -104,7 +111,7 @@ test('/doctor asks the running OpenCode for its version and agents, and names th
       '✅ 24小时: 完成 0，失败 0，中断 0',
       '✅ 定时任务: 无',
       '✅ 运行时长: <uptime>',
-      '总体: 有 4 项需要注意',
+      '总体: 有 5 项需要注意',
     ].join('\n'),
     'no opencode.db line without the file',
   );
@@ -127,6 +134,7 @@ test('/doctor flags each thing that needs attention and counts them; a healthy d
     // As fetch fails in Node: refused, or the signal's timeout.
     server: rejected(new TypeError('fetch failed', { cause: { code: 'ECONNREFUSED' } })),
     agents: rejected(Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' })),
+    plugins: rejected(new TypeError('fetch failed', { cause: { code: 'ECONNREFUSED' } })),
     // Its cooldown is over: not listed.
     gateways: [{ provider: 'oneapi', openUntil: NOW + 10 * MINUTE }, { provider: 'oneapi-gemini', openUntil: NOW - MINUTE }],
     // The model the retry of 2026-11-22 went to, after it had been removed from the server.
@@ -141,6 +149,7 @@ test('/doctor flags each thing that needs attention and counts them; a healthy d
       '🩺 自检：',
       '❌ OpenCode: 无法连接（fetch failed (ECONNREFUSED)）',
       '❌ Agent: 无法获取（8 秒无响应）',
+      '❌ 插件: 无法获取（fetch failed (ECONNREFUSED)）',
       '⚠️ 事件流: 已断开 5分钟（进展只靠轮询判断，长时间推理可能被误判为无进展）',
       '❌ 消息令牌: 无（结果会等你的下一条消息再发）',
       '⚠️ 待补发: 2 条（最久 1小时30分，重试 2 次）',
@@ -152,7 +161,7 @@ test('/doctor flags each thing that needs attention and counts them; a healthy d
       '⚠️ 24小时: 完成 0，失败 1，中断 0（最近失败 19:30 任务 #1：boom）',
       '✅ 定时任务: 2 个，启用 1 个，下次 11-10 09:00（daily）',
       '✅ 运行时长: 3小时12分',
-      '总体: 有 9 项需要注意',
+      '总体: 有 10 项需要注意',
     ].join('\n'),
   );
 
@@ -160,13 +169,14 @@ test('/doctor flags each thing that needs attention and counts them; a healthy d
   raw.prepare('UPDATE users SET context_token_at = ? WHERE account_id = ?').run(NOW - 13 * HOUR, 'sick');
   const stale = formatDoctor(db, 'sick', sick, NOW);
   assert.match(stale, /^⚠️ 消息令牌: 13小时0分前（超过 12 小时，可能已失效）$/m);
-  assert.match(stale, /^总体: 有 9 项需要注意$/m);
+  assert.match(stale, /^总体: 有 10 项需要注意$/m);
 
   db.saveContextToken('well', 'wx-well', TOKEN);
   raw.prepare('UPDATE users SET context_token_at = ? WHERE account_id = ?').run(NOW - 5 * MINUTE, 'well');
   const well: DoctorProbe = {
     server: fulfilled({}),
     agents: fulfilled(['build', ...REQUIRED_AGENTS].map((id) => ({ id }))),
+    plugins: fulfilled([{ id: 'wechat-bridge', active: true }]),
     gateways: [{ provider: 'oneapi-gemini', openUntil: NOW - MINUTE }],
     fallback: { state: 'ok', model: 'oneapi-claude/Claude Sonnet 5.5' },
     memory: { state: 'ok', url: 'http://127.0.0.1:3111', count: 1332 },
@@ -179,6 +189,7 @@ test('/doctor flags each thing that needs attention and counts them; a healthy d
       '🩺 自检：',
       '✅ OpenCode: 已连接',
       '✅ Agent: 4 个已就绪',
+      '✅ 插件: wechat-bridge 已加载',
       '✅ 事件流: 已连接',
       '✅ 消息令牌: 5分钟前',
       '✅ 待补发: 无',

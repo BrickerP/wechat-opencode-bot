@@ -61,12 +61,13 @@ cp -pR "$ARTIFACT/dist" "$STAGE/dist"
 for file in package.json package-lock.json run-bot.sh run-server.sh; do cp -p "$SRC/$file" "$STAGE/"; done
 mkdir "$STAGE/config" "$STAGE/scripts"
 cp -pR "$SRC/config/agents" "$STAGE/config/agents"
+cp -pR "$SRC/plugin" "$STAGE/plugin"
 cp -p "$SRC/scripts/healthcheck.sh" "$SRC/scripts/collect-work-activity.mjs" "$STAGE/scripts/"
 printf 'tag=%s\ncommit=%s\npackaged=%s\n' "$TAG" "$COMMIT" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STAGE/RELEASE"
 
 mkdir -p "$OUT"
 # COPYFILE_DISABLE keeps macOS tar from adding ._* metadata files.
-(cd "$STAGE" && COPYFILE_DISABLE=1 tar -czf "$WORK/release.tgz" RELEASE dist package.json package-lock.json run-bot.sh run-server.sh config scripts)
+(cd "$STAGE" && COPYFILE_DISABLE=1 tar -czf "$WORK/release.tgz" RELEASE dist package.json package-lock.json run-bot.sh run-server.sh config plugin scripts)
 mv "$WORK/release.tgz" "$TARBALL"
 (cd "$OUT" && shasum -a 256 "wechat-bot-$TAG.tgz" > "wechat-bot-$TAG.tgz.sha256")
 

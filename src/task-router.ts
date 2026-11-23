@@ -6,7 +6,7 @@ import { stopOneTask, type CommandContext } from './commands/handlers.js';
 import { logger } from './logger.js';
 import { DEFAULT_MODEL } from './model-routing.js';
 import { generateText } from './opencode/provider.js';
-import { clip, formatTime, joinRunningTask, STATUS_LABEL } from './orchestrator.js';
+import { clip, formatTime, joinRunningTask, taskStatusLabel } from './orchestrator.js';
 import type { StateDb, TaskLane, TaskProject, TaskRow } from './tasks/db.js';
 
 /** What a message does: new work, more input for one open task (attach), or the end of one (stop). */
@@ -59,20 +59,23 @@ function ago(at: number, now: number): string {
 }
 
 /**
- * The question a done task's reply ends with, its end if it is long, so a short answer such as "M1" or "要" finds the
- * task it answers; '' when the reply asks nothing.
+ * What a done task's reply asked the user, its end if it is long, so a short answer such as "M1" or "要" finds the
+ * task it answers: the end of a reply the orchestrator reported as needs_input, which may list options after its
+ * question, else a last line that ends with a question mark; '' when the reply asks nothing.
  */
 function lastQuestion(task: TaskRow): string {
-  const last = task.status === 'done' ? (task.result ?? '').trim().split('\n').at(-1)!.trim() : '';
-  if (!/[?？][\s"'”’」』)）]*$/.test(last)) return '';
-  return last.length > QUESTION_CHARS ? `…${last.slice(-QUESTION_CHARS)}` : last;
+  if (task.status !== 'done' || !task.result) return '';
+  const tail = (text: string) => (text.length > QUESTION_CHARS ? `…${text.slice(-QUESTION_CHARS)}` : text);
+  if (task.outcome === 'needs_input') return tail(task.result.replace(/\s+/g, ' ').trim());
+  const last = task.result.trim().split('\n').at(-1)!.trim();
+  return /[?？][\s"'”’」』)）]*$/.test(last) ? tail(last) : '';
 }
 
 /** One line per task: number, status, when it last changed, bot, project, what the user asked, what it did, what it asked. */
 function describeTask(task: TaskRow, now: number, defaultBotId: string): string {
   const line = [
     `#${task.seq}`,
-    `[${STATUS_LABEL[task.status]}]`,
+    `[${taskStatusLabel(task)}]`,
     ago(task.finished_at ?? task.started_at ?? task.created_at, now),
     `bot:${task.bot_id ?? defaultBotId}`,
     `项目:${task.project_id ?? '无'}`,

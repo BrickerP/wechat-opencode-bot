@@ -16,15 +16,18 @@ import {
   ORCHESTRATOR_AGENT,
   ORCHESTRATOR_READ_AGENT,
   STATUS_LABEL,
+  taskStatusLabel,
   taskWarnTokens,
 } from '../orchestrator.js';
 import {
+  BRIDGE_PLUGIN,
   eventStreamState,
   formatModelRef,
   lastAssistantText,
   listAgents,
   listChildSessions,
   listModels,
+  listPlugins,
   listSessions,
   openCodeInfo,
   resolveModelRef,
@@ -126,7 +129,7 @@ Bot：
   /permission [模式] 查看或设置权限模式
 
 其他：
-  /doctor           自检：OpenCode 与 agent、事件流、消息令牌、待补发、数据库、记忆、备用模型、熔断和定时任务
+  /doctor           自检：OpenCode 与 agent、桥接插件、事件流、消息令牌、待补发、数据库、记忆、备用模型、熔断和定时任务
   /help             显示帮助
   /version          查看版本
 
@@ -257,6 +260,8 @@ export interface DoctorProbe {
   server: PromiseSettledResult<{ version?: string }>;
   /** listAgents(): GET /api/agent. */
   agents: PromiseSettledResult<Array<{ id: string }>>;
+  /** listPlugins(): GET /api/plugin. */
+  plugins: PromiseSettledResult<Array<{ id: string; active: boolean; error?: string }>>;
   /** breaker.snapshot(): the breakers live in the daemon's memory. */
   gateways: Gateway[];
   /** checkFallback(): OPENCODE_FALLBACK_MODEL against GET /api/model. */
@@ -361,7 +366,7 @@ export async function readSession(
  * attention. The token shows by its age only.
  */
 export function formatDoctor(db: StateDb, accountId: string, probe: DoctorProbe, now: number = Date.now()): string {
-  const { server, agents, gateways, uptimeMs } = probe;
+  const { server, agents, plugins, gateways, uptimeMs } = probe;
   const checks: Check[] = [
     server.status === 'fulfilled'
       ? ['✅', `OpenCode: 已连接${server.value.version ? `（v${server.value.version}）` : ''}`]
@@ -372,6 +377,16 @@ export function formatDoctor(db: StateDb, accountId: string, probe: DoctorProbe,
     const ids = new Set(agents.value.map((a) => a.id));
     const missing = REQUIRED_AGENTS.filter((id) => !ids.has(id));
     checks.push(missing.length ? ['❌', `Agent: 缺少 ${missing.join('、')}\n${AGENTS_FIX}`] : ['✅', `Agent: ${REQUIRED_AGENTS.length} 个已就绪`]);
+  }
+  // Without the bridge's tools an orchestrator has no way to answer: every task fails.
+  if (plugins.status === 'rejected') checks.push(['❌', `插件: 无法获取（${requestError(plugins.reason)}）`]);
+  else {
+    const bridge = plugins.value.find((p) => p.id === BRIDGE_PLUGIN);
+    checks.push(
+      bridge?.active
+        ? ['✅', `插件: ${BRIDGE_PLUGIN} 已加载`]
+        : ['❌', `插件: ${BRIDGE_PLUGIN} ${bridge ? `加载失败（${clip(bridge.error ?? '', 120)}）` : '未加载'}，任务给不出回复\n${AGENTS_FIX}`],
+    );
   }
   const { events } = probe;
   checks.push(
@@ -418,7 +433,7 @@ export function formatTasks(db: StateDb, accountId: string, limit: number): stri
   const threshold = taskWarnTokens();
   return tasks
     .map((t) => {
-      const head = `#${t.seq} ${formatTime(t.created_at)} [${STATUS_LABEL[t.status]}] ${taskInput(t, 40, defaultBotId)}`;
+      const head = `#${t.seq} ${formatTime(t.created_at)} [${taskStatusLabel(t)}] ${taskInput(t, 40, defaultBotId)}`;
       const used =
         t.tokens_in || t.tokens_out
           ? `  ${formatTokens(t.tokens_in ?? 0, t.tokens_out ?? 0)}${t.cost_usd ? ` ${formatCost(t.cost_usd)}` : ''}`
@@ -580,14 +595,15 @@ export const handlers: Record<string, Handler> = {
   async doctor(_args, { accountId, db }) {
     // Bounded: messages are handled one at a time, so a hung OpenCode would hold up every later one.
     const signal = AbortSignal.timeout(OPENCODE_TIMEOUT_MS);
-    const [[server, agents], fallback, memory] = await Promise.all([
-      Promise.allSettled([openCodeInfo(signal), listAgents(signal)]),
+    const [[server, agents, plugins], fallback, memory] = await Promise.all([
+      Promise.allSettled([openCodeInfo(signal), listAgents(signal), listPlugins(signal)]),
       checkFallback(signal),
       checkMemory(signal),
     ]);
     return formatDoctor(db, accountId, {
       server,
       agents,
+      plugins,
       fallback,
       memory,
       events: eventStreamState(),

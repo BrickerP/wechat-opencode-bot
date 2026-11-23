@@ -120,7 +120,7 @@ Configs written for OpenCode 1, the maintainer's included, put providers under a
 
 1. `/models` in WeChat lists the models the server can reach, by provider. Yours must be among them.
 2. `/model <provider/model>` checks the name against the server and uses it for the chat's next tasks. `/model default` goes back to each bot's `model`, or the orchestrator's when the bot sets none.
-3. `/doctor` checks the server, the four agents, the message token, the outbox, the databases, the fallback model, the breakers and the routines. It never calls a model, so a bad key still passes.
+3. `/doctor` checks the server, the four agents, the event stream, the message token, the outbox, the databases, the fallback model, the breakers and the routines. It never calls a model, so a bad key still passes.
 4. `node dist/main.js --simulate "只回复 ok"` runs one real task and prints the reply. It ignores the chat's `/model`, so it tests the default bot's model, or the orchestrator's.
 5. Each `Task finished` line in `~/.wechat-opencode-bot/logs/` records `model`, `attempts`, `fallback` and `errorKind`. `fallback: true` means the task ran on the fallback, because the primary failed or its breaker was open.
 

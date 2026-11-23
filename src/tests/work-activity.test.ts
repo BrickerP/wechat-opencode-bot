@@ -68,7 +68,7 @@ const ENV: NodeJS.ProcessEnv = {
   TZ: 'America/Los_Angeles',
 };
 
-// The prompt test's config and logs follow HOME, its state, memory and registries OWB_DATA_DIR: keep them away from the
+// The prompt test's config and logs follow HOME, its state and registries OWB_DATA_DIR: keep them away from the
 // real bot. ENV above is already built, so the collector's environment stays as it is.
 process.env.HOME = tmp;
 process.env.OWB_DATA_DIR = join(tmp, 'data');

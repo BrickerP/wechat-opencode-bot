@@ -1,5 +1,5 @@
 // The bot roster: the generated registry and its checks, each bot's model, "@bot" routing, the v4 bot_id column,
-// per-bot memory, the <persona> block, reply prefixes, /bots and /status.
+// the <persona> and <memory> blocks, reply prefixes, /bots and /status.
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -10,15 +10,17 @@ import type { CommandContext } from '../commands/handlers.js';
 import type { TaskRow } from '../tasks/db.js';
 
 const tmp = mkdtempSync(join(tmpdir(), 'owb-bots-'));
-// Config and logs follow HOME, state, memory and the registries OWB_DATA_DIR: keep all of them away from the real bot.
+// Config and logs follow HOME, state and the registries OWB_DATA_DIR: keep all of them away from the real bot.
 process.env.HOME = tmp;
 process.env.OWB_DATA_DIR = join(tmp, 'data');
+// No secret under the temporary HOME and no URL: memory is off.
+delete process.env.AGENTMEMORY_URL;
+delete process.env.AGENTMEMORY_SECRET;
 mkdirSync(join(tmp, '.wechat-opencode-bot'));
 writeFileSync(join(tmp, '.wechat-opencode-bot', 'config.env'), `workingDirectory=${tmp}\n`);
 
 const { BOTS_PATH, detectBot, isReadOnlyBot, loadBots, resolveBot } = await import('../bots.js');
 const { logger } = await import('../logger.js');
-const { appendMemory, memoryPath, readMemory } = await import('../memory.js');
 const { composePrompt, resultText } = await import('../orchestrator.js');
 const { openStateDb } = await import('../tasks/db.js');
 const { formatStatus, formatTasks } = await import('../commands/handlers.js');
@@ -27,7 +29,6 @@ const { routeCommand } = await import('../commands/router.js');
 const bots = loadBots();
 const [chief, research] = bots;
 const none = { paths: [], carried: false };
-const DAY = /\[\d{4}-\d{2}-\d{2}\]/.source;
 
 after(() => rmSync(tmp, { recursive: true, force: true }));
 
@@ -161,22 +162,13 @@ test('a v3 database gains bot_id and keeps its rows; new tasks store their bot',
   assert.equal(db.startTaskNow('sim', 'hi', undefined, 'all')?.bot_id, 'all');
 });
 
-test('the default bot keeps the shared memory; every other bot also keeps its own file', () => {
-  const dir = join(tmp, 'data', 'memory', 'mem');
-  assert.equal(memoryPath('mem'), join(dir, 'MEMORY.md'));
-  assert.equal(memoryPath('mem', chief), join(dir, 'MEMORY.md'));
-  const own = memoryPath('mem', research);
-  assert.equal(own, join(dir, 'bots', 'research.md'));
-  assert.equal(appendMemory(own, ['偏好只读调研', '偏好只读调研', '无'], new Date('2026-11-06T04:00:00Z')), 1);
-  assert.equal(readMemory(own), '- [2026-11-06] 偏好只读调研');
-  assert.equal(statSync(own).mode & 0o777, 0o600);
-  assert.equal(readMemory(memoryPath('mem')), '', 'a bot fact stays out of the shared memory');
-});
-test('the prompt names the persona and its memory; the default bot also lists the specialists', () => {
+test('the prompt names the persona, and the default bot also lists the specialists; <memory> shows the matches with ids', () => {
   const db = openStateDb(join(tmp, 'prompt.db'));
-  appendMemory(memoryPath('p'), ['回复用中文']);
-  appendMemory(memoryPath('p', research), ['偏好只读调研']);
-  const prompt = (botId?: string) => composePrompt(db, db.createTask('p', '你好', null, undefined, botId).task, tmp, none);
+  const memories = [
+    { id: 'mem_a', text: '回复用中文', full: true, date: '2026-11-18' },
+    { id: 'mem_b', text: '长…', full: false, date: '' },
+  ];
+  const prompt = (botId?: string) => composePrompt(db, db.createTask('p', '你好', null, undefined, botId).task, tmp, none, { memories });
   const block = (text: string, tag: string) => new RegExp(`<${tag}>\\n([\\s\\S]*?)\\n</${tag}>`).exec(text)?.[1] ?? '';
 
   const asResearch = prompt('research');
@@ -187,15 +179,16 @@ test('the prompt names the persona and its memory; the default bot also lists th
     persona,
     /^You are speaking as 研究\. Match this role\. The repository's AGENTS\.md and opencode\.json take precedence over this persona role, <memory> and <recent_tasks>\.$/m,
   );
-  assert.doesNotMatch(persona, /specialists/);
-  assert.match(block(asResearch, 'memory'), new RegExp(`^- ${DAY} 回复用中文\\n\\n研究 的记忆:\\n- ${DAY} 偏好只读调研$`));
+  assert.doesNotMatch(persona, /specialists|WECHAT_MEMORY/);
+  assert.equal(block(asResearch, 'memory'), '- [mem_a 2026-11-18] 回复用中文\n- [mem_b] 长…');
 
   const asChief = prompt();
   assert.match(block(asChief, 'persona'), /^id: chief\n[\s\S]*^specialists .*:\n- research \(研究\): .*\n- eng \(工程\): .*\n- ops \(Ops\): /m);
-  assert.match(block(asChief, 'memory'), new RegExp(`^- ${DAY} 回复用中文$`), "the default bot does not read another bot's memory");
+  assert.equal(block(asChief, 'memory'), block(asResearch, 'memory'), 'every bot reads the same memories');
   assert.doesNotMatch(asChief, /@all/);
   assert.match(asChief, /用户（对 research）: 你好/, 'recent tasks say which bot each message went to');
   assert.match(block(prompt('all'), 'persona'), /^id: chief\n[\s\S]*\(@all\): .*at most 3 subagents/);
+  assert.equal(block(composePrompt(db, db.createTask('p', '你好').task, tmp, none), 'memory'), '(暂无)');
 });
 
 test('the bridge puts the bot prefix before a reply; the default bot and notices get none', () => {
@@ -222,15 +215,16 @@ test('/bots lists the roster with the default bot, each model and "@all"', async
   assert.match(withModel, /^- eng: 工程（eng, 工程, code）回复前缀「工程：」，model=oneapi-chat\/claude-opus-5-5$/m);
 });
 
-test('/status shows the default bot, the last bot and each memory; /tasks shows the "@bot"', () => {
+test('/status shows the default bot, the last bot and where memories come from; /tasks shows the "@bot"', (t) => {
   const db = openStateDb(join(tmp, 'status.db'));
   assert.match(formatStatus(db, 'st'), /^💬 最近 bot: 无$/m);
   db.createTask('st', 'hi', null, undefined, 'research');
-  appendMemory(memoryPath('st'), ['回复用中文']);
-  appendMemory(memoryPath('st', research), ['偏好只读调研']);
   const status = formatStatus(db, 'st');
   assert.match(status, /^🎭 默认 bot: chief（Chief）$/m);
   assert.match(status, /^💬 最近 bot: research（#1）$/m);
-  assert.match(status, /^🧠 记忆: 共享 1 条，research 1 条$/m);
+  assert.match(status, /^🧠 记忆: 未启用（没有 AGENTMEMORY_SECRET、~\/\.agentmemory\/secret 或 AGENTMEMORY_URL）$/m);
   assert.match(formatTasks(db, 'st', 5), /\] @research hi$/m);
+  t.after(() => void delete process.env.AGENTMEMORY_URL);
+  process.env.AGENTMEMORY_URL = 'http://127.0.0.1:3999/';
+  assert.match(formatStatus(db, 'st'), /^🧠 记忆: agentmemory（http:\/\/127\.0\.0\.1:3999）$/m, 'it asks the engine nothing');
 });

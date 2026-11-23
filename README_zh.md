@@ -22,6 +22,7 @@ Bot： 工程：补了 tests/e2e/login.spec.ts，本地通过。 /tasks 可以�
 flowchart LR
   wechat["微信<br/>(iLink bot API)"] -- "长轮询" --> daemon["bot 守护进程<br/>(Node.js)"]
   daemon <--> db[("state.db<br/>任务队列、待发队列、定时任务")]
+  daemon -- "检索、保存" --> memory[("agentmemory<br/>你的记忆")]
   daemon -- "HTTP API" --> server["OpenCode 服务"]
   server --> orch["orchestrator 会话<br/>(每个任务一个)"]
   orch --> general["wechat-general"]
@@ -39,6 +40,7 @@ flowchart LR
 | orchestrator | primary agent `wechat-orchestrator` 和 `wechat-orchestrator-read` | 规划每个任务、分派工作、撰写回复 |
 | 子 agent | `wechat-general`（能改文件）和 `wechat-explore`（不能） | 干活：读代码、跑命令、改文件 |
 | `state.db` | SQLite（`node:sqlite`），位于数据目录 | 任务、待发队列、定时任务、每个聊天的设置 |
+| agentmemory | 你的记忆引擎，REST 在 `127.0.0.1:3111`；可选 | 保存所有记忆：任务开始前检索，结束后写入。bot 自己不存记忆 |
 | launchd | 两个 macOS 用户级任务，可选 | 让服务和守护进程常驻（[docs/DEPLOY.md](docs/DEPLOY.md)） |
 
 ### 任务生命周期
@@ -46,9 +48,9 @@ flowchart LR
 1. 守护进程长轮询 iLink，忽略不在 `WECHAT_ALLOWED_IDS` 里的人。每条消息都会刷新这个聊天的 `context_token`，每次回复都要用到它。
 2. `y`/`n` 回答正在等待的权限请求，`/` 命令直接得到回复。其余消息都变成任务：守护进程下载第一张图片，把文字分派给一个 bot 和一个项目，再把任务存进 `state.db`。前面还有任务时，它会回复 `⏳ 已排队：任务 #N（前面还有 X 个任务）` 和预计等待时间。
 3. 通道的 worker 取出最早排队的任务，在项目根目录（没有项目时在聊天的工作目录）新开一个 OpenCode 会话。OpenCode 会加载该目录的 `AGENTS.md` 和 `opencode.json`，其中的规则优先于记忆和最近任务。
-4. 会话从不复用，所以上下文由 prompt 携带：时间、附件、bot 的角色、项目、聊天记忆，以及最近 8 个任务（各带会话 id，最近 2 个附回复摘录）。消息需要某个早先任务做过什么时，编排器让 `wechat-explore` 用 `--session <id>`（prompt 里给出路径）读那个会话，而不是去搜。
+4. 会话从不复用，所以上下文由 prompt 携带：时间、附件、bot 的角色、项目、与消息相关的至多 8 条 agentmemory 记忆（各带 id 和日期），以及最近 8 个任务（各带会话 id，最近 2 个附回复摘录）。消息需要某个早先任务做过什么时，编排器让 `wechat-explore` 用 `--session <id>`（prompt 里给出路径）读那个会话，而不是去搜。
 5. orchestrator 把工作交给 `wechat-explore` 或 `wechat-general`，同时最多 3 个，每个任务最多 6 个。权限请求发到微信。orchestrator 在调用子 agent 前写的一句简短说明可以作为过程说明发到聊天；守护进程自己的进度通知（已运行时长、正在运行的工具、子 agent 数量）默认关闭。
-6. orchestrator 的输出以 `<<<WECHAT_REPLY>>>`、`<<<WECHAT_MEMORY>>>`、`<<<WECHAT_SUMMARY>>>` 收尾，可选带 `<<<WECHAT_HANDOFF>>>` 和 `<<<WECHAT_FILES>>>` 段。守护进程保留回复、把最多 5 条带日期的事实写进记忆，保存摘要、交接、token 用量和文件路径，并在文字之后发送文件。
+6. orchestrator 的输出以 `<<<WECHAT_REPLY>>>`、`<<<WECHAT_MEMORY>>>`、`<<<WECHAT_SUMMARY>>>` 收尾，可选带 `<<<WECHAT_HANDOFF>>>` 和 `<<<WECHAT_FILES>>>` 段。守护进程保留回复、把最多 5 条事实存进 agentmemory（以某条记忆的 id 开头的事实会更新那一条），保存摘要、交接、token 用量和文件路径，并在文字之后发送文件。
 7. 2 小时内的下一个任务会收到上一个任务的 handoff（文件、命令、未完成项、下一步），所以“继续”不必只靠摘要重新摸索。结果加上 bot 的回复前缀后只进入待发队列一次，按 2048 字分段；失败显示 `⚠️ 任务 #N 失败：…`，重启中断显示 `⏹ 任务 #N 已中断…`。
 
 ### 路由
@@ -94,7 +96,7 @@ flowchart LR
 | 任务、待发队列、定时任务、每个聊天的设置 | `state.db`：`tasks`、`task_sessions`、`pending_notices`、`routines`、`users` | 打开时执行迁移（`PRAGMA user_version`，只做增量变更） |
 | `state.db` 的备份 | `backups/state-<time>.db` | 启动时若最新备份已超过一天就新建一份；保留 7 份 |
 | OpenCode 会话 | OpenCode 服务 | 任务结束 7 天后经它的 API 删除，始终保留最新 300 个；启动时和每天检查一次 |
-| 记忆 | `memory/<account>/MEMORY.md`（共享，由默认 bot 写入）、`memory/<account>/bots/<id>.md` | 每个任务最多 5 条、每条 300 字；每个文件最多向 prompt 注入 8 KB，上限 16 KB |
+| 记忆 | 你的 agentmemory 引擎（`AGENTMEMORY_URL`），与你的其他 agent 共用 | 由引擎保存。prompt 展示最相关的 8 条，每条截到 600 字；每个任务最多保存或更新 5 条、每条 600 字，带概念标签 `wechat-opencode-bot`。`--simulate` 只读不写。bot 不再读取数据目录下的 `memory/` |
 | 图片 | `attachments/<task>/` | 24 小时；图片任务之后 10 分钟内的文字任务会复用这些图片 |
 | 日志 | `~/.wechat-opencode-bot/logs/` | 每天一个文件，保留 3 个 |
 
@@ -139,7 +141,7 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 | 命令 | 作用 |
 |---|---|
 | `node dist/main.js --daemon` | 前台运行 bot。它持有 `daemon.lock`，第二个实例会打印 `already running (pid N)` 并退出 |
-| `node dist/main.js --simulate "列出工作目录"` | 像收到一条微信消息那样执行一个任务，并打印回复。需要服务已在运行，使用账号 `simulate`，所有权限请求一律拒绝 |
+| `node dist/main.js --simulate "列出工作目录"` | 像收到一条微信消息那样执行一个任务，并打印回复。需要服务已在运行，使用账号 `simulate`，所有权限请求一律拒绝，只读记忆、不保存 |
 | `node dist/main.js --status` | 守护进程的 pid 和 `/status` 报告（不含熔断） |
 | `node dist/main.js --tasks [n]` | 最近 n 个任务 |
 | `node dist/main.js --notify "<text>"` | 给聊天发一条消息。退出码 2（`no_context_token`）或 3（`send_failed`）表示它留在待发队列里 |
@@ -154,7 +156,7 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 | 命令 | 作用 |
 |---|---|
 | `/help` | 显示帮助 |
-| `/status` | 工作目录、项目、bot、模型、权限模式、运行中和排队的任务、记忆；以及 24 小时结果、token 用量、已打开的熔断、待补发数量和消息令牌的时效 |
+| `/status` | 工作目录、项目、bot、模型、权限模式、运行中和排队的任务、记忆来源；以及 24 小时结果、token 用量、已打开的熔断、待补发数量和消息令牌的时效 |
 | `/tasks [n]` | 最近 n 个任务（默认 5 个，最多 20 个），有记录时附带 token 用量；达到 `OWB_TASK_WARN_TOKENS` 的任务标 ⚠️ |
 | `/session <id\|标题>` | 直接读这台 OpenCode 上的会话：原样返回它最后一条助手文本（超过 20000 字截断）；标题匹配多个时列出最多 5 个 id |
 | `/stop` | 停止两条通道里正在运行的任务，并拒绝等待中的权限请求；`/stop all` 同时取消队列 |
@@ -166,7 +168,7 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 | `/bots` | 列出 bot：id、别名、回复前缀、model、是否默认 |
 | `/model [model]` | 查看或设置之后任务的模型，覆盖所有 bot：`provider/model[#variant]` 或只写 id；`/model default` 恢复各 bot 自己的 model |
 | `/models` | 列出服务上的模型 |
-| `/doctor` | 自检：OpenCode、agent、事件流、消息令牌、待补发、数据库、备用模型、熔断、定时任务和运行时长 |
+| `/doctor` | 自检：OpenCode、agent、事件流、消息令牌、待补发、数据库、agentmemory、备用模型、熔断、定时任务和运行时长 |
 | `/panic` | 停止并取消所有任务、拒绝等待中的审批、切到 `plan`、停用所有定时任务 |
 | `/permission [mode]` | 查看或设置 `default`、`acceptEdits`、`plan` 或 `auto` |
 | `/routine …` | 列出定时任务，或对某一个执行 `add`、`rm`、`on`、`off`、`run` |
@@ -214,6 +216,8 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 | `OWB_PROGRESS_FIRST_MS`、`OWB_PROGRESS_MIN_GAP_MS`、`OWB_PROGRESS_EVERY_MS`、`OWB_PROGRESS_MAX` | `20000`、`90000`、`300000`、`4` | 进度通知（需 `OWB_PROGRESS_ENABLED=true`）：首条时间、最小间隔、常规间隔、每个任务的上限；`OWB_PROGRESS_MAX=0` 时一条都不发 |
 | `OWB_TASK_WARN_TOKENS` | `500000` | 输入 token（含缓存）达到这个数的任务会记一条警告日志，并在 `/tasks` 里标 ⚠️ |
 | `OWB_ASR_URL`、`OWB_ASR_MODEL`、`OWB_ASR_API_KEY` | 空、`whisper-1`、空 | 语音没有微信自带转写时使用的 OpenAI 兼容转写接口；SILK 会先解码为 WAV |
+| `AGENTMEMORY_URL` | `http://127.0.0.1:3111` | agentmemory 引擎。没有 secret 的引擎要设置它 |
+| `AGENTMEMORY_SECRET` | `~/.agentmemory/secret` 的内容 | 引擎的 bearer token。它和 `AGENTMEMORY_URL` 都没有时记忆关闭，`/doctor` 会提示 |
 | `OWB_DATA_DIR` | `~/.wechat-opencode-bot` | 数据目录 |
 | `OWB_LOG_LEVEL` | `info` | `debug`、`info`、`warn` 或 `error` |
 

@@ -19,6 +19,9 @@ process.env.OWB_DATA_DIR = join(tmp, 'data');
 process.env.OPENCODE_SERVER_PASSWORD = '';
 // /doctor's fallback line follows this; the tests that need one pass it in their probe.
 delete process.env.OPENCODE_FALLBACK_MODEL;
+// And its memory line these, with no secret under the temporary HOME: memory is off.
+delete process.env.AGENTMEMORY_URL;
+delete process.env.AGENTMEMORY_SECRET;
 mkdirSync(join(tmp, '.wechat-opencode-bot'));
 writeFileSync(join(tmp, '.wechat-opencode-bot', 'config.env'), `workingDirectory=${tmp}\npermissionMode=auto\n`);
 
@@ -99,12 +102,13 @@ test('/doctor asks the running OpenCode for its version and agents, and names th
       '✅ 消息令牌: <age>前',
       '✅ 待补发: 无',
       '✅ state.db: <size>',
+      '⚠️ 记忆: 未启用（没有 AGENTMEMORY_SECRET、~/.agentmemory/secret 或 AGENTMEMORY_URL），任务不带记忆',
       '⚠️ 备用模型: 未设置 OPENCODE_FALLBACK_MODEL（上游失败不会重试）',
       '✅ 熔断: 无',
       '✅ 24小时: 完成 0，失败 0，中断 0',
       '✅ 定时任务: 无',
       '✅ 运行时长: <uptime>',
-      '总体: 有 3 项需要注意',
+      '总体: 有 4 项需要注意',
     ].join('\n'),
     'no opencode.db line without the file',
   );
@@ -131,6 +135,7 @@ test('/doctor flags each thing that needs attention and counts them; a healthy d
     gateways: [{ provider: 'oneapi', openUntil: NOW + 10 * MINUTE }, { provider: 'oneapi-gemini', openUntil: NOW - MINUTE }],
     // The model the retry of 2026-11-22 went to, after it had been removed from the server.
     fallback: { state: 'missing', configured: 'oneapi-chat-gpt/gpt-6-astra', reason: '不在 OpenCode 的模型列表里' },
+    memory: { state: 'unreachable', url: 'http://127.0.0.1:3111', reason: 'fetch failed (ECONNREFUSED)' },
     events: { connected: false, since: NOW - 5 * MINUTE },
     uptimeMs: 3 * HOUR + 12 * MINUTE,
   };
@@ -145,12 +150,13 @@ test('/doctor flags each thing that needs attention and counts them; a healthy d
       '⚠️ 待补发: 2 条（最久 1小时30分，重试 2 次）',
       '✅ state.db: <size>',
       '✅ opencode.db: 1.5 MB（OpenCode 的会话库）',
+      '❌ 记忆: http://127.0.0.1:3111 无法使用（fetch failed (ECONNREFUSED)），任务暂不读写记忆',
       `❌ 备用模型: oneapi-chat-gpt/gpt-6-astra 不在 OpenCode 的模型列表里，上游失败不会重试（在 ${join(tmp, 'data', 'env')} 更新 OPENCODE_FALLBACK_MODEL）`,
       '⚠️ 熔断: oneapi（剩 10 分钟）',
       '⚠️ 24小时: 完成 0，失败 1，中断 0（最近失败 19:30 任务 #1：boom）',
       '✅ 定时任务: 2 个，启用 1 个，下次 11-10 09:00（daily）',
       '✅ 运行时长: 3小时12分',
-      '总体: 有 8 项需要注意',
+      '总体: 有 9 项需要注意',
     ].join('\n'),
   );
 
@@ -158,7 +164,7 @@ test('/doctor flags each thing that needs attention and counts them; a healthy d
   raw.prepare('UPDATE users SET context_token_at = ? WHERE account_id = ?').run(NOW - 13 * HOUR, 'sick');
   const stale = formatDoctor(db, 'sick', sick, NOW);
   assert.match(stale, /^⚠️ 消息令牌: 13小时0分前（超过 12 小时，可能已失效）$/m);
-  assert.match(stale, /^总体: 有 8 项需要注意$/m);
+  assert.match(stale, /^总体: 有 9 项需要注意$/m);
 
   db.saveContextToken('well', 'wx-well', TOKEN);
   raw.prepare('UPDATE users SET context_token_at = ? WHERE account_id = ?').run(NOW - 5 * MINUTE, 'well');
@@ -167,6 +173,7 @@ test('/doctor flags each thing that needs attention and counts them; a healthy d
     agents: fulfilled(['build', ...REQUIRED_AGENTS].map((id) => ({ id }))),
     gateways: [{ provider: 'oneapi-gemini', openUntil: NOW - MINUTE }],
     fallback: { state: 'ok', model: 'oneapi-claude/Claude Sonnet 5.5' },
+    memory: { state: 'ok', url: 'http://127.0.0.1:3111', count: 1332 },
     events: { connected: true, since: NOW - HOUR },
     uptimeMs: 90_000,
   };
@@ -181,6 +188,7 @@ test('/doctor flags each thing that needs attention and counts them; a healthy d
       '✅ 待补发: 无',
       '✅ state.db: <size>',
       '✅ opencode.db: 1.5 MB（OpenCode 的会话库）',
+      '✅ 记忆: agentmemory 已连接（1332 条）',
       '✅ 备用模型: oneapi-claude/Claude Sonnet 5.5',
       '✅ 熔断: 无',
       '✅ 24小时: 完成 0，失败 0，中断 0',

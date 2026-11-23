@@ -5,19 +5,19 @@ import { DATA_DIR } from './constants.js';
 import { logger } from './logger.js';
 
 /**
- * A persona the one WeChat bot speaks as. Personas shape the orchestrator's prompt, its memory and the
- * reply prefix; a read-only bot's tasks also run in the read lane on the read-only orchestrator (see
+ * A persona the one WeChat bot speaks as. Personas shape the orchestrator's prompt and the reply
+ * prefix; a read-only bot's tasks also run in the read lane on the read-only orchestrator (see
  * isReadOnlyBot). The repo's AGENTS.md and opencode.json still come first.
  */
 export interface Bot {
-  /** Also names the bot's memory file, so it stays a plain lowercase file name. */
+  /** A plain lowercase word, as task rows, /bots and the logs show it. */
   id: string;
   name: string;
   /** Names that pick the bot as an "@alias" at the start of a message. */
   aliases: string[];
   /** The bridge puts it before the bot's replies; empty for none. */
   prefix: string;
-  /** Answers messages that name no bot and keeps the account's shared memory. Exactly one bot is the default. */
+  /** Answers messages that name no bot. Exactly one bot is the default. */
   default: boolean;
   role: string;
   /** The subagent the bot prefers for its work; unset means either. */

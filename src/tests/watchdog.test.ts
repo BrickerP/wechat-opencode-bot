@@ -1,7 +1,8 @@
 // runTask against a fake OpenCode server: the first-response and stall watchdogs, the one-shot retry on the
 // configured fallback and the breaker that skips a failing gateway, the progress notes of a long task (diagnostics, off
 // unless OWB_PROGRESS_ENABLED), the directory each session opens in, the bot a task speaks as and the model it runs
-// on, the orchestrator agent of each lane, and the handoff, the usage and the attachments a task records.
+// on, the orchestrator agent of each lane, the memories a task reads and saves through a fake agentmemory engine, and
+// the handoff, the usage and the attachments a task records.
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
@@ -20,6 +21,10 @@ const TOOL_MS = 5000;
 const PROGRESS_MAX = 2;
 const REPLY = '<<<WECHAT_REPLY>>>\nok\n<<<WECHAT_MEMORY>>>\n- 无\n<<<WECHAT_SUMMARY>>>\nok';
 const FACT = '用户喜欢简短的回复';
+/** What the fake agentmemory engine finds for any search, the queries it got and the writes, with their auth. */
+const memoryHits: unknown[] = [];
+const memorySearches: Array<{ q: string | null; auth?: string }> = [];
+const memoryWrites: Array<{ path: string; body: unknown }> = [];
 /** The session model of the fallback the tests configure. */
 const GPT = { providerID: 'oneapi-chat-gpt', id: 'gpt-6-astra' };
 /** The session model of oneapi/DeepSeek-V4.1-Flash, the default model. */
@@ -43,6 +48,7 @@ type Script =
   | 'silent'
   | 'answer'
   | 'remember'
+  | 'update'
   | 'delegate'
   | 'provider-error'
   | 'quota'
@@ -98,6 +104,8 @@ const play: Record<Script, (session: FakeSession) => void> = {
   silent: () => {},
   answer: (s) => later(100, () => answer(s)),
   remember: (s) => later(100, () => answer(s, REPLY.replace('- 无', `- ${FACT}`))),
+  // Rewrites one memory the prompt showed whole and one it showed cut, by their ids.
+  update: (s) => later(100, () => answer(s, REPLY.replace('- 无', '- [mem_a 2026-11-19] 用户在 M1 上工作\n- [mem_long] 长记忆的新版本'))),
   // One subagent runs and finishes, then the orchestrator answers and hands off to the next task.
   delegate: (s) =>
     later(100, () => {
@@ -135,13 +143,22 @@ const play: Record<Script, (session: FakeSession) => void> = {
     later(100, () => answer(s, `${REPLY}\n<<<WECHAT_HANDOFF>>>\n-\n<<<WECHAT_FILES>>>\n${attachments.join('\n')}`)),
 };
 
-/** The few OpenCode routes runTask uses. */
+/** The few OpenCode routes runTask uses, and the agentmemory ones under /agentmemory/. */
 function handle(req: IncomingMessage, res: ServerResponse): void {
   let body = '';
   req.on('data', (chunk) => (body += chunk));
   req.on('end', () => {
     const url = new URL(req.url ?? '/', 'http://fake');
     const send = (data: unknown) => void res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ data }));
+    if (url.pathname.startsWith('/agentmemory/')) {
+      const json = (status: number, data: unknown) => void res.writeHead(status, { 'Content-Type': 'application/json' }).end(JSON.stringify(data));
+      if (url.pathname === '/agentmemory/memories') {
+        memorySearches.push({ q: url.searchParams.get('q'), auth: req.headers.authorization });
+        return json(200, { memories: memoryHits });
+      }
+      memoryWrites.push({ path: url.pathname, body: JSON.parse(body) });
+      return url.pathname === '/agentmemory/evolve' ? json(200, { success: true }) : json(201, { success: true });
+    }
     if (url.pathname === '/api/model') return send(MODELS);
     if (url.pathname === '/api/session') {
       if (req.method === 'GET') return send(sessions.filter((s) => s.parentID === url.searchParams.get('parentID')));
@@ -170,7 +187,7 @@ function handle(req: IncomingMessage, res: ServerResponse): void {
 }
 
 const tmp = mkdtempSync(join(tmpdir(), 'owb-watchdog-'));
-// Logs and config follow HOME, state and memory OWB_DATA_DIR: keep all of them away from the real bot.
+// Logs and config follow HOME, state OWB_DATA_DIR: keep all of them away from the real bot.
 process.env.HOME = tmp;
 process.env.OWB_DATA_DIR = join(tmp, 'data');
 process.env.OPENCODE_SERVER_PASSWORD = '';
@@ -191,6 +208,9 @@ delete process.env.OWB_BREAKER_COOLDOWN_MS;
 const server = createServer(handle);
 await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
 process.env.OPENCODE_URL = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+// The fake server is the agentmemory engine too, so no test reads or writes the owner's.
+process.env.AGENTMEMORY_URL = process.env.OPENCODE_URL;
+process.env.AGENTMEMORY_SECRET = 'test-secret';
 
 // provider.ts reads its settings at module load, so the bot modules load after the fake server is up.
 const { resultText, runTask } = await import('../orchestrator.js');
@@ -207,10 +227,12 @@ interface RunOptions {
   lane?: TaskLane;
   /** Every progress note fails to send, as a reply does while WeChat is unreachable. */
   progressFails?: boolean;
+  /** As --simulate runs a task: it reads memories but saves none. */
+  readOnlyMemory?: boolean;
 }
 
 /** Run one task through the given session scripts. */
-async function run(plan: Script[], { stopAfterMs, project, botId, lane, progressFails }: RunOptions = {}) {
+async function run(plan: Script[], { stopAfterMs, project, botId, lane, progressFails, readOnlyMemory }: RunOptions = {}) {
   scripts.push(...plan);
   const task = db.startTaskNow('test', 'hi', project, botId, lane)!;
   const controller = new AbortController();
@@ -232,6 +254,7 @@ async function run(plan: Script[], { stopAfterMs, project, botId, lane, progress
         progress.push(text);
         if (progressFails) throw new Error('send failed');
       },
+      readOnlyMemory,
     },
     controller.signal,
   );
@@ -242,6 +265,9 @@ async function run(plan: Script[], { stopAfterMs, project, botId, lane, progress
 beforeEach(() => {
   sessions.length = 0;
   scripts.length = 0;
+  memoryHits.length = 0;
+  memorySearches.length = 0;
+  memoryWrites.length = 0;
   // Gateway state lives in memory for the whole process; each test starts with every breaker closed.
   resetModelRouting();
   delete process.env.OWB_BREAKER_THRESHOLD;
@@ -394,18 +420,48 @@ test('a project task opens its sessions at the repo root, any other task in the 
   assert.deepEqual((await run(['answer'])).roots.map((s) => s.directory), [workspace]);
 });
 
-test('a task speaks as its bot: the persona in the prompt, the reply prefix, and where its memory goes', async () => {
-  const memory = join(tmp, 'data', 'memory', 'test');
-  const research = await run(['remember'], { botId: 'research' });
+test('a task speaks as its bot: the persona in the prompt and the reply prefix', async () => {
+  const research = await run(['answer'], { botId: 'research' });
   assert.match(research.roots[0].prompt ?? '', /<persona>\nid: research\n/);
   assert.equal(resultText(research.task), '研究：ok');
-  assert.match(readFileSync(join(memory, 'bots', 'research.md'), 'utf-8'), new RegExp(`^- \\[\\d{4}-\\d{2}-\\d{2}\\] ${FACT}$`, 'm'));
   sessions.length = 0;
-  const chief = await run(['remember']);
+  const chief = await run(['answer']);
   assert.match(chief.roots[0].prompt ?? '', /<persona>\nid: chief\n/);
-  assert.doesNotMatch(chief.roots[0].prompt ?? '', new RegExp(FACT), "the default bot does not read another bot's memory");
   assert.equal(resultText(chief.task), 'ok');
-  assert.match(readFileSync(join(memory, 'MEMORY.md'), 'utf-8'), new RegExp(FACT));
+});
+
+test("the memories that match the message reach every attempt's prompt, and a done task's fact is saved", async () => {
+  // 17:00 UTC is the next day in Shanghai.
+  memoryHits.push({ id: 'mem_a', content: '用户  在 M5\n上工作', updatedAt: '2026-11-18T17:00:00Z' });
+  const { task, roots } = await run(['provider-error', 'remember']);
+  assert.equal(task.status, 'done');
+  assert.deepEqual(memorySearches, [{ q: 'hi', auth: 'Bearer test-secret' }], 'one search, with the message, for both attempts');
+  assert.equal(roots.length, 2);
+  for (const root of roots) assert.match(root.prompt ?? '', /\n<memory>\n- \[mem_a 2026-11-19\] 用户 在 M5 上工作\n<\/memory>\n/);
+  assert.deepEqual(memoryWrites, [{ path: '/agentmemory/remember', body: { content: FACT, concepts: ['wechat-opencode-bot'] } }]);
+
+  memoryHits.length = 0;
+  sessions.length = 0;
+  assert.match((await run(['answer'])).roots[0].prompt ?? '', /\n<memory>\n\(暂无\)\n<\/memory>\n/, 'nothing matched');
+});
+
+test('a fact naming a memory shown whole updates it; one shown cut is saved as a new memory', async () => {
+  memoryHits.push({ id: 'mem_a', content: '用户在 M5 上工作', updatedAt: '2026-11-18T17:00:00Z' }, { id: 'mem_long', content: '长'.repeat(700) });
+  await run(['update']);
+  assert.deepEqual(memoryWrites, [
+    { path: '/agentmemory/evolve', body: { memoryId: 'mem_a', newContent: '用户在 M1 上工作' } },
+    { path: '/agentmemory/remember', body: { content: '长记忆的新版本', concepts: ['wechat-opencode-bot'] } },
+  ]);
+});
+
+test('a read-only run, as --simulate is, reads memories and saves none; a failed task saves none either', async () => {
+  const simulated = await run(['remember'], { readOnlyMemory: true });
+  assert.equal(simulated.task.status, 'done');
+  assert.equal(memorySearches.length, 1);
+  assert.deepEqual(memoryWrites, []);
+  delete process.env.OPENCODE_FALLBACK_MODEL;
+  assert.equal((await run(['provider-error'])).task.status, 'failed');
+  assert.deepEqual(memoryWrites, []);
 });
 
 test('a read-lane task runs on the read-only orchestrator, its retry too; a write task on the full one', async () => {

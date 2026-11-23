@@ -10,7 +10,7 @@ import { after, test } from 'node:test';
 import type { TaskRow, TaskUsage } from '../tasks/db.js';
 
 const tmp = mkdtempSync(join(tmpdir(), 'owb-task-meta-'));
-// Config and logs follow HOME, state, memory and the registries OWB_DATA_DIR: keep all of them away from the real bot.
+// Config and logs follow HOME, state and the registries OWB_DATA_DIR: keep all of them away from the real bot.
 process.env.HOME = tmp;
 process.env.OWB_DATA_DIR = join(tmp, 'data');
 

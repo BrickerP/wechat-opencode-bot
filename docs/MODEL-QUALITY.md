@@ -31,7 +31,7 @@ Run the same five cases before and after a change, and change one thing per pass
 Every case of every pass runs in isolation, never in a real chat:
 
 1. A new temporary directory per run, with an empty `fixture/` that holds no repository. It is the run's working directory and workspace, so no case reads real work.
-2. Its own `HOME` and `OWB_DATA_DIR` in that directory, so the account, `config.env`, logs, `state.db`, memory and recent tasks start empty. The live data directory's `simulate` account has its own, the watchdog's daily smoke tests among them.
+2. Its own `HOME` and `OWB_DATA_DIR` in that directory, so the account, `config.env`, logs, `state.db` and recent tasks start empty. A temporary `HOME` has no `~/.agentmemory/secret`, so the bot's memory is off as long as the environment sets neither `AGENTMEMORY_SECRET` nor `AGENTMEMORY_URL`: `<memory>` is `(暂无)`, and `--simulate` never saves a memory anyway. The live data directory's `simulate` account has its own, the watchdog's daily smoke tests among them.
 3. The same seed every time: the same `bots.json` in the data directory and the same environment. A model pass changes only chief's `model` in the seed; a new data directory has no `/model`, so that `model` applies.
 4. `--simulate` only, never the daemon or a chat: it sends nothing to WeChat and denies every permission ask.
 5. No live memory. The OpenCode server's global rules and MCP servers reach every run; if they let an agent read a memory store, such as an agentmemory server, evaluate on a server without that access. A run whose session record shows a memory read is void.

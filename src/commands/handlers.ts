@@ -2,11 +2,11 @@ import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { checkMemory, memoryConnection, type MemoryCheck } from '../agentmemory.js';
 import { BOTS_PATH, defaultBot, detectBot, isReadOnlyBot, loadBots, type Bot } from '../bots.js';
 import { loadConfig, saveConfig, type PermissionMode } from '../config.js';
 import { DATA_DIR } from '../constants.js';
 import { logger } from '../logger.js';
-import { memoryPath, memoryStats } from '../memory.js';
 import { breaker, checkFallback, type FallbackCheck } from '../model-routing.js';
 import {
   clip,
@@ -91,6 +91,8 @@ const OPENCODE_TIMEOUT_MS = 8000;
 const TOKEN_STALE_MS = 12 * 60 * 60 * 1000;
 /** OpenCode's own database: /doctor reads its size, never its contents. */
 const OPENCODE_DB_PATH = join(homedir(), '.local', 'share', 'opencode', 'opencode.db');
+/** Why memory is off: agentmemory.ts finds neither a secret nor an explicit URL. */
+const MEMORY_OFF = '没有 AGENTMEMORY_SECRET、~/.agentmemory/secret 或 AGENTMEMORY_URL';
 
 const HELP_TEXT = `可用命令：
 
@@ -125,7 +127,7 @@ Bot：
   /permission [模式] 查看或设置权限模式
 
 其他：
-  /doctor           自检：OpenCode 与 agent、事件流、消息令牌、待补发、数据库、备用模型、熔断和定时任务
+  /doctor           自检：OpenCode 与 agent、事件流、消息令牌、待补发、数据库、记忆、备用模型、熔断和定时任务
   /help             显示帮助
   /version          查看版本
 
@@ -162,14 +164,10 @@ function lastBot(db: StateDb, accountId: string, defaultBotId: string): string {
   return last ? `${last.bot_id ?? defaultBotId}（#${last.seq}）` : '无';
 }
 
-/** The shared memory, then each other bot's own memory that holds any facts. */
-function memoryCounts(accountId: string, bots: Bot[]): string {
-  const counts = [`共享 ${memoryStats(memoryPath(accountId)).bullets} 条`];
-  for (const bot of bots.filter((b) => !b.default)) {
-    const { bullets } = memoryStats(memoryPath(accountId, bot));
-    if (bullets) counts.push(`${bot.id} ${bullets} 条`);
-  }
-  return counts.join('，');
+/** Where the tasks' memories come from; /doctor checks that the engine answers. */
+function memorySource(): string {
+  const connection = memoryConnection();
+  return connection ? `agentmemory（${connection.url}）` : `未启用（${MEMORY_OFF}）`;
 }
 
 /** Tasks that finished in the last 24 hours by outcome, and the latest failure among them. */
@@ -242,7 +240,7 @@ export function formatStatus(db: StateDb, accountId: string, gateways?: Gateway[
     `▶️ 运行中: ${running.join('；') || '无'}`,
     `⏳ 排队: ${counts.queued} 个`,
     `📊 累计: ${total} 个任务（完成 ${counts.done}，失败 ${counts.failed}，中断 ${counts.interrupted}）`,
-    `🧠 记忆: ${memoryCounts(accountId, bots)}`,
+    `🧠 记忆: ${memorySource()}`,
     `🩺 ${dayHealth(db, accountId, now).text}`,
     `📊 24h tokens: ${formatTokens(day.input, day.output)}${day.cost > 0 ? `（${formatCost(day.cost)}）` : ''}`,
     `🧯 熔断: ${gateways ? openBreakers(gateways, now) : '仅 bot 进程内可见，在微信发送 /status 查看'}`,
@@ -264,6 +262,8 @@ export interface DoctorProbe {
   gateways: Gateway[];
   /** checkFallback(): OPENCODE_FALLBACK_MODEL against GET /api/model. */
   fallback: FallbackCheck;
+  /** checkMemory(): whether the agentmemory engine answers. */
+  memory: MemoryCheck;
   /** eventStreamState(): undefined when this process does not follow GET /api/event. */
   events: EventStreamState | undefined;
   /** How long the daemon has been up. */
@@ -294,6 +294,13 @@ function fallbackCheck(fallback: FallbackCheck): Check {
   if (fallback.state === 'ok') return ['✅', `备用模型: ${fallback.model}`];
   if (fallback.state === 'unset') return ['⚠️', '备用模型: 未设置 OPENCODE_FALLBACK_MODEL（上游失败不会重试）'];
   return ['❌', `备用模型: ${fallback.configured} ${fallback.reason}，上游失败不会重试（在 ${join(DATA_DIR, 'env')} 更新 OPENCODE_FALLBACK_MODEL）`];
+}
+
+/** The memory line: off is worth a look, an engine that does not answer is broken. */
+function memoryCheck(memory: MemoryCheck): Check {
+  if (memory.state === 'ok') return ['✅', `记忆: agentmemory 已连接（${memory.count} 条）`];
+  if (memory.state === 'off') return ['⚠️', `记忆: 未启用（${MEMORY_OFF}），任务不带记忆`];
+  return ['❌', `记忆: ${memory.url} 无法使用（${memory.reason}），任务暂不读写记忆`];
 }
 
 /** What readSession shows, and whether it found any assistant text. */
@@ -387,6 +394,7 @@ export function formatDoctor(db: StateDb, accountId: string, probe: DoctorProbe,
   checks.push(stateDb ? ['✅', `state.db: ${formatSize(stateDb.size)}`] : ['❌', `state.db: 未找到 ${STATE_DB_PATH}`]);
   const openCodeDb = statSync(OPENCODE_DB_PATH, { throwIfNoEntry: false });
   if (openCodeDb) checks.push(['✅', `opencode.db: ${formatSize(openCodeDb.size)}（OpenCode 的会话库）`]);
+  checks.push(memoryCheck(probe.memory));
   checks.push(fallbackCheck(probe.fallback));
   checks.push([gateways.some((g) => g.openUntil > now) ? '⚠️' : '✅', `熔断: ${openBreakers(gateways, now)}`]);
   const day = dayHealth(db, accountId, now);
@@ -557,14 +565,16 @@ export const handlers: Record<string, Handler> = {
   async doctor(_args, { accountId, db }) {
     // Bounded: messages are handled one at a time, so a hung OpenCode would hold up every later one.
     const signal = AbortSignal.timeout(OPENCODE_TIMEOUT_MS);
-    const [[server, agents], fallback] = await Promise.all([
+    const [[server, agents], fallback, memory] = await Promise.all([
       Promise.allSettled([openCodeInfo(signal), listAgents(signal)]),
       checkFallback(signal),
+      checkMemory(signal),
     ]);
     return formatDoctor(db, accountId, {
       server,
       agents,
       fallback,
+      memory,
       events: eventStreamState(),
       gateways: breaker.snapshot(),
       uptimeMs: process.uptime() * 1000,

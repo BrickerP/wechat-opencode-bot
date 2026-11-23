@@ -1,11 +1,11 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { longestFirst, mentionPattern, prefixPattern } from './aliases.js';
-import { ALL_BOTS, botAliases, defaultBot, detectBot, loadBots, type Bot } from './bots.js';
+import { botAliases, defaultBot, detectBot, loadBots, type Bot } from './bots.js';
 import { loadConfig } from './config.js';
 import { DATA_DIR } from './constants.js';
 import { logger } from './logger.js';
-import type { StateDb, TaskProject, TaskRow } from './tasks/db.js';
+import type { TaskProject } from './tasks/db.js';
 
 /**
  * A repo a task can run in. The registry only routes messages: the task's session opens at the
@@ -35,13 +35,7 @@ const PROJECT_MARKERS = ['.git', 'AGENTS.md', 'opencode.json'];
 const PROJECT_ID = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 const BASE_ID = 'base';
 
-/** A follow-up stays in the previous task's project, and with its bot, only if that task came this recently. */
-const FOLLOW_UP_MS = 2 * 60 * 60 * 1000;
-/** A follow-up opens with one of these cues; inside another word (其它, 再见) or later in a sentence they mean nothing. */
-const FOLLOW_UP = /^(继续|接着|然后|再(?!见)|那|这个|上面|刚才|它|还有|第二个|改一下|看一下)/;
-/** Longer messages are new requests: they name their project or run in the base. */
-const FOLLOW_UP_MAX_CHARS = 32;
-/** Opens a message that follows neither the last project nor the last bot; it comes off the text. */
+/** Opens a message that is new work, whatever tasks are open; it comes off the text. */
 const NEW_TOPIC = /^\s*(?:新话题|换个话题|new\s+topic(?![A-Za-z]))(?=$|[\s:：,，])[\s:：,，]*/i;
 /** "@base" at the start runs the task in the base workspace, whether or not the registry has a "base" project. */
 const BASE_PREFIX = prefixPattern('base');
@@ -209,26 +203,16 @@ export function removeProject(base: string, file: string, key: string): Project 
   return { id: String(entry.id), dir: String(entry.dir), aliases: Array.isArray(entry.aliases) ? entry.aliases.map(String) : [] };
 }
 
-/** An image without text, or a short message that opens with a follow-up cue. */
-function isFollowUp(text: string): boolean {
-  const message = text.trim();
-  return !message || (message.length <= FOLLOW_UP_MAX_CHARS && FOLLOW_UP.test(message));
-}
-
 /**
- * The project a message is about, in order: an "@alias" prefix, an alias mentioned anywhere, then
- * a follow-up (a short message opening with "继续" and the like, or an image without text) staying
- * in the previous task's project. null runs the task in the base workspace. Only registry entries
- * count; a path in the message never does.
+ * The project a message is about: an "@alias" prefix, else an alias mentioned anywhere. null runs the task in the
+ * base workspace. Only registry entries count; a path in the message never does.
  */
-export function detectProject(text: string, projects: Project[], lastProjectId?: string | null): Project | null {
+export function detectProject(text: string, projects: Project[]): Project | null {
   const aliases = longestFirst(projects.flatMap((project) => project.aliases.map((alias) => ({ project, alias }))));
   const named =
     aliases.find(({ alias }) => prefixPattern(alias).test(text)) ??
     aliases.find(({ alias }) => alias.length >= MIN_MENTION_CHARS && mentionPattern(alias).test(text));
-  if (named) return named.project;
-  if (lastProjectId && isFollowUp(text)) return projects.find((p) => p.id === lastProjectId) ?? null;
-  return null;
+  return named?.project ?? null;
 }
 
 /** The message without its "@alias" prefix; the whole message if nothing would be left. */
@@ -241,16 +225,11 @@ export function stripProjectPrefix(text: string, project: Project): string {
  * Who answers an inbound message, where it runs, and the text to store for it. The "@bot" prefix
  * comes off first and the project is found in the rest, so "@research 在 miaoda 里…" is both. A
  * message that opens with "@project" or "@base" may name its bot right after it: "@miaoda @eng …".
- * A short follow-up such as "继续" that names no bot stays with the last task's bot, as it stays in
- * the last task's project; "新话题：…" follows neither. No project means the account's workspace.
- * follows is that last task when the message is a follow-up of it with the same bot and project: the daemon then
- * joins the message to that task, or continues its session.
+ * "新话题：…" comes off as well. No "@bot" means the default bot, and no project the account's workspace.
+ * prefixed: the message opened with "@bot", "@project", "@base" or "新话题", which settles that it is new work;
+ * any other message may belong to an open task, and the task router decides (task-router.ts).
  */
-export function routeMessage(
-  db: StateDb,
-  accountId: string,
-  text: string,
-): { input: string; project?: TaskProject; botId: string; follows?: TaskRow } {
+export function routeMessage(text: string): { input: string; project?: TaskProject; botId: string; prefixed: boolean } {
   const bots = loadBots();
   const topic = NEW_TOPIC.exec(text);
   const message = (topic && text.slice(topic[0].length).trim()) || text;
@@ -258,21 +237,11 @@ export function routeMessage(
   // Only a message that no "@bot" opened looks for one after the project; a message names one bot.
   const opened = botId !== defaultBot(bots).id || rest !== message;
   const withBot = (input: string) => (opened ? { botId, input } : detectBot(input, bots));
-  if (BASE_PREFIX.test(rest)) return withBot(rest.replace(BASE_PREFIX, '').trim() || rest);
+  if (BASE_PREFIX.test(rest)) return { ...withBot(rest.replace(BASE_PREFIX, '').trim() || rest), prefixed: true };
 
   const base = loadConfig().workingDirectory;
-  const last = topic ? undefined : db.recentTasks(accountId, 1)[0];
-  const recent = last && Date.now() - last.created_at <= FOLLOW_UP_MS ? last : undefined;
-  const project = detectProject(rest, loadProjects(base, PROJECTS_PATH, bots), recent?.project_id);
-  const routed: { input: string; botId: string; follows?: TaskRow } = withBot(project ? stripProjectPrefix(rest, project) : rest);
-  // A follow-up opens with its cue, so no "@project" and no "@bot" stands before it.
-  const lastBot = recent?.bot_id;
-  if (!opened && lastBot && isFollowUp(rest) && (lastBot === ALL_BOTS || bots.some((bot) => bot.id === lastBot))) {
-    routed.botId = lastBot;
-  }
-  // Rows from before bots went to the default bot.
-  const sameWork =
-    recent && routed.botId === (recent.bot_id ?? defaultBot(bots).id) && (project?.id ?? null) === recent.project_id;
-  if (sameWork && isFollowUp(rest)) routed.follows = recent;
+  const project = detectProject(rest, loadProjects(base, PROJECTS_PATH, bots));
+  const named = project !== null && project.aliases.some((alias) => prefixPattern(alias).test(rest));
+  const routed = { ...withBot(project ? stripProjectPrefix(rest, project) : rest), prefixed: topic !== null || opened || named };
   return project ? { ...routed, project: { id: project.id, dir: resolveProjectDir(base, project) } } : routed;
 }

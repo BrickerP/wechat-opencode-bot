@@ -1,5 +1,5 @@
 // Permission asks: a queue per account that y/n answers oldest first, a timeout per ask, /stop rejecting
-// every ask, a cap of three; and the ask a task sends, which names the task.
+// every ask and a task stopped alone its own, a cap of three; and the ask a task sends, which names the task.
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -96,6 +96,19 @@ test('rejecting without an answer rejects every ask (/stop); with one, only that
   await settle();
   assert.deepEqual(settled, [false, false, false]);
   assert.equal(broker.rejectPending('acc'), false);
+});
+
+test('rejecting a task rejects only the asks that task made', async () => {
+  const broker = createPermissionBroker();
+  const [a, b, c] = ['A', 'B', 'C'].map((label) => broker.createPending('acc', 'bash', label, label, label === 'B' ? 'task-2' : 'task-1'));
+  const settled = watch(a, b, c);
+  assert.equal(broker.rejectTask('acc', 'task-1'), true);
+  await settle();
+  assert.deepEqual(settled, [false, undefined, false]);
+  assert.equal(broker.getPending('acc')?.label, 'B');
+  assert.equal(broker.rejectTask('acc', 'task-1'), false, 'none left');
+  assert.equal(broker.rejectTask('other', 'task-2'), false, 'another account’s');
+  broker.rejectPending('acc');
 });
 
 test('with three asks waiting a fourth is denied at once; another account has a queue of its own', async () => {

@@ -46,8 +46,8 @@ flowchart LR
 ### 任务生命周期
 
 1. 守护进程长轮询 iLink，忽略不在 `WECHAT_ALLOWED_IDS` 里的人。每条消息都会刷新这个聊天的 `context_token`，每次回复都要用到它。
-2. `y`/`n` 回答正在等待的权限请求，`/` 命令直接得到回复。其余消息都变成任务：守护进程下载第一张图片，把文字分派给一个 bot 和一个项目，再把任务存进 `state.db`。前面还有任务时，它会回复 `⏳ 已排队：任务 #N（前面还有 X 个任务）` 和预计等待时间。
-3. 通道的 worker 取出最早排队的任务，在项目根目录（没有项目时在聊天的工作目录）新开一个 OpenCode 会话。OpenCode 会加载该目录的 `AGENTS.md` 和 `opencode.json`，其中的规则优先于记忆和最近任务。已结束任务的追问则接着那个任务的会话做（见“路由”），重试也接着失败的那个会话。
+2. `y`/`n` 回答正在等待的权限请求，`/` 命令直接得到回复。其余消息都交给任务：守护进程下载第一张图片，把文字分派给一个 bot 和一个项目。聊天有未结束的任务时，没有前缀的消息先交给任务分派器（见“路由”），它可能把消息并入某个任务、交给运行中的任务，或停止某个任务；否则守护进程把新任务存进 `state.db`。前面还有任务时，它会回复 `⏳ 已排队：任务 #N（前面还有 X 个任务）` 和预计等待时间。
+3. 通道的 worker 取出最早排队的任务，在项目根目录（没有项目时在聊天的工作目录）新开一个 OpenCode 会话。OpenCode 会加载该目录的 `AGENTS.md` 和 `opencode.json`，其中的规则优先于记忆和最近任务。分派器接到已结束任务上的消息则接着那个任务的会话做（见“路由”），重试也接着失败的那个会话。
 4. 新会话的上下文由 prompt 携带：时间、附件、bot 的角色、项目、与消息相关的至多 8 条 agentmemory 记忆（各带 id 和日期），以及最近 8 个任务（各带会话 id，最近 2 个附回复摘录）。消息需要某个早先任务做过什么时，编排器让 `wechat-explore` 用 `--session <id>`（prompt 里给出路径）读那个会话，而不是去搜。
 5. orchestrator 把工作交给 `wechat-explore` 或 `wechat-general`，同时最多 3 个，每个任务最多 6 个。权限请求发到微信。orchestrator 在调用子 agent 前写的一句简短说明可以作为过程说明发到聊天；守护进程自己的进度通知（已运行时长、正在运行的工具、子 agent 数量）默认关闭。
 6. orchestrator 的输出以 `<<<WECHAT_REPLY>>>`、`<<<WECHAT_MEMORY>>>`、`<<<WECHAT_SUMMARY>>>` 收尾，可选带 `<<<WECHAT_FILES>>>` 段。守护进程保留回复、把最多 5 条事实存进 agentmemory（以某条记忆的 id 开头的事实会更新那一条），保存摘要、本任务各轮的 token 用量和文件路径，并在文字之后发送文件。
@@ -63,12 +63,15 @@ flowchart LR
 | `@myproj …`（开头是项目别名） | 默认 bot，或紧随其后的 `@bot` | 该项目 |
 | `@base …` | 默认 bot，或紧随其后的 `@bot` | 无，在聊天的工作目录运行 |
 | `@all …`、`@everyone …` | 默认 bot，把各部分分给专长 bot，同时最多 3 个，最后合并成一条回复 | 从其余文字识别 |
-| `新话题：…`（或 `换个话题`、`new topic`） | 从其余文字识别 | 从其余文字识别，不沿用上一个任务的 |
-| 追问：`继续`、`接着`、`然后`、`再`、`还有`、`改一下`、`看一下`… | 沿用上一个任务的 | 沿用上一个任务的；bot 和项目都相同时并入那个任务（见下） |
+| `新话题：…`（或 `换个话题`、`new topic`） | 从其余文字识别 | 从其余文字识别 |
+| 聊天有未结束任务时的其他消息 | 分派器把它接到哪个任务上就用那个任务的（见下），否则同上 | 同左 |
 
 - 没有 `@` 时由默认 bot 回答；bot 不会根据正文猜测。项目取正文任意位置出现的 2 字及以上别名（ASCII 别名须整词匹配），没有就不指定。只认 `projects.json`：正文里的路径不会被当作目录打开。与 bot 别名相同的项目别名会被丢弃。
-- 追问不超过 32 字，以提示词开头，且在上一个任务 2 小时内发出；只有图片、没有文字也算追问。`@eng 继续` 沿用项目，换成 `eng`，因此算新的工作。
-- bot 和项目都与上一个任务相同的追问会并入那个任务。它还在排队，文字就追加到它的输入里（`↪️ 已合并到排队中的任务 #N`）。它正在运行，就由它在下一个步骤把追问送进会话；若这一轮已经答完，就给追问单独一轮，任务仍只回复一次（`↪️ 已追加到正在运行的任务 #N…`）。它已经结束，追问就成为新任务，接着它的会话做，因此能看到之前的全部工作；会话已不存在时，新任务另开一个会话。追问运行中或排队中任务的图片总是单独成为一个任务。
+- 以表中前缀（`@bot`、`@项目`、`@base`、`@all`、`新话题`）开头的消息总是新任务。其他消息在聊天有未结束的任务时先交给任务分派器（`src/task-router.ts`）：经 OpenCode 的 `POST /api/experimental/generate/text` 调用一次 `OPENCODE_DEFAULT_MODEL`，不建会话、不用工具，约 2 秒，最长 15 秒。未结束的任务指运行中、排队中，以及 24 小时内结束且会话仍在的任务，取最新的 6 个，接着做的同一段对话只算一个。分派器能看到每个任务的状态、时间、bot、项目、输入、摘要，以及回复是否以提问结尾，然后给出下面之一：
+  - attach #N：消息是在接着、修正、缩小或回答任务 #N。它还在排队，文字就追加到它的输入里（`↪️ 已合并到排队中的任务 #N`）。它正在运行，就由它在下一个步骤把消息送进会话；若这一轮已经答完，就给这条消息单独一轮，任务仍只回复一次（`↪️ 已追加到正在运行的任务 #N…`）。它已经结束，消息就成为新任务，用 #N 的 bot 和项目，接着 #N 的会话做，因此能看到之前的全部工作；会话已不存在时，新任务另开一个会话。图片总是单独成为一个任务，跟在 #N 后面。
+  - stop #N：排队中的任务被取消（`🗑 已取消任务 #N`），运行中的任务单独停止（`⏹ 已停止任务 #N`）。`/stop` 仍然停止所有运行中的任务。
+  - new：新任务，按上表分派。
+- 调用失败或超时，或回答里没有未结束的任务编号时，都按新任务处理，日志会写明原因。日志记录每次分派的结果和耗时，从不记录消息内容。`--simulate` 用它自己的任务以同样方式分派，但遇到 stop 只打印不执行。
 
 ### 并发
 
@@ -113,7 +116,7 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 
 | 路径 | 内容 |
 |---|---|
-| `src/` | 守护进程：`main.ts`（CLI、收消息）、`orchestrator.ts`（prompt、执行、结果）、`opencode/`（HTTP 客户端、watchdog）、`tasks/`（`state.db`、通道）、`wechat/`（iLink 客户端）、`commands/`、`tests/` |
+| `src/` | 守护进程：`main.ts`（CLI、收消息）、`task-router.ts`（消息属于哪个未结束的任务）、`orchestrator.ts`（prompt、执行、结果）、`opencode/`（HTTP 客户端、watchdog）、`tasks/`（`state.db`、通道）、`wechat/`（iLink 客户端）、`commands/`、`tests/` |
 | `config/agents/` | 四个 agent 的提示词，见 [config/agents/README.md](config/agents/README.md) |
 | `config/launchd/` | server、daemon、watchdog 三个 launchd 模板，分别经 `run-server.sh`、`run-bot.sh`、`scripts/watchdog.sh` 启动 |
 | `scripts/` | `release.sh`、`deploy.sh`、`rollback.sh`、`healthcheck.sh`、`install-agents.sh`、`install-launchd.sh` |
@@ -205,7 +208,7 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 | `OPENCODE_PORT` | `4096` | 没有服务响应时，守护进程自行启动的服务所用端口 |
 | `OPENCODE_SERVER_PASSWORD` | 空 | 服务密码，以用户 `opencode` 的 Basic auth 发送 |
 | `WECHAT_ALLOWED_IDS` | 绑定的账号 | bot 接收消息的微信用户 id，逗号分隔 |
-| `OPENCODE_DEFAULT_MODEL` | `oneapi/DeepSeek-V4.1-Flash` | 没有 `/model` 时路由假定的模型；与 orchestrator 的 `model:` 保持一致 |
+| `OPENCODE_DEFAULT_MODEL` | `oneapi/DeepSeek-V4.1-Flash` | 没有 `/model` 时路由假定的模型，也是任务分派器用的模型；与 orchestrator 的 `model:` 保持一致 |
 | `OPENCODE_FALLBACK_MODEL` | 无 | 上游失败后那一次重试使用的模型，即使与主模型在同一个 provider 上。只在服务器列出它时使用；启动时、`/doctor` 和每次使用前都会核对。未设置：不重试 |
 | `OPENCODE_FIRST_RESPONSE_TIMEOUT_MS`、`OPENCODE_STALL_TIMEOUT_MS` | `120000`、`180000` | 首次输出前、两次进展之间允许的沉默时长（事件流上的流式输出算作进展） |
 | `OWB_BREAKER_THRESHOLD`、`OWB_BREAKER_COOLDOWN_MS` | `3`、`600000` | 打开熔断所需的连续上游失败次数，以及首次冷却时长 |

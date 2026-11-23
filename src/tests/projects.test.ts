@@ -1,7 +1,6 @@
-// Project routing: the registry, alias and follow-up detection, directory checks (also for /cwd),
-// the prompt's <project> block, routing together with "@bot" in either order, follow-ups that stay
-// with the last bot and name the task they follow when it is the same work, "新话题" and "@base", aliases a bot
-// owns, the v3 task columns, and the registry edits of /projects add and rm.
+// Project routing: the registry, alias detection, directory checks (also for /cwd), the prompt's <project> block,
+// routing together with "@bot" in either order, the prefixes that settle a message is new work, "新话题" and
+// "@base", aliases a bot owns, the v3 task columns, and the registry edits of /projects add and rm.
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -9,7 +8,6 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { after, test } from 'node:test';
 import type { CommandContext } from '../commands/handlers.js';
-import type { StateDb } from '../tasks/db.js';
 
 const tmp = mkdtempSync(join(tmpdir(), 'owb-projects-'));
 const base = join(tmp, 'work');
@@ -39,10 +37,10 @@ const { openStateDb } = await import('../tasks/db.js');
 const { composePrompt } = await import('../orchestrator.js');
 const { handlers } = await import('../commands/handlers.js');
 
-/** routeMessage, with the task a follow-up follows shown by its number. */
-function route(db: StateDb, text: string) {
-  const { follows, ...routed } = routeMessage(db, 'acc', text);
-  return follows ? { ...routed, follows: follows.seq } : routed;
+/** routeMessage without prefixed, which a test of its own checks. */
+function route(text: string) {
+  const { prefixed: _prefixed, ...routed } = routeMessage(text);
+  return routed;
 }
 
 const registry = join(tmp, 'registry', 'projects.json');
@@ -108,29 +106,11 @@ test('the longest alias wins', () => {
   assert.equal(stripProjectPrefix('@秒哒运维 部署', { ...short, aliases: ['秒哒', '秒哒运维'] }), '部署');
 });
 
-test('a follow-up stays in the last project; anything else goes to the base', () => {
-  assert.equal(detectProject('继续', projects, 'medo')?.id, 'medo');
-  assert.equal(detectProject('', projects, 'medo')?.id, 'medo', 'an image without text');
-  assert.equal(detectProject('继续看 rh', projects, 'medo')?.id, 'rh-layers', 'a named project beats the follow-up');
-  assert.equal(detectProject('你好', projects, 'medo'), null);
-  assert.equal(detectProject('继续', projects, null), null);
-  assert.equal(detectProject('继续', projects, 'removed'), null);
+test('a project is an "@alias" prefix or a mention; anything else goes to the base', () => {
+  assert.equal(detectProject('继续', projects), null);
+  assert.equal(detectProject('', projects), null, 'an image without text');
+  assert.equal(detectProject('继续看 rh', projects)?.id, 'rh-layers');
   assert.equal(detectProject('@unknown 看看', projects), null);
-});
-
-test('a follow-up is a short message that opens with a cue; a cue inside other words or a long request does not count', () => {
-  for (const text of ['继续', ' 再改一下 ', '刚才那个', '看一下这个报错', '它们呢']) {
-    assert.equal(detectProject(text, projects, 'medo')?.id, 'medo', text);
-  }
-  for (const text of [
-    '再见',
-    '其它项目呢',
-    '你好',
-    '今天下午开会前帮我看一下明天北京的天气预报，再提醒我带伞，顺便把会议纪要模板也发我一份',
-    '看一下这个报错是怎么回事，然后把配置里的超时改成三十秒，再重新部署一遍测试环境',
-  ]) {
-    assert.equal(detectProject(text, projects, 'medo'), null, text);
-  }
 });
 
 test('a message that is only "@alias" keeps its text', () => {
@@ -187,125 +167,68 @@ test('a project task tells the orchestrator its repo, and that the repo rules co
   assert.doesNotMatch(composePrompt(db, db.createTask('acc', '你好').task, base, none), /<project>/);
 });
 
-test('routeMessage stores the stripped input and the repo dir; follow-ups expire after 2 hours', () => {
-  const file = join(tmp, 'state.db');
-  const db = openStateDb(file);
+test('routeMessage stores the stripped input and the repo dir', () => {
+  const db = openStateDb(join(tmp, 'state.db'));
   const medo = { id: 'medo', dir: join(base, 'medo-discord-icafe-bot') };
-  const first = routeMessage(db, 'acc', '@medo 看下 AGENTS.md');
+  const first = route('@medo 看下 AGENTS.md');
   assert.deepEqual(first, { input: '看下 AGENTS.md', project: medo, botId: 'chief' });
   const { task } = db.createTask('acc', first.input, 'm1', first.project);
   assert.deepEqual([task.input, task.project_id, task.project_dir], ['看下 AGENTS.md', medo.id, medo.dir]);
-  assert.deepEqual(route(db, '继续'), { input: '继续', project: medo, botId: 'chief', follows: 1 }, 'the same work');
-  assert.deepEqual(routeMessage(db, 'acc', '你好'), { input: '你好', botId: 'chief' });
+  assert.deepEqual(route('继续'), { input: '继续', botId: 'chief' }, 'the task router, not a rule here, ties it to the last task');
   assert.equal(db.startTaskNow('sim', '继续', medo)?.project_dir, medo.dir);
-
-  const raw = new DatabaseSync(file);
-  raw.prepare('UPDATE tasks SET created_at = ? WHERE id = ?').run(Date.now() - 2 * 60 * 60 * 1000 - 1000, task.id);
-  raw.close();
-  assert.deepEqual(routeMessage(db, 'acc', '继续'), { input: '继续', botId: 'chief' });
 });
 
 test('"@bot" comes off first, then the project is routed from the rest', () => {
-  const db = openStateDb(join(tmp, 'bots.db'));
   const at = (id: string, dir: string) => ({ id, dir: join(base, dir) });
-  assert.deepEqual(routeMessage(db, 'acc', '@research 在 miaoda 里看下发布流程'), {
-    input: '在 miaoda 里看下发布流程',
-    project: at('miaoda', 'miaoda'),
-    botId: 'research',
-  });
-  assert.deepEqual(routeMessage(db, 'acc', '@eng @medo 看下日志'), {
-    input: '看下日志',
-    project: at('medo', 'medo-discord-icafe-bot'),
-    botId: 'eng',
-  });
+  assert.deepEqual(route('@research 在 miaoda 里看下发布流程'), { input: '在 miaoda 里看下发布流程', project: at('miaoda', 'miaoda'), botId: 'research' });
+  assert.deepEqual(route('@eng @medo 看下日志'), { input: '看下日志', project: at('medo', 'medo-discord-icafe-bot'), botId: 'eng' });
   // "ops" is the Ops bot's alias, at the start and in the rest of the message; the project goes by "miaoda-ops".
-  assert.deepEqual(routeMessage(db, 'acc', '@ops 看下日志'), { input: '看下日志', botId: 'ops' });
-  assert.deepEqual(routeMessage(db, 'acc', '@miaoda-ops 看下部署'), {
-    input: '看下部署',
-    project: at('miaoda-ops', 'miaoda-ops'),
-    botId: 'chief',
-  });
-  assert.deepEqual(routeMessage(db, 'acc', '@all 让 ops 和 research 分头看下这个报错'), {
-    input: '让 ops 和 research 分头看下这个报错',
-    botId: 'all',
-  });
-  assert.deepEqual(routeMessage(db, 'acc', '@all 看看 rh'), { input: '看看 rh', project: at('rh-layers', 'rh-layers'), botId: 'all' });
+  assert.deepEqual(route('@ops 看下日志'), { input: '看下日志', botId: 'ops' });
+  assert.deepEqual(route('@miaoda-ops 看下部署'), { input: '看下部署', project: at('miaoda-ops', 'miaoda-ops'), botId: 'chief' });
+  assert.deepEqual(route('@all 让 ops 和 research 分头看下这个报错'), { input: '让 ops 和 research 分头看下这个报错', botId: 'all' });
+  assert.deepEqual(route('@all 看看 rh'), { input: '看看 rh', project: at('rh-layers', 'rh-layers'), botId: 'all' });
 });
 
 test('"@project @bot" works too; an unknown "@name" stays in the text for the default bot', () => {
-  const db = openStateDb(join(tmp, 'order.db'));
   const miaoda = { id: 'miaoda', dir: join(base, 'miaoda') };
-  assert.deepEqual(routeMessage(db, 'acc', '@miaoda @eng 看下日志'), { input: '看下日志', project: miaoda, botId: 'eng' });
-  assert.deepEqual(routeMessage(db, 'acc', '@秒哒：@研究，看下发布流程'), { input: '看下发布流程', project: miaoda, botId: 'research' });
-  assert.deepEqual(routeMessage(db, 'acc', '@miaoda @foo 看下日志'), { input: '@foo 看下日志', project: miaoda, botId: 'chief' });
-  assert.deepEqual(routeMessage(db, 'acc', '@foo 看下日志'), { input: '@foo 看下日志', botId: 'chief' });
+  assert.deepEqual(route('@miaoda @eng 看下日志'), { input: '看下日志', project: miaoda, botId: 'eng' });
+  assert.deepEqual(route('@秒哒：@研究，看下发布流程'), { input: '看下发布流程', project: miaoda, botId: 'research' });
+  assert.deepEqual(route('@miaoda @foo 看下日志'), { input: '@foo 看下日志', project: miaoda, botId: 'chief' });
+  assert.deepEqual(route('@foo 看下日志'), { input: '@foo 看下日志', botId: 'chief' });
   // A message names one bot: the one that opens it.
-  assert.deepEqual(routeMessage(db, 'acc', '@eng @miaoda @research 看下'), { input: '@research 看下', project: miaoda, botId: 'eng' });
+  assert.deepEqual(route('@eng @miaoda @research 看下'), { input: '@research 看下', project: miaoda, botId: 'eng' });
 });
 
-test('a follow-up that names no bot stays with the last bot; a new request goes to the default bot', () => {
-  const file = join(tmp, 'last-bot.db');
-  const db = openStateDb(file);
-  const medo = { id: 'medo', dir: join(base, 'medo-discord-icafe-bot') };
-  db.createTask('acc', '看下日志', null, undefined, 'eng');
-  assert.deepEqual(route(db, '继续'), { input: '继续', botId: 'eng', follows: 1 });
-  assert.deepEqual(route(db, ''), { input: '', botId: 'eng', follows: 1 }, 'an image without text');
-  assert.deepEqual(routeMessage(db, 'acc', '你好'), { input: '你好', botId: 'chief' });
-  db.createTask('acc', '看下日志', null, medo, 'research');
-  assert.deepEqual(route(db, '继续'), { input: '继续', project: medo, botId: 'research', follows: 2 });
-  db.createTask('acc', '分头看下', null, undefined, 'all');
-  assert.deepEqual(route(db, '继续'), { input: '继续', botId: 'all', follows: 3 });
-  // A bot that left the registry is not followed, and neither is a task from over 2 hours ago.
-  db.createTask('acc', '看下', null, undefined, 'removed');
-  assert.deepEqual(routeMessage(db, 'acc', '继续'), { input: '继续', botId: 'chief' });
-  const { task } = db.createTask('acc', '看下', null, undefined, 'eng');
-  const raw = new DatabaseSync(file);
-  raw.prepare('UPDATE tasks SET created_at = ? WHERE id = ?').run(Date.now() - 2 * 60 * 60 * 1000 - 1000, task.id);
-  raw.close();
-  assert.deepEqual(routeMessage(db, 'acc', '继续'), { input: '继续', botId: 'chief' });
+test('prefixed: "@bot", "@project", "@base" or "新话题" at the start settles that a message is new work', () => {
+  for (const text of ['@eng 继续', '@chief 继续', '@all 看下', '@miaoda 继续', '@秒哒：@研究，看下', '@base 继续', '新话题：继续', ' New Topic, 看下 rh', '新话题']) {
+    assert.equal(routeMessage(text).prefixed, true, text);
+  }
+  // Anything else may belong to an open task; a project only mentioned still routes a new task there.
+  for (const text of ['继续', '看下 miaoda 的日志', '@foo 看下日志', '', '那第二个呢', '更新一下 是11/16的我本人的okr周报']) {
+    assert.equal(routeMessage(text).prefixed, false, text);
+  }
+  assert.equal(routeMessage('看下 miaoda 的日志').project?.id, 'miaoda');
 });
 
-test('an explicit "@bot" beats the last bot, and so does an "@project" that names none', () => {
-  const db = openStateDb(join(tmp, 'explicit-bot.db'));
-  const miaoda = { id: 'miaoda', dir: join(base, 'miaoda') };
-  db.createTask('acc', '看下日志', null, undefined, 'research');
-  assert.deepEqual(routeMessage(db, 'acc', '@ops 继续'), { input: '继续', botId: 'ops' }, 'another bot: new work');
-  assert.deepEqual(route(db, '@research 继续'), { input: '继续', botId: 'research', follows: 1 }, 'the same bot named');
-  assert.deepEqual(routeMessage(db, 'acc', '@chief 继续'), { input: '继续', botId: 'chief' });
-  assert.deepEqual(routeMessage(db, 'acc', '@all 继续'), { input: '继续', botId: 'all' });
-  assert.deepEqual(routeMessage(db, 'acc', '@eng 看下这个报错'), { input: '看下这个报错', botId: 'eng' });
-  assert.deepEqual(routeMessage(db, 'acc', '@miaoda 继续'), { input: '继续', project: miaoda, botId: 'chief' });
-  assert.deepEqual(routeMessage(db, 'acc', '@miaoda @eng 继续'), { input: '继续', project: miaoda, botId: 'eng' });
-});
-
-test('"新话题" at the start follows neither the last project nor the last bot, and comes off the text', () => {
-  const db = openStateDb(join(tmp, 'new-topic.db'));
-  const medo = { id: 'medo', dir: join(base, 'medo-discord-icafe-bot') };
-  db.createTask('acc', '看下日志', null, medo, 'eng');
-  assert.deepEqual(routeMessage(db, 'acc', '新话题：继续'), { input: '继续', botId: 'chief' });
-  assert.deepEqual(routeMessage(db, 'acc', ' New Topic, @research 继续'), { input: '继续', botId: 'research' });
-  assert.deepEqual(routeMessage(db, 'acc', '换个话题 看下 rh'), {
-    input: '看下 rh',
-    project: { id: 'rh-layers', dir: join(base, 'rh-layers') },
-    botId: 'chief',
-  });
-  assert.deepEqual(routeMessage(db, 'acc', '新话题'), { input: '新话题', botId: 'chief' }, 'nothing would be left');
+test('"新话题" at the start comes off the text, and the rest is routed as usual', () => {
+  assert.deepEqual(route('新话题：继续'), { input: '继续', botId: 'chief' });
+  assert.deepEqual(route(' New Topic, @research 继续'), { input: '继续', botId: 'research' });
+  assert.deepEqual(route('换个话题 看下 rh'), { input: '看下 rh', project: { id: 'rh-layers', dir: join(base, 'rh-layers') }, botId: 'chief' });
+  assert.deepEqual(route('新话题'), { input: '新话题', botId: 'chief' }, 'nothing would be left');
   // Later in the message it is just words.
-  assert.deepEqual(route(db, '继续，别当新话题'), { input: '继续，别当新话题', project: medo, botId: 'eng', follows: 1 });
+  assert.deepEqual(routeMessage('继续，别当新话题'), { input: '继续，别当新话题', botId: 'chief', prefixed: false });
   // The cue needs a separator or the end, so a word that merely starts with it is left alone.
-  assert.deepEqual(routeMessage(db, 'acc', '新话题来了'), { input: '新话题来了', botId: 'chief' });
+  assert.deepEqual(route('新话题来了'), { input: '新话题来了', botId: 'chief' });
 });
 
 test('"@base" at the start runs the task in the base workspace, with the default bot unless one is named', () => {
-  const db = openStateDb(join(tmp, 'at-base.db'));
   assert.ok(!loadProjects(base).some((p) => p.id === 'base'), 'the base is no repo, so no project is called "base"');
-  db.createTask('acc', '看下日志', null, { id: 'medo', dir: join(base, 'medo-discord-icafe-bot') }, 'eng');
-  assert.deepEqual(routeMessage(db, 'acc', '@base 看下日志'), { input: '看下日志', botId: 'chief' });
-  assert.deepEqual(routeMessage(db, 'acc', '@base 继续'), { input: '继续', botId: 'chief' }, 'no follow-up of the medo task');
-  assert.deepEqual(routeMessage(db, 'acc', '@BASE：@eng 看下'), { input: '看下', botId: 'eng' });
-  assert.deepEqual(routeMessage(db, 'acc', '@eng @base 看下'), { input: '看下', botId: 'eng' });
-  assert.deepEqual(routeMessage(db, 'acc', '@base'), { input: '@base', botId: 'chief' });
-  assert.deepEqual(routeMessage(db, 'acc', '@baseline 看下'), { input: '@baseline 看下', botId: 'chief' });
+  assert.deepEqual(route('@base 看下日志'), { input: '看下日志', botId: 'chief' });
+  assert.deepEqual(route('@base 继续'), { input: '继续', botId: 'chief' });
+  assert.deepEqual(route('@BASE：@eng 看下'), { input: '看下', botId: 'eng' });
+  assert.deepEqual(route('@eng @base 看下'), { input: '看下', botId: 'eng' });
+  assert.deepEqual(route('@base'), { input: '@base', botId: 'chief' });
+  assert.deepEqual(route('@baseline 看下'), { input: '@baseline 看下', botId: 'chief' });
 });
 
 test('an alias a bot uses names only the bot: a project that lists it loses it, with a warning', () => {
@@ -318,13 +241,9 @@ test('an alias a bot uses names only the bot: a project that lists it loses it, 
   const logs = join(tmp, '.wechat-opencode-bot', 'logs');
   const log = readdirSync(logs).map((name) => readFileSync(join(logs, name), 'utf-8')).join('');
   assert.match(log, /WARN Ignoring project aliases that name a bot \{"id":"miaoda-ops","aliases":\["OPS","all"\]\}/);
-  const db = openStateDb(join(tmp, 'stale.db'));
-  assert.deepEqual(routeMessage(db, 'acc', '@ops 看下日志'), { input: '看下日志', botId: 'ops' });
-  assert.deepEqual(routeMessage(db, 'acc', '@all 让 ops 和 research 分头看下这个报错'), {
-    input: '让 ops 和 research 分头看下这个报错',
-    botId: 'all',
-  });
-  assert.equal(routeMessage(db, 'acc', '@miaoda-ops 看下部署').project?.id, 'miaoda-ops');
+  assert.deepEqual(route('@ops 看下日志'), { input: '看下日志', botId: 'ops' });
+  assert.deepEqual(route('@all 让 ops 和 research 分头看下这个报错'), { input: '让 ops 和 research 分头看下这个报错', botId: 'all' });
+  assert.equal(route('@miaoda-ops 看下部署').project?.id, 'miaoda-ops');
   writeFileSync(PROJECTS_PATH, generated);
 });
 
@@ -430,7 +349,7 @@ test('/projects add and rm edit the registry from WeChat, and reply with what to
   const hidden = { id: 'hidden', dir: join(base, '.hidden') };
 
   assert.equal(await send('add hidden .hidden'), '✅ 已添加项目 hidden: .hidden，以 @hidden 开头的消息就在该目录运行');
-  assert.deepEqual(routeMessage(db, 'acc', '@hidden 看下'), { input: '看下', project: hidden, botId: 'chief' });
+  assert.deepEqual(route('@hidden 看下'), { input: '看下', project: hidden, botId: 'chief' });
   assert.match(await send(''), /^- hidden: \.hidden（hidden）$/m);
   const usage = '用法：/projects 查看；/projects add <id> [目录]；/projects rm <id|别名>';
   for (const [args, reply] of [

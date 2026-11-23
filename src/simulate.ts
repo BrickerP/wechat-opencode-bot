@@ -2,6 +2,7 @@ import { isReadOnlyBot } from './bots.js';
 import { resultText, runTask, type TaskIO } from './orchestrator.js';
 import { pingOpenCode, startEventStream, stopEventStream } from './opencode/provider.js';
 import { routeMessage } from './projects.js';
+import { followUpOf, routeToTask, type NewTask } from './task-router.js';
 import { openStateDb } from './tasks/db.js';
 
 /** --simulate files its tasks here, apart from the WeChat chat. */
@@ -13,6 +14,8 @@ const RETRY_MS = 2000;
  * --simulate: run one task in this process against the real OpenCode server, as if it came from
  * WeChat. It keeps its own task history under SIMULATE_ACCOUNT, so the chat's history stays
  * untouched, and it reads the owner's memories but saves none; replies print instead of being sent.
+ * The message is routed as the daemon routes it, against that history: one that attaches to a task
+ * runs as a task that follows it, and a stop is printed, not carried out.
  */
 export async function runSimulate(text: string): Promise<number> {
   if (!(await pingOpenCode())) {
@@ -21,15 +24,23 @@ export async function runSimulate(text: string): Promise<number> {
   }
   const accountId = SIMULATE_ACCOUNT;
   const db = openStateDb();
-  const { input, project, botId } = routeMessage(db, accountId, text);
+  const { input, project, botId, prefixed } = routeMessage(text);
+  const route = prefixed ? undefined : await routeToTask(db, accountId, input);
+  if (route?.action === 'stop') {
+    console.log(`[simulate] 路由：停止任务 #${route.task.seq}（simulate 不执行）`);
+    return 0;
+  }
   // As in the daemon: a read-only bot's task runs on the read agent.
-  const lane = isReadOnlyBot(botId) ? 'read' : 'write';
+  const placed: NewTask =
+    route?.action === 'attach' ? followUpOf(route.task) : { project, botId, lane: isReadOnlyBot(botId) ? 'read' : 'write' };
+  if (route?.action === 'attach') console.log(`[simulate] 路由：接着任务 #${route.task.seq}`);
+  const start = () => db.startTaskNow(accountId, input, placed.project, placed.botId, placed.lane, placed.continues);
 
-  let task = db.startTaskNow(accountId, input, project, botId, lane);
+  let task = start();
   while (!task) {
     console.log('[simulate] 已有任务在运行，2 秒后重试...');
     await new Promise((resolve) => setTimeout(resolve, RETRY_MS));
-    task = db.startTaskNow(accountId, input, project, botId, lane);
+    task = start();
   }
   console.log(`[simulate] task ${task.id} (#${task.seq}) bot=${task.bot_id ?? '-'} project=${task.project_id ?? '-'} lane=${task.lane}`);
 

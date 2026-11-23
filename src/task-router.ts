@@ -21,6 +21,7 @@ const OPEN_MS = 24 * 60 * 60 * 1000;
 const ROUTER_TIMEOUT_MS = 15_000;
 const INPUT_CHARS = 150;
 const SUMMARY_CHARS = 100;
+const QUESTION_CHARS = 80;
 const REASON_CHARS = 200;
 
 const ROUTER_RULES = [
@@ -28,7 +29,7 @@ const ROUTER_RULES = [
   '- {"action":"attach","task":N}：消息接着、修正、缩小或回答任务 #N 的工作，或者指向它，如“继续”“不是 M5，是 M1”“那第二个呢”；任务的回复在问用户时，“M1”这样的简短回答也属于它。',
   '- {"action":"stop","task":N}：消息要停止或取消任务 #N。',
   '- {"action":"new"}：消息说的是别的事。',
-  '在 attach 和 new 之间拿不准时，只有消息点名或明显接着那个任务的主题才选 attach。',
+  '在 attach 和 new 之间拿不准时，只有消息点名或明显接着那个任务的主题才选 attach。几个任务都说得通时，选列表里靠前的那个。',
   '例：任务 #32 运行中，输入是“去帮我完成最新一期周报，看一下我本地open claw session…”；新消息“更新一下 是11/16的我本人的okr周报 看下opncode session有周工作记录的”是在修正 #32 的要求，输出 {"action":"attach","task":32}。',
 ].join('\n');
 
@@ -57,10 +58,17 @@ function ago(at: number, now: number): string {
   return minutes < 60 ? `${minutes} 分钟前` : `${Math.floor(minutes / 60)} 小时前`;
 }
 
-/** The task's reply ends by asking the user something, so a short answer such as "M1" belongs to it. */
-const asksUser = (task: TaskRow): boolean => task.status === 'done' && /[?？][\s"'”’」』)）]*$/.test(task.result ?? '');
+/**
+ * The question a done task's reply ends with, its end if it is long, so a short answer such as "M1" or "要" finds the
+ * task it answers; '' when the reply asks nothing.
+ */
+function lastQuestion(task: TaskRow): string {
+  const last = task.status === 'done' ? (task.result ?? '').trim().split('\n').at(-1)!.trim() : '';
+  if (!/[?？][\s"'”’」』)）]*$/.test(last)) return '';
+  return last.length > QUESTION_CHARS ? `…${last.slice(-QUESTION_CHARS)}` : last;
+}
 
-/** One line per task: number, status, when it last changed, bot, project, what the user asked and what it did. */
+/** One line per task: number, status, when it last changed, bot, project, what the user asked, what it did, what it asked. */
 function describeTask(task: TaskRow, now: number, defaultBotId: string): string {
   const line = [
     `#${task.seq}`,
@@ -71,7 +79,8 @@ function describeTask(task: TaskRow, now: number, defaultBotId: string): string 
     `输入：${clip(task.input, INPUT_CHARS)}`,
     `摘要：${task.summary ? clip(task.summary, SUMMARY_CHARS) : '无'}`,
   ];
-  if (asksUser(task)) line.push('（回复最后在问用户）');
+  const question = lastQuestion(task);
+  if (question) line.push(`最后问用户：${question}`);
   return line.join(' ');
 }
 

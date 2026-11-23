@@ -134,17 +134,21 @@ test('open tasks: running, queued, and finished within 24 hours with a session; 
 
 test('the prompt gives the time, each open task on one line, the #32 example and the message last', () => {
   const { db, add } = fresh();
-  add('看下日志', { status: 'done', ago: 90 * MINUTE, session: 'ses_a', botId: 'research', summary: '查了日志', result: '你说的是 M1 还是 M5？' });
+  add('看下日志', { status: 'done', ago: 90 * MINUTE, session: 'ses_a', botId: 'research', summary: '查了日志', result: '日志有两份。\n你说的是 M1 还是 M5？' });
+  add('看下配置', { status: 'done', ago: 80 * MINUTE, session: 'ses_c', result: `${'问'.repeat(100)}？` });
+  add('看下部署', { status: 'done', ago: 70 * MINUTE, session: 'ses_d', result: '部署好了。' });
   add('去帮我完成最新一期周报'.repeat(20), { status: 'running', ago: 2 * MINUTE, session: 'ses_b' });
   add('改测试');
   const now = Date.now();
   const prompt = composeRouterPrompt('M1', openTasks(db, 'acc', now), now);
   const lines = prompt.split('\n').filter((line) => /^#\d+ /.test(line));
-  assert.equal(lines.length, 3);
-  assert.equal(lines[0], '#3 [排队中] 刚刚 bot:chief 项目:无 输入：改测试 摘要：无');
-  assert.match(lines[1], /^#2 \[运行中\] 2 分钟前 bot:chief 项目:无 输入：去帮我完成\S+… 摘要：无$/);
+  assert.equal(lines.length, 5);
+  assert.equal(lines[0], '#5 [排队中] 刚刚 bot:chief 项目:无 输入：改测试 摘要：无');
+  assert.match(lines[1], /^#4 \[运行中\] 2 分钟前 bot:chief 项目:无 输入：去帮我完成\S+… 摘要：无$/);
   assert.equal(/输入：(\S+) 摘要/.exec(lines[1])?.[1].length, 151, 'the input is cut at 150 characters');
-  assert.equal(lines[2], '#1 [完成] 1 小时前 bot:research 项目:无 输入：看下日志 摘要：查了日志 （回复最后在问用户）');
+  assert.equal(lines[2], '#3 [完成] 1 小时前 bot:chief 项目:无 输入：看下部署 摘要：无', 'a reply that asks nothing');
+  assert.equal(lines[3], `#2 [完成] 1 小时前 bot:chief 项目:无 输入：看下配置 摘要：无 最后问用户：…${'问'.repeat(79)}？`, 'the end of a long one');
+  assert.equal(lines[4], '#1 [完成] 1 小时前 bot:research 项目:无 输入：看下日志 摘要：查了日志 最后问用户：你说的是 M1 还是 M5？');
   assert.match(prompt, /^现在：\d{4}-\d\d-\d\d \d\d:\d\d（北京时间）$/m);
   assert.match(prompt, /输出 \{"action":"attach","task":32\}/);
   assert.ok(prompt.endsWith('新消息：\n<message>\nM1\n</message>'), prompt.slice(-80));

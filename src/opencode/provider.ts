@@ -220,7 +220,7 @@ export async function initOpenCode(cwd?: string): Promise<void> {
   logger.warn("Failed to connect to OpenCode, checking installation");
 
   if (!checkOpenCodeInstalled()) {
-    throw new Error(`OpenCode 未安装。请先安装：\nnpm install -g opencode-ai`);
+    throw new Error(`OpenCode 未安装。请先安装 OpenCode 2：\nnpm install -g @opencode/cli`);
   }
 
   console.log("OpenCode 已安装，但服务未启动");

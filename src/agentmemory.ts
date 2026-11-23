@@ -6,7 +6,7 @@ import { logger } from './logger.js';
 /**
  * The owner's agentmemory engine holds every memory the bot uses; the bot keeps none of its own. Before a task the
  * daemon searches it with the message and shows the matches in <memory>; after the task it saves the facts the
- * orchestrator wrote under WECHAT_MEMORY, or updates a memory a fact names by id. Every call has a short deadline,
+ * orchestrator listed in its wechat_report memory, or updates a memory a fact names by id. Every call has a short deadline,
  * and a failed one is logged and never fails a task. The REST API is that of @agentmemory/agentmemory 0.9.
  */
 
@@ -143,14 +143,15 @@ export async function searchMemories(query: string, signal: AbortSignal = AbortS
   }
 }
 
-/** A WECHAT_MEMORY bullet: a fact to save, or with id the new text of that memory. */
+/** A memory item of wechat_report: a fact to save, or with id the new text of that memory. */
 interface Fact {
   id?: string;
   text: string;
 }
 
 function parseFact(bullet: string): Fact | undefined {
-  const line = oneLine(bullet);
+  // A model used to bullet lists may still open an item with "- ".
+  const line = oneLine(bullet).replace(/^[-*]\s+/, '');
   const update = UPDATE.exec(line);
   const text = (update ? update[2] : line).slice(0, MAX_MEMORY_CHARS).trim();
   if (!text || NOTHING.has(text.toLowerCase())) return undefined;
@@ -165,7 +166,7 @@ export interface MemoryWrites {
 }
 
 /**
- * Saves a task's WECHAT_MEMORY bullets: the first MAX_FACTS_PER_TASK that hold a fact, each on one line and cut at
+ * Saves the memory items of a task's wechat_report: the first MAX_FACTS_PER_TASK that hold a fact, each on one line and cut at
  * MAX_MEMORY_CHARS. "[mem_x] text" updates memory mem_x to text (the engine's evolve, which keeps the old version)
  * when the task's prompt showed mem_x whole, so it is in updatable. A fact for a memory shown cut or not at all, or
  * one the engine no longer has as its latest version, is saved as a new memory instead. Any other bullet is a new

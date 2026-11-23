@@ -71,13 +71,22 @@ function fresh() {
   const raw = new DatabaseSync(file);
   const add = (
     input: string,
-    fields: { status?: TaskStatus; ago?: number; session?: string; botId?: string; lane?: 'read' | 'write'; summary?: string; result?: string } = {},
+    fields: {
+      status?: TaskStatus;
+      ago?: number;
+      session?: string;
+      botId?: string;
+      lane?: 'read' | 'write';
+      summary?: string;
+      result?: string;
+      outcome?: string;
+    } = {},
   ): TaskRow => {
     const { task } = db.createTask('acc', input, null, undefined, fields.botId, fields.lane);
     const status = fields.status ?? 'queued';
     const at = Date.now() - (fields.ago ?? 0);
     raw
-      .prepare('UPDATE tasks SET status = ?, started_at = ?, finished_at = ?, session_id = ?, summary = ?, result = ? WHERE id = ?')
+      .prepare('UPDATE tasks SET status = ?, started_at = ?, finished_at = ?, session_id = ?, summary = ?, result = ?, outcome = ? WHERE id = ?')
       .run(
         status,
         status === 'queued' ? null : at,
@@ -85,6 +94,7 @@ function fresh() {
         fields.session ?? null,
         fields.summary ?? null,
         fields.result ?? null,
+        fields.outcome ?? null,
         task.id,
       );
     return db.getTask(task.id)!;
@@ -137,18 +147,20 @@ test('the prompt gives the time, each open task on one line, the #32 example and
   add('看下日志', { status: 'done', ago: 90 * MINUTE, session: 'ses_a', botId: 'research', summary: '查了日志', result: '日志有两份。\n你说的是 M1 还是 M5？' });
   add('看下配置', { status: 'done', ago: 80 * MINUTE, session: 'ses_c', result: `${'问'.repeat(100)}？` });
   add('看下部署', { status: 'done', ago: 70 * MINUTE, session: 'ses_d', result: '部署好了。' });
+  add('查下会话', { status: 'done', ago: 60 * MINUTE, session: 'ses_e', result: '你说的是哪台？\n1. M1\n2. M5', outcome: 'needs_input' });
   add('去帮我完成最新一期周报'.repeat(20), { status: 'running', ago: 2 * MINUTE, session: 'ses_b' });
   add('改测试');
   const now = Date.now();
   const prompt = composeRouterPrompt('M1', openTasks(db, 'acc', now), now);
   const lines = prompt.split('\n').filter((line) => /^#\d+ /.test(line));
-  assert.equal(lines.length, 5);
-  assert.equal(lines[0], '#5 [排队中] 刚刚 bot:chief 项目:无 输入：改测试 摘要：无');
-  assert.match(lines[1], /^#4 \[运行中\] 2 分钟前 bot:chief 项目:无 输入：去帮我完成\S+… 摘要：无$/);
+  assert.equal(lines.length, 6);
+  assert.equal(lines[0], '#6 [排队中] 刚刚 bot:chief 项目:无 输入：改测试 摘要：无');
+  assert.match(lines[1], /^#5 \[运行中\] 2 分钟前 bot:chief 项目:无 输入：去帮我完成\S+… 摘要：无$/);
+  assert.equal(lines[2], '#4 [完成·等你回复] 1 小时前 bot:chief 项目:无 输入：查下会话 摘要：无 最后问用户：你说的是哪台？ 1. M1 2. M5');
   assert.equal(/输入：(\S+) 摘要/.exec(lines[1])?.[1].length, 151, 'the input is cut at 150 characters');
-  assert.equal(lines[2], '#3 [完成] 1 小时前 bot:chief 项目:无 输入：看下部署 摘要：无', 'a reply that asks nothing');
-  assert.equal(lines[3], `#2 [完成] 1 小时前 bot:chief 项目:无 输入：看下配置 摘要：无 最后问用户：…${'问'.repeat(79)}？`, 'the end of a long one');
-  assert.equal(lines[4], '#1 [完成] 1 小时前 bot:research 项目:无 输入：看下日志 摘要：查了日志 最后问用户：你说的是 M1 还是 M5？');
+  assert.equal(lines[3], '#3 [完成] 1 小时前 bot:chief 项目:无 输入：看下部署 摘要：无', 'a reply that asks nothing');
+  assert.equal(lines[4], `#2 [完成] 1 小时前 bot:chief 项目:无 输入：看下配置 摘要：无 最后问用户：…${'问'.repeat(79)}？`, 'the end of a long one');
+  assert.equal(lines[5], '#1 [完成] 1 小时前 bot:research 项目:无 输入：看下日志 摘要：查了日志 最后问用户：你说的是 M1 还是 M5？');
   assert.match(prompt, /^现在：\d{4}-\d\d-\d\d \d\d:\d\d（北京时间）$/m);
   assert.match(prompt, /输出 \{"action":"attach","task":32\}/);
   assert.ok(prompt.endsWith('新消息：\n<message>\nM1\n</message>'), prompt.slice(-80));

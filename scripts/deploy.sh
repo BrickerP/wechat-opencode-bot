@@ -68,9 +68,10 @@ agents_follow_current() {  # some agent links into current, so moving current ch
   return 1
 }
 
-prompts_changed() {  # also true when there is no previous release to compare with
+prompts_changed() {  # the prompts or the bridge plugin; also true when there is no previous release to compare with
   if [ -z "$prev" ] || [ ! -d "$REPO/$prev/config/agents" ]; then return 0; fi
-  ! diff -rq "$REPO/$prev/config/agents" "$DEST/config/agents" >/dev/null 2>&1
+  ! diff -rq "$REPO/$prev/config/agents" "$DEST/config/agents" >/dev/null 2>&1 ||
+    ! diff -rq "$REPO/$prev/plugin" "$DEST/plugin" >/dev/null 2>&1
 }
 
 reload_agents() {  # a subshell keeps the env file's values out of this script

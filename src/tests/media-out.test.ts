@@ -1,6 +1,6 @@
-// Files and images back to WeChat: the upload to the iLink CDN, the image and file items that send them, the
-// <<<WECHAT_FILES>>> section of the orchestrator's answer, the checks a listed path must pass, the v10 column that
-// stores the accepted paths, and the deliver that sends them after the task's text.
+// Files and images back to WeChat: the upload to the iLink CDN, the image and file items that send them, the checks a
+// path the orchestrator's wechat_report lists must pass, the v10 column that stores the accepted paths, and the
+// deliver that sends them after the task's text.
 import assert from 'node:assert/strict';
 import { createHash, randomBytes } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
@@ -28,7 +28,7 @@ const { uploadAndEncrypt } = await import('../wechat/cdn.js');
 const { decryptAesEcb } = await import('../wechat/crypto.js');
 const { ILinkError, WeChatApi } = await import('../wechat/api.js');
 const { createSender } = await import('../wechat/send.js');
-const { checkTaskFiles, parseOrchestratorOutput } = await import('../orchestrator.js');
+const { checkTaskFiles } = await import('../orchestrator.js');
 const { createNotifier } = await import('../notify.js');
 const { openStateDb } = await import('../tasks/db.js');
 
@@ -198,38 +198,6 @@ test('sendImage and sendFile upload the file, then send one image or one file it
   assert.notEqual(first.client_id, second.client_id);
 });
 
-/** An answer with the three required sections, then rest. */
-const answer = (rest = '') => `<<<WECHAT_REPLY>>>\n图表做好了\n<<<WECHAT_MEMORY>>>\n- 无\n<<<WECHAT_SUMMARY>>>\n画了图表${rest}`;
-
-test('the files section follows the summary and runs to the end: one path per line, without bullets or backticks', () => {
-  const out = parseOrchestratorOutput(answer('\n<<<WECHAT_FILES>>>\n/ws/chart.png\n\n  - `/ws/report.pdf`  \n/ws/chart.png\n'));
-  assert.deepEqual([out.reply, out.summary], ['图表做好了', '画了图表'], 'the summary ends at the marker');
-  assert.deepEqual(out.files, ['/ws/chart.png', '/ws/report.pdf'], 'a repeated path counts once');
-});
-
-test('no files without the marker, or when the section is empty, "-" or "无"', () => {
-  assert.deepEqual(parseOrchestratorOutput(answer()).files, []);
-  for (const none of ['-', '无', '', '  ']) {
-    assert.deepEqual(parseOrchestratorOutput(answer(`\n<<<WECHAT_FILES>>>\n${none}\n`)).files, [], JSON.stringify(none));
-  }
-});
-
-test('a files marker the reply quotes is text: it cuts nothing short and sends nothing', () => {
-  const quoted = '附件写在 <<<WECHAT_FILES>>> 后面\n/etc/passwd';
-  const out = parseOrchestratorOutput(answer().replace('图表做好了', quoted));
-  assert.deepEqual([out.reply, out.summary, out.files], [quoted, '画了图表', []]);
-});
-
-test('without a memory section the files section still ends the answer', () => {
-  const out = parseOrchestratorOutput('<<<WECHAT_REPLY>>>\n好了\n<<<WECHAT_SUMMARY>>>\n发了图\n<<<WECHAT_FILES>>>\n/ws/a.png');
-  assert.deepEqual([out.reply, out.summary, out.files], ['好了', '发了图', ['/ws/a.png']]);
-});
-
-test('a handoff section from a session begun before handoffs went away changes nothing else', () => {
-  const out = parseOrchestratorOutput(answer('\n<<<WECHAT_HANDOFF>>>\nnext: 等反馈\n<<<WECHAT_FILES>>>\n/ws/chart.png'));
-  assert.deepEqual([out.reply, out.memory, out.summary, out.files], ['图表做好了', ['无'], '画了图表', ['/ws/chart.png']]);
-});
-
 test('checkTaskFiles keeps regular files inside the workspace and says why it drops each other path', () => {
   const ws = join(tmp, 'ws');
   const outside = join(tmp, 'outside');
@@ -282,7 +250,7 @@ test('a v9 database gains the files column and keeps its rows', () => {
   const migrated = openStateDb(v9);
   const columns = old.prepare("SELECT name FROM pragma_table_info('tasks')").all().map((c) => c.name);
   assert.ok(columns.includes('files'));
-  assert.equal((old.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 10);
+  assert.equal((old.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 11);
   old.close();
   const row = migrated.getTask(task.id)!;
   assert.deepEqual([row.input, row.files], ['old task', null]);

@@ -21,7 +21,8 @@ const STALL_MS = 2500;
 const TOOL_MS = 5000;
 /** Progress notes per task; a turn that runs past 300ms gets its first. */
 const PROGRESS_MAX = 2;
-const REPLY = '<<<WECHAT_REPLY>>>\nok\n<<<WECHAT_MEMORY>>>\n- 无\n<<<WECHAT_SUMMARY>>>\nok';
+/** What the 'answer' script's wechat_report call says. */
+const REPORT = { status: 'done', reply: 'ok', summary: 'ok' };
 const FACT = '用户喜欢简短的回复';
 /** What the fake agentmemory engine finds for any search, the queries it got and the writes, with their auth. */
 const memoryHits: unknown[] = [];
@@ -38,7 +39,7 @@ const MODELS = [
   { id: 'claude-opus-5-5', providerID: 'oneapi-chat', variants: [] },
 ];
 const FALLBACK = 'oneapi-chat-gpt/gpt-6-astra';
-/** The paths the 'send-files' script lists after its summary. */
+/** The paths the 'send-files' script reports. */
 const attachments: string[] = [];
 /** What each turn of a root session uses: 5000 tokens in with the cache reads, 250 out with the reasoning. */
 const TURN_USAGE = { input: 1000, output: 200, reasoning: 50, cache: { read: 4000, write: 0 }, cost: 0.25 };
@@ -60,7 +61,9 @@ type Script =
   | 'rejected'
   | 'child-stall'
   | 'child-tool'
-  | 'send-files';
+  | 'send-files'
+  | 'ask'
+  | 'no-report';
 
 interface FakeSession {
   id: string;
@@ -128,10 +131,12 @@ function charge(session: FakeSession): void {
   session.cost += TURN_USAGE.cost;
 }
 
-function answer(session: FakeSession, text = REPLY): void {
+/** The turn ends with a wechat_report call of these fields. */
+function answer(session: FakeSession, fields: object = {}): void {
   const now = Date.now();
   const time = { created: now, streamed: now, completed: now };
-  session.messages.push(message('assistant', { time, content: [{ type: 'text', text }] }), idle('succeeded'));
+  const report = { type: 'tool', id: `call_${++ids}`, name: 'wechat_report', state: { status: 'completed', input: { ...REPORT, ...fields } } };
+  session.messages.push(message('assistant', { time, content: [report] }), idle('succeeded'));
 }
 
 /** A turn that works on a shell command for 2 s, a poll's length and more, then answers. */
@@ -155,9 +160,9 @@ const play: Record<Script, (session: FakeSession) => void> = {
   'slow-answer': (s) => slowly(s),
   // The turn takes in what was steered meanwhile before it answers.
   'take-in': (s) => slowly(s, () => void s.inbox.splice(0)),
-  remember: (s) => later(100, () => answer(s, REPLY.replace('- 无', `- ${FACT}`))),
+  remember: (s) => later(100, () => answer(s, { memory: [FACT, '无'] })),
   // Rewrites one memory the prompt showed whole and one it showed cut, by their ids.
-  update: (s) => later(100, () => answer(s, REPLY.replace('- 无', '- [mem_a 2026-11-19] 用户在 M1 上工作\n- [mem_long] 长记忆的新版本'))),
+  update: (s) => later(100, () => answer(s, { memory: ['[mem_a 2026-11-19] 用户在 M1 上工作', '- [mem_long] 长记忆的新版本'] })),
   // One subagent runs and finishes, then the orchestrator answers.
   delegate: (s) =>
     later(100, () => {
@@ -196,7 +201,15 @@ const play: Record<Script, (session: FakeSession) => void> = {
         answer(s);
       });
     }),
-  'send-files': (s) => later(100, () => answer(s, `${REPLY}\n<<<WECHAT_FILES>>>\n${attachments.join('\n')}`)),
+  'send-files': (s) => later(100, () => answer(s, { files: [...attachments] })),
+  // The reply asks the user to choose.
+  ask: (s) => later(100, () => answer(s, { status: 'needs_input', reply: '你说的是哪台？\n1. M1\n2. M5' })),
+  // The turn ends on text, with no report.
+  'no-report': (s) =>
+    later(100, () => {
+      const now = Date.now();
+      s.messages.push(message('assistant', { time: { created: now, streamed: now }, content: [{ type: 'text', text: 'ok' }] }), idle('succeeded'));
+    }),
 };
 
 /** OpenCode's 404 for a session it does not have. */
@@ -732,4 +745,25 @@ test('a follow-up that comes as the turn answers gets a turn of its own before t
   assert.equal(task.status, 'done');
   assert.deepEqual(sent.map((p) => p.delivery), ['queue', 'queue']);
   assert.match(sent[1].text, /^<user_correction>\n还有 redis\n<\/user_correction>/);
+});
+
+test('a turn that ends without wechat_report gets one prompt to give it, in the same session; still none, and the task fails', async () => {
+  const nudged = await run(['no-report', 'answer']);
+  assert.equal(nudged.task.status, 'done');
+  assert.equal(nudged.task.result, 'ok');
+  assert.deepEqual(nudged.prompts.map((p) => [p.session, p.delivery]), [[nudged.roots[0].id, 'queue'], [nudged.roots[0].id, 'queue']]);
+  assert.match(nudged.prompts[1].text, /^Your turn ended without calling wechat_report/);
+  sessions.length = 0;
+  const { task, prompts: sent, delivered } = await run(['no-report', 'no-report']);
+  assert.equal(task.status, 'failed');
+  assert.equal(task.error, 'OpenCode 执行结束，但模型没有给出最终回复');
+  assert.equal(sent.length, 2, 'one nudge, and no retry: the model answered, just not as asked');
+  assert.equal(delivered.length, 1);
+});
+
+test('a done task records the status its report gave, and its reply as the result', async () => {
+  const { task } = await run(['ask']);
+  assert.deepEqual([task.status, task.outcome, task.result, task.summary], ['done', 'needs_input', '你说的是哪台？\n1. M1\n2. M5', 'ok']);
+  const plain = await run(['answer']);
+  assert.equal(plain.task.outcome, 'done');
 });

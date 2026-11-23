@@ -1,8 +1,8 @@
-// runTask against a fake OpenCode server whose sessions change from one poll to the next (a poll every 1.5s): what
-// the orchestrator writes on a root step that calls a tool reaches the user once, in its bot's voice and ahead of
-// the answer; only a step that calls no tool can be the answer; reasoning, subagents, tool payloads, steps still
-// streaming, answer text and tool-call markup are never commentary; a stop, a failed send or a finished task drops
-// a note without touching the outcome; a retry does not say again what was said; and OWB_PROGRESS_MAX=0 sends no
+// runTask against a fake OpenCode server whose sessions change from one poll to the next (a poll every 1.5s): each
+// completed wechat_reply call of the root session reaches the user once, in its bot's voice and ahead of the answer;
+// the answer is the turn's last wechat_report, and a turn without one gets one more turn to give it; text, reasoning,
+// subagents and calls that failed or still run are never a note; a stop, a failed send or a finished task drops a
+// note without touching the outcome; a retry does not say again what was said; and OWB_PROGRESS_MAX=0 sends no
 // progress note though the notes are on.
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -12,7 +12,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, beforeEach, test } from 'node:test';
 
-const REPLY = '<<<WECHAT_REPLY>>>\nok\n<<<WECHAT_MEMORY>>>\n- 无\n<<<WECHAT_SUMMARY>>>\nok';
 const NO_ANSWER = 'OpenCode 执行结束，但模型没有给出最终回复';
 
 /** What a session does as the provider reads its messages: one read per poll. */
@@ -42,10 +41,14 @@ const step = (...content: unknown[]): any => {
   return { id: `msg_${++ids}`, type: 'assistant', time: { created: at, streamed: at }, content };
 };
 const text = (value: string) => ({ type: 'text', text: value });
-const tool = (name: string, status = 'running', state: object = {}): any => ({ type: 'tool', name, state: { status, ...state } });
+const tool = (name: string, status = 'running', state: object = {}): any => ({ type: 'tool', id: `call_${++ids}`, name, state: { status, ...state } });
+/** A wechat_reply call that has run: a note for the user. */
+const note = (value: string, status = 'completed'): any => tool('wechat_reply', status, { input: { text: value } });
+/** A wechat_report call that has run: the answer "ok" unless fields say otherwise. */
+const report = (fields: object = {}): any => tool('wechat_report', 'completed', { input: { status: 'done', reply: 'ok', summary: 'ok', ...fields } });
 const idle = (outcome: string, error?: unknown): any => message('idle', { outcome, error });
 /** The answer comes and the turn ends. */
-const answer: Read = (s) => void s.messages.push(step(text(REPLY)), idle('succeeded'));
+const answer: Read = (s) => void s.messages.push(step(report()), idle('succeeded'));
 
 function addSession(fields: Partial<FakeSession> = {}): FakeSession {
   const session: FakeSession = { id: `ses_${++ids}`, messages: [], reads: [], interrupted: false, ...fields };
@@ -167,18 +170,16 @@ async function run(plays: Read[][], { botId, onCommentary }: RunOptions = {}) {
   return { task: db.getTask(task.id)!, heard, progress, roots: sessions.filter((s) => !s.parentID) };
 }
 
-test("a tool step's words reach the user once over the polls, in its bot's voice and ahead of the answer", async () => {
-  const shell = tool('shell');
+test('a wechat_reply call reaches the user once over the polls, in its bot\'s voice and ahead of the answer', async () => {
+  const call = note('我先看一下日志。', 'running');
   const { task, heard, progress, roots } = await run(
     [
       [
-        (s) => void s.messages.push(step(text('我先看一下日志。'), shell)),
-        // The command is still running: the next poll reads the same step again.
+        (s) => void s.messages.push(step(call, tool('shell'))),
+        // It has run now; the polls after read it again.
+        () => void (call.state.status = 'completed'),
         () => {},
-        (s) => {
-          shell.state.status = 'completed';
-          answer(s);
-        },
+        answer,
       ],
     ],
     { botId: 'research' },
@@ -189,65 +190,48 @@ test("a tool step's words reach the user once over the polls, in its bot's voice
   assert.deepEqual(progress, [], 'OWB_PROGRESS_MAX=0 sends none, though a note is due at every poll');
 });
 
-test('a turn that ends on a tool step fails rather than pass what was said on the way off as the answer', async () => {
-  const lookup = () => step(text('我先查一下。'), tool('read', 'completed'));
-  const endings: Record<string, Read> = {
-    'a last step that only reasoned': (s) =>
-      void s.messages.push(lookup(), step({ type: 'reasoning', text: '查完了' }), idle('succeeded')),
-    'no step after the tool': (s) => void s.messages.push(lookup(), idle('succeeded')),
-  };
-  for (const [name, ending] of Object.entries(endings)) {
-    sessions.length = 0;
-    const { task, heard, roots } = await run([[ending]]);
-    assert.equal(task.status, 'failed', name);
-    assert.equal(task.error, NO_ANSWER, name);
-    assert.equal(roots.length, 1, `${name}: not an upstream failure, so no retry`);
-    assert.deepEqual(heard, ['我先查一下。', `→ ⚠️ 任务 #${task.seq} 失败：${NO_ANSWER}`], name);
-  }
+test('a turn that ends without wechat_report gets one more turn to give it; still none, and the task fails', async () => {
+  const unreported: Read = (s) => void s.messages.push(step(text('答案写在了正文里')), idle('succeeded'));
+  const nudged = await run([[unreported], [answer]]);
+  assert.equal(nudged.task.status, 'done');
+  assert.equal(nudged.roots.length, 1, 'the same session');
+  assert.deepEqual(nudged.heard, ['→ ok'], 'the text was never the answer');
+  sessions.length = 0;
+  const { task, heard, roots } = await run([[unreported], [unreported]]);
+  assert.equal(task.status, 'failed');
+  assert.equal(task.error, NO_ANSWER);
+  assert.equal(roots.length, 1, 'not an upstream failure, so no retry');
+  assert.deepEqual(heard, [`→ ⚠️ 任务 #${task.seq} 失败：${NO_ANSWER}`]);
 });
 
-test('the answer is the newest step that says something and calls no tool, its text before an empty reply section too', async () => {
-  const answerFirst = '那个 medo 架构的学习 session 讲了三层：\n1. 网关\n2. 服务\n3. 存储\n';
-  const recovered = await run([
+test("the answer is the turn's last wechat_report; text and reasoning around it never are", async () => {
+  const { task, heard } = await run([
     [
       (s) =>
         void s.messages.push(
-          step(text('我先翻一下笔记。'), tool('read', 'completed')),
-          step(text(`${answerFirst}<<<WECHAT_REPLY>>>\n\n<<<WECHAT_MEMORY>>>\n- 无\n<<<WECHAT_SUMMARY>>>\n讲了三层`)),
+          step(text('草稿'), report({ reply: '第一版' })),
+          step({ type: 'reasoning', text: '再改一下' }, report({ reply: '第二版', summary: '改了两版', status: 'needs_input' })),
+          step(text('已完成。')),
           idle('succeeded'),
         ),
     ],
   ]);
-  assert.equal(recovered.task.status, 'done');
-  assert.deepEqual(recovered.heard, ['我先翻一下笔记。', `→ ${answerFirst.trim()}`]);
-  sessions.length = 0;
-  const trailing = await run([
-    [(s) => void s.messages.push(step(text(REPLY)), step({ type: 'reasoning', text: '答完了' }), idle('succeeded'))],
-  ]);
-  assert.deepEqual(trailing.heard, ['→ ok'], 'a step after the answer that wrote nothing is passed over');
+  assert.deepEqual(heard, ['→ 第二版']);
+  assert.deepEqual([task.summary, task.outcome], ['改了两版', 'needs_input']);
 });
 
-test('no commentary from a subagent, reasoning, a tool payload, a step still streaming, answer text or tool-call markup', async () => {
-  let draft: any;
+test('no note from a subagent, a call that failed or still runs, or one without text; each call once', async () => {
+  let pending: any;
   const { task, heard } = await run([
     [
       (s) => {
-        addSession({ parentID: s.id }).messages.push(message('user'), step(text('子任务：我来跑测试。'), tool('shell')));
-        draft = message('assistant', { content: [text('我在检'), tool('grep')] });
-        s.messages.push(
-          step({ type: 'reasoning', text: '先派一个子任务去跑测试' }, tool('subagent')),
-          step(tool('read', 'completed', { input: { path: '/repo/a.ts' }, output: 'export const a = 1;' })),
-          draft,
-        );
+        addSession({ parentID: s.id }).messages.push(message('user'), step(note('子任务：我来跑测试。'), tool('shell')));
+        pending = note('我在检查配置文件。', 'running');
+        s.messages.push(step(note('出错的那条', 'error'), note('  ')), step(pending, tool('grep')));
       },
       (s) => {
-        // Streamed in full now: only now is it told, and whole.
-        draft.content[0].text = '我在检查配置文件。';
-        draft.time.streamed = Date.now();
-        s.messages.push(
-          step(text('<<<WECHAT_REPLY>>>\n草稿回复'), tool('read')),
-          step(text('我看下文件\n<｜｜DSML｜｜invoke name="read"'), tool('read')),
-        );
+        pending.state.status = 'completed';
+        s.messages.push(step(text('我看下文件'), tool('read')));
         answer(s);
       },
     ],
@@ -256,29 +240,28 @@ test('no commentary from a subagent, reasoning, a tool payload, a step still str
   assert.deepEqual(heard, ['我在检查配置文件。', '→ ok']);
 });
 
-test('a stop after a step is chosen but before it is told drops it, in the provider and in runTask', async () => {
+test('a stop after a note is chosen but before it is told drops it, in the provider and in runTask', async () => {
   const controller = new AbortController();
   const told: string[] = [];
-  turns.push([(s) => void s.messages.push(step(text('第一步'), tool('read')), step(text('第二步'), tool('read')))]);
+  turns.push([(s) => void s.messages.push(step(note('第一条')), step(note('第二条')))]);
   const result = await openCodeQuery({
     prompt: 'hi',
     cwd: tmp,
     signal: controller.signal,
-    // Both steps come in one poll and are queued together; the stop comes as the first is told.
-    onAssistantText: (update) => {
+    // Both notes come in one poll and are queued together; the stop comes as the first is told.
+    onReply: (update) => {
       told.push(update.text);
       controller.abort();
     },
   });
   assert.equal(result.interrupted, true);
-  assert.deepEqual(told, ['第一步']);
+  assert.deepEqual(told, ['第一条']);
 
   // runTask chooses both notes before the first goes out, so the second is dropped as it is handed over.
   sessions.length = 0;
-  const { task, heard, roots } = await run(
-    [[(s) => void s.messages.push(step(text('先看日志。'), tool('shell')), step(text('再看配置。'), tool('shell')))]],
-    { onCommentary: (stop) => stop() },
-  );
+  const { task, heard, roots } = await run([[(s) => void s.messages.push(step(note('先看日志。')), step(note('再看配置。')))]], {
+    onCommentary: (stop) => stop(),
+  });
   assert.equal(task.status, 'interrupted');
   assert.equal(task.error, '用户停止');
   assert.ok(roots[0].interrupted, 'the session is stopped too');
@@ -290,7 +273,7 @@ test('a note that fails to send is dropped, and the outcome still goes out', asy
     [
       [
         (s) => {
-          s.messages.push(step(text('我先看一下。'), tool('read', 'completed')));
+          s.messages.push(step(note('我先看一下。')));
           answer(s);
         },
       ],
@@ -327,7 +310,7 @@ test('the notifier drops a note whose send fails or whose turn comes after its t
 });
 
 test('a retry does not say again what was said; notes are cut at 800 characters, 3 at most, and a plain answer has none', async () => {
-  const said = (note: string) => step(text(note), tool('shell', 'completed'));
+  const said = (value: string) => step(note(value), tool('shell', 'completed'));
   const { task, heard, roots } = await run([
     [
       (s) =>

@@ -40,12 +40,13 @@ export interface QueryOptions {
    */
   onProgress?: (update: { elapsedMs: number; children: number; idleMs: number; tools: string[] }) => void;
   /**
-   * Called once per message with the public text of a root step that calls a tool, as soon as the model has
-   * finished that step's response: what the orchestrator says while it works. A step without a tool call is an
-   * answer, left to the result. Never reasoning, subagent sessions, tool input or output, a failed step, or
-   * anything once the signal aborts; a callback that throws or rejects is only logged.
+   * Called once per completed wechat_reply call of the root session, with its text: what the orchestrator tells the
+   * user while it works. Never for subagent sessions or once the signal aborts; a callback that throws or rejects is
+   * only logged.
    */
-  onAssistantText?: (update: { messageId: string; text: string }) => void | Promise<void>;
+  onReply?: (update: { id: string; text: string }) => void | Promise<void>;
+  /** The prompt of one more turn when the last one ended without a wechat_report call; without it, such a turn fails. */
+  reportNudge?: string;
 }
 
 /** See QueryOptions.followUps. Both calls are synchronous, so nothing can come in between a check and a close. */
@@ -65,8 +66,28 @@ export interface PermissionRequest {
 
 export type PermissionDecision = "once" | "always" | "reject";
 
+/** The tools the WeChat orchestrators end a turn and talk to the user with: plugin/wechat-bridge.js adds them. */
+export const REPORT_TOOL = "wechat_report";
+export const REPLY_TOOL = "wechat_reply";
+
+/** How the orchestrator says its turn ended; needs_input when its reply asks the user something. */
+export const REPORT_STATUSES = ["done", "needs_input", "blocked", "failed"] as const;
+export type ReportStatus = (typeof REPORT_STATUSES)[number];
+
+/** A turn's wechat_report call: the answer for the user and what the task records. */
+export interface Report {
+  status: ReportStatus;
+  reply: string;
+  summary: string;
+  /** Facts for agentmemory, "[mem_x] text" to replace that memory (agentmemory.ts). */
+  memory: string[];
+  /** Paths to send after the reply, as given and not yet checked (checkTaskFiles in orchestrator.ts). */
+  files: string[];
+}
+
 export interface QueryResult {
-  text: string;
+  /** The last turn's report; set exactly when the query did not fail. */
+  report?: Report;
   sessionId: string;
   error?: string;
   interrupted?: boolean;
@@ -254,6 +275,19 @@ export async function listAgents(signal?: AbortSignal): Promise<Array<{ id: stri
   return (out.data || []).map((a) => ({ id: String(a.id), name: a.name || a.id }));
 }
 
+/** The id of plugin/wechat-bridge.js, which adds REPORT_TOOL and REPLY_TOOL. */
+export const BRIDGE_PLUGIN = "wechat-bridge";
+
+/** The server plugins OpenCode has loaded, each active or with the error it failed with. */
+export async function listPlugins(signal?: AbortSignal): Promise<Array<{ id: string; active: boolean; error?: string }>> {
+  const out = await api<{ data: any[] }>("/api/plugin", { signal });
+  return (out.data || []).map((p) => ({
+    id: String(p.id ?? ""),
+    active: p.state?.status === "active",
+    error: typeof p.state?.error === "string" ? p.state.error : undefined,
+  }));
+}
+
 export async function initOpenCode(cwd?: string): Promise<void> {
   if (await pingOpenCode()) {
     logger.info("OpenCode client connected", { url: OPENCODE_URL });
@@ -434,14 +468,19 @@ export async function listSessions(
   return found;
 }
 
-/** The text of the session's newest assistant message that has any, as a turn ends with; "" when none has. */
+/**
+ * What the session last answered: the reply of its newest wechat_report call, as an orchestrator's turn ends with,
+ * else the text of its newest assistant message that has any, as a subagent's does; "" when there is neither.
+ */
 export async function lastAssistantText(sessionId: string, signal?: AbortSignal): Promise<string> {
   const out = await api<{ data: any[] }>(`/api/session/${encodeURIComponent(sessionId)}/message?limit=100&order=desc`, { signal });
+  let text = "";
   for (const message of (out.data || []).filter((m) => m?.type === "assistant")) {
-    const text = extractAssistantText(message);
-    if (text) return text;
+    const report = lastReport([message]);
+    if (report) return report.reply;
+    text ||= extractAssistantText(message);
   }
-  return "";
+  return text;
 }
 
 const ZERO_USAGE: Usage = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
@@ -688,43 +727,62 @@ function progressSignature(messages: any[]): string {
   );
 }
 
-/** A step that calls a tool says what it does on the way; only a step that calls none can be the answer. */
-const callsTool = (message: any): boolean =>
-  Array.isArray(message?.content) && message.content.some((part: any) => part?.type === "tool");
+/** The completed calls of one tool in messages, in their order, with the input each was called with. */
+function completedCalls(messages: any[], name: string): Array<{ id: string; input: any }> {
+  return messages.flatMap((m) =>
+    (Array.isArray(m?.content) ? m.content : [])
+      .filter((part: any) => part?.type === "tool" && part.name === name && part.state?.status === "completed")
+      .map((part: any) => ({ id: String(part.id ?? ""), input: part.state?.input ?? {} })),
+  );
+}
+
+/** The non-empty strings of a list the model gave, trimmed; [] for anything else. */
+const textList = (value: unknown): string[] =>
+  Array.isArray(value) ? value.filter((item): item is string => typeof item === "string" && item.trim() !== "").map((item) => item.trim()) : [];
+
+/** A wechat_report call's input as a report; undefined without a reply, which is the one field the user sees. */
+function readReport(input: any): Report | undefined {
+  const reply = typeof input?.reply === "string" ? input.reply.trim() : "";
+  if (!reply) return undefined;
+  return {
+    status: REPORT_STATUSES.find((status) => status === input.status) ?? "done",
+    reply,
+    summary: typeof input.summary === "string" ? input.summary.trim() : "",
+    memory: textList(input.memory),
+    files: textList(input.files),
+  };
+}
+
+/** The report of the newest completed wechat_report call in messages, oldest first; undefined when there is none. */
+const lastReport = (messages: any[]): Report | undefined =>
+  completedCalls(messages, REPORT_TOOL).map((call) => readReport(call.input)).filter((report) => report !== undefined).at(-1);
 
 /**
- * Hands onAssistantText the text of each root step that calls a tool, oldest first, once the model's response for
- * that step has streamed in full. A step is looked at once, by message id; a failed one is left for OpenCode's
- * retry of the same message.
+ * Hands onReply each completed wechat_reply call of the root session once, oldest first, by its call id. Checked
+ * when the callback is due, not when it is queued: an abort in between drops the note.
  */
-function announceSteps(sessionId: string, assistants: any[], announced: Set<string>, options: QueryOptions): void {
-  for (const message of assistants) {
-    const id = message?.id;
-    if (typeof id !== "string" || announced.has(id) || message.error) continue;
-    if (!message.time?.streamed && !message.time?.completed) continue;
+function announceReplies(sessionId: string, assistants: any[], announced: Set<string>, options: QueryOptions): void {
+  for (const { id, input } of completedCalls(assistants, REPLY_TOOL)) {
+    const text = typeof input?.text === "string" ? input.text.trim() : "";
+    if (!id || announced.has(id) || !text) continue;
     announced.add(id);
-    if (!callsTool(message)) continue;
-    const text = extractAssistantText(message);
-    if (!text) continue;
-    // Checked when the callback is due, not when it is queued: an abort in between drops the step.
     Promise.resolve()
-      .then(() => (options.signal?.aborted ? undefined : options.onAssistantText?.({ messageId: id, text })))
-      .catch((err) => logger.debug("Assistant text callback failed", { sessionId, messageId: id, error: String(err) }));
+      .then(() => (options.signal?.aborted ? undefined : options.onReply?.({ id, text })))
+      .catch((err) => logger.debug("Reply callback failed", { sessionId, callId: id, error: String(err) }));
   }
 }
 
 /**
- * Poll until the turn goes idle, answering permission requests on the way and announcing the root steps that
- * call a tool (announceSteps). Two watchdogs give up on a silent upstream model: no first output within
+ * Poll until the turn goes idle, answering permission requests on the way and handing over the orchestrator's
+ * wechat_reply notes (announceReplies). Two watchdogs give up on a silent upstream model: no first output within
  * FIRST_RESPONSE_TIMEOUT_MS, or no sign of progress in the session or its subagent sessions for STALL_TIMEOUT_MS.
  * Signs of progress are a changed snapshot, a running tool or a pending permission, and what the event stream
  * shows streaming (events.ts): without it a long reasoning step looked like silence.
- * The answer is the text of the last step that says or does anything, and only if that step calls no tool: a turn
- * that ends on a tool step, or on nothing at all, fails rather than pass what was said on the way off as the answer.
+ * The answer is the turn's last wechat_report call; undefined when it made none, which openCodeQuery deals with.
  * Follow-ups (options.followUps) are steered in at every poll; one whose steer fails goes to held, for the next turn.
  * A continued session's subagent sessions from earlier turns are left out.
  */
-async function waitForTurn(sessionId: string, since: number, options: QueryOptions, held: string[]): Promise<string> {
+async function waitForTurn(sessionId: string, since: number, options: QueryOptions, held: string[]): Promise<Report | undefined> {
   const startedAt = Date.now();
   const deadline = startedAt + TURN_TIMEOUT_MS;
   const handledPermissions = new Set<string>();
@@ -789,8 +847,8 @@ async function waitForTurn(sessionId: string, since: number, options: QueryOptio
     const assistants = turn
       .filter((m) => m?.type === "assistant")
       .sort((a, b) => (a.time?.created ?? 0) - (b.time?.created ?? 0));
-    // Before the idle check, so a step that came in the same poll as the end of the turn is told ahead of the answer.
-    if (options.onAssistantText) announceSteps(sessionId, assistants, announced, options);
+    // Before the idle check, so a note that came in the same poll as the end of the turn is told ahead of the answer.
+    if (options.onReply) announceReplies(sessionId, assistants, announced, options);
 
     const idle = turn.find((m) => m?.type === "idle");
     if (idle) {
@@ -801,13 +859,7 @@ async function waitForTurn(sessionId: string, since: number, options: QueryOptio
       if (idle.outcome === "interrupted") {
         throw new TurnInterrupted("OpenCode 执行被中断");
       }
-
-      // Back from the newest step over those that call no tool; one that only reasoned, or wrote nothing, is passed over.
-      for (let i = assistants.length - 1; i >= 0 && !callsTool(assistants[i]); i--) {
-        const text = extractAssistantText(assistants[i]);
-        if (text) return text;
-      }
-      throw new TurnFailed("OpenCode 执行结束，但模型没有给出最终回复");
+      return lastReport(assistants);
     }
 
     const childMessages = (
@@ -871,8 +923,9 @@ async function sendTurn(sessionId: string, text: string, files?: string[]): Prom
  * Run one piece of work: a turn in a new session, or the next turn of options.sessionId, after a switch to
  * options.model when given. Input for the same work that came while it ran and that no turn took in (follow-ups the
  * turn had answered by, a steer that came after its last step) then gets a turn of its own, until close() finds
- * nothing waiting; the answer is the last turn's. usage counts these turns only: a continued session's totals from
- * before are subtracted.
+ * nothing waiting; the answer is the last turn's report. A last turn without one gets one more turn, with
+ * options.reportNudge, to give it; still none, and the query fails. usage counts these turns only: a continued
+ * session's totals from before are subtracted.
  */
 export async function openCodeQuery(options: QueryOptions): Promise<QueryResult> {
   const { prompt, cwd, agent, model, title, files, signal } = options;
@@ -887,7 +940,7 @@ export async function openCodeQuery(options: QueryOptions): Promise<QueryResult>
   // Follow-ups whose steer failed, for the next turn.
   const held: string[] = [];
   /** text as the session's next turn, and the answer to it. */
-  const turn = async (text: string, turnFiles?: string[]): Promise<string> => {
+  const turn = async (text: string, turnFiles?: string[]): Promise<Report | undefined> => {
     const since = await sendTurn(sessionId, text, turnFiles);
     admitted = true;
     return waitForTurn(sessionId, since, options, held);
@@ -907,23 +960,28 @@ export async function openCodeQuery(options: QueryOptions): Promise<QueryResult>
     options.onSession?.(sessionId);
     if (signal?.aborted) throw new TurnInterrupted();
 
-    let text = await turn(prompt, files);
+    let report = await turn(prompt, files);
     for (;;) {
       // Synchronous from take() to close(), once the inbox has been read: nothing can come in between.
       const waiting = [...held.splice(0), ...(await takeInbox(sessionId)), ...(options.followUps?.take() ?? [])];
       if (waiting.length) {
         logger.info("Another turn for input the last one did not take in", { sessionId, inputs: waiting.length });
-        text = await turn(waiting.join("\n\n"));
+        report = await turn(waiting.join("\n\n"));
         continue;
       }
       if (!options.followUps || options.followUps.close()) break;
     }
-    logger.info("OpenCode query completed", { sessionId, textLength: text.length });
-    return { text, sessionId, usage: usedSince(await sessionUsage(sessionId), before) };
+    if (!report && options.reportNudge) {
+      logger.warn("Turn ended without a report; asking for it", { sessionId });
+      report = await turn(options.reportNudge);
+    }
+    if (!report) throw new TurnFailed("OpenCode 执行结束，但模型没有给出最终回复");
+    logger.info("OpenCode query completed", { sessionId, status: report.status, replyLength: report.reply.length });
+    return { report, sessionId, usage: usedSince(await sessionUsage(sessionId), before) };
   } catch (err) {
     if (err instanceof SessionGone && !admitted) {
       logger.warn("Session to continue is gone", { sessionId });
-      return { text: "", sessionId, error: err.message, gone: true };
+      return { sessionId, error: err.message, gone: true };
     }
     const interrupted = err instanceof TurnInterrupted;
     const upstream = err instanceof UpstreamError;
@@ -936,7 +994,7 @@ export async function openCodeQuery(options: QueryOptions): Promise<QueryResult>
     const usage = sessionId ? usedSince(await sessionUsage(sessionId), before) : undefined;
     if (interrupted) logger.info("OpenCode query interrupted", { sessionId });
     else logger.error("OpenCode query failed", { sessionId, error, upstream, errorKind });
-    return { text: "", sessionId, error, interrupted, upstream, errorKind, usage };
+    return { sessionId, error, interrupted, upstream, errorKind, usage };
   }
 }
 

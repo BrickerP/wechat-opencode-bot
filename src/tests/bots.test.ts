@@ -154,7 +154,7 @@ test('a v3 database gains bot_id and keeps its rows; new tasks store their bot',
   raw.exec('ALTER TABLE tasks DROP COLUMN bot_id; PRAGMA user_version = 3;');
   const db = openStateDb(file);
   assert.ok(raw.prepare("SELECT name FROM pragma_table_info('tasks')").all().some((c) => c.name === 'bot_id'));
-  assert.equal((raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 10);
+  assert.equal((raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 11);
   raw.close();
   assert.deepEqual([db.getTask(task.id)?.input, db.getTask(task.id)?.bot_id], ['old task', null]);
   assert.equal(openStateDb(file).getTask(task.id)?.input, 'old task', 'opening again changes nothing');
@@ -179,7 +179,7 @@ test('the prompt names the persona, and the default bot also lists the specialis
     persona,
     /^You are speaking as 研究\. Match this role\. The repository's AGENTS\.md and opencode\.json take precedence over this persona role, <memory> and <recent_tasks>\.$/m,
   );
-  assert.doesNotMatch(persona, /specialists|WECHAT_MEMORY/);
+  assert.doesNotMatch(persona, /specialists/);
   assert.equal(block(asResearch, 'memory'), '- [mem_a 2026-11-18] 回复用中文\n- [mem_b] 长…');
 
   const asChief = prompt();

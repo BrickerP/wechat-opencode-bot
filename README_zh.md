@@ -49,8 +49,8 @@ flowchart LR
 2. `y`/`n` 回答正在等待的权限请求，`/` 命令直接得到回复。其余消息都交给任务：守护进程下载第一张图片，把文字分派给一个 bot 和一个项目。聊天有未结束的任务时，没有前缀的消息先交给任务分派器（见“路由”），它可能把消息并入某个任务、交给运行中的任务，或停止某个任务；否则守护进程把新任务存进 `state.db`。前面还有任务时，它会回复 `⏳ 已排队：任务 #N（前面还有 X 个任务）` 和预计等待时间。
 3. 通道的 worker 取出最早排队的任务，在项目根目录（没有项目时在聊天的工作目录）新开一个 OpenCode 会话。OpenCode 会加载该目录的 `AGENTS.md` 和 `opencode.json`，其中的规则优先于记忆和最近任务。分派器接到已结束任务上的消息则接着那个任务的会话做（见“路由”），重试也接着失败的那个会话。
 4. 新会话的上下文由 prompt 携带：时间、附件、bot 的角色、项目、与消息相关的至多 8 条 agentmemory 记忆（各带 id 和日期），以及最近 8 个任务（各带会话 id，最近 2 个附回复摘录）。消息需要某个早先任务做过什么时，编排器让 `wechat-explore` 用 `--session <id>`（prompt 里给出路径）读那个会话，而不是去搜。
-5. orchestrator 把工作交给 `wechat-explore` 或 `wechat-general`，同时最多 3 个，每个任务最多 6 个。权限请求发到微信。orchestrator 在调用子 agent 前写的一句简短说明可以作为过程说明发到聊天；守护进程自己的进度通知（已运行时长、正在运行的工具、子 agent 数量）默认关闭。
-6. orchestrator 的输出以 `<<<WECHAT_REPLY>>>`、`<<<WECHAT_MEMORY>>>`、`<<<WECHAT_SUMMARY>>>` 收尾，可选带 `<<<WECHAT_FILES>>>` 段。守护进程保留回复、把最多 5 条事实存进 agentmemory（以某条记忆的 id 开头的事实会更新那一条），保存摘要、本任务各轮的 token 用量和文件路径，并在文字之后发送文件。
+5. orchestrator 把工作交给 `wechat-explore` 或 `wechat-general`，同时最多 3 个，每个任务最多 6 个。权限请求发到微信。orchestrator 用 `wechat_reply` 发的简短说明会作为过程说明发到聊天；守护进程自己的进度通知（已运行时长、正在运行的工具、子 agent 数量）默认关闭。
+6. orchestrator 每一轮都以一次 `wechat_report` 调用结束：`status`（`done`、`needs_input`、`blocked` 或 `failed`）、`reply`、`summary`，以及可选的 `memory` 和 `files`。两个工具都来自 OpenCode 插件 `plugin/wechat-bridge.js`，守护进程从会话里读取它们的调用。某一轮没有调用就结束时，会再发一条 prompt 让它补上；仍然没有，任务失败。守护进程保留回复、把最多 5 条事实存进 agentmemory（以某条记忆的 id 开头的事实会更新那一条），保存摘要、状态、本任务各轮的 token 用量和文件路径，并在文字之后发送文件。已完成任务的状态不是 `done` 时，`/tasks` 和分派器会显示出来，比如 `完成·等你回复`。
 7. 接着做的会话只在下一轮收到新的内容：时间、任务编号、附件、相关记忆和消息，因为会话里已经有之前的工作。结果加上 bot 的回复前缀后只进入待发队列一次，按 2048 字分段；失败显示 `⚠️ 任务 #N 失败：…`，重启中断显示 `⏹ 任务 #N 已中断…`。
 
 ### 路由
@@ -87,7 +87,7 @@ flowchart LR
 - 上游失败会在 `OPENCODE_FALLBACK_MODEL` 上重试一次，前提是设置了它、且服务器此刻的模型列表（`GET /api/model`）里有它；模型可能在 bot 运行期间被移除，所以每次使用前、启动时和 `/doctor` 都会核对。设置了但列表里没有的备用模型不会被尝试，任务的错误会说明原因；没有设置时，上游失败不重试。上游失败包括 429 或额度不足、5xx 或过载、超时、连接错误、鉴权以外的 `provider.*` 错误，以及模型首次输出前沉默 120 秒、或两次进展之间沉默 180 秒。进展包括正在流式输出的推理、正文和工具参数，守护进程从 OpenCode 的事件流（`GET /api/event`）读取它们；消息快照要等它们输出完才看得到。事件流断开时只靠轮询判断进展，`/doctor` 会提示。重试接着同一个会话、换成备用模型，用一段简短的 prompt 说明第一次尝试为何停下，并要求先检查它改过什么再继续；会话已不存在时，新开一个会话并给完整 prompt。你只会看到最终结果。
 - 不重试：鉴权、权限、4xx 和未知错误，本地服务的错误，以及单轮 30 分钟的上限。
 - 每个网关有一个熔断器，状态只在内存里。连续 3 次上游失败会打开它：只要服务器列出了备用模型，新任务就直接用备用模型，聊天收到一条通知；没有可用的备用模型时，任务仍用主模型。10 分钟后下一个任务会再试这个网关；成功则关闭熔断，失败则等待时间翻倍，最长 1 小时。另外，30 分钟内 3 个任务失败会发一条 `🚨` 告警，之后 30 分钟内不再发。
-- 过程说明：orchestrator 在调用子 agent 前写的那句话，会在该步骤的响应完成后加上 bot 的回复前缀发到聊天。每个任务最多 3 条（含重试），每条截断到 800 字；含分段标记或工具调用标记的文字、以及重试时重复的文字不会发送。它尽力而为：不进待发队列，也从不重试。最终回复只经待发队列发送一次。
+- 过程说明：orchestrator 的每次 `wechat_reply` 调用在执行后加上 bot 的回复前缀发到聊天。每个任务最多 3 条（含重试），每条截断到 800 字；重试时重复的文字不再发送。它尽力而为：不进待发队列，也从不重试。最终回复只经待发队列发送一次。orchestrator 在这两个工具之外写的文字从不发到聊天。
 - 进度通知属于诊断信息，默认关闭。设置 `OWB_PROGRESS_ENABLED=true` 后，任务运行 20 秒时发 `⏳ 任务 #N 运行中…`，附已运行时长、正在运行的工具和已派出的子 agent 数；之后在派出新子 agent 时或每 5 分钟再发，间隔至少 90 秒，每个任务最多 4 条。即使开启，`OWB_PROGRESS_MAX=0` 也会关掉它们。
 - 每个结果在发送前先存入待发队列（`pending_notices`），按从旧到新的顺序发出。发送失败后依次等待 30 秒、2 分钟、10 分钟、1 小时，等待结束后在你的下一条消息或某个任务结束时重试。
 
@@ -118,6 +118,7 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 |---|---|
 | `src/` | 守护进程：`main.ts`（CLI、收消息）、`task-router.ts`（消息属于哪个未结束的任务）、`orchestrator.ts`（prompt、执行、结果）、`opencode/`（HTTP 客户端、watchdog）、`tasks/`（`state.db`、通道）、`wechat/`（iLink 客户端）、`commands/`、`tests/` |
 | `config/agents/` | 四个 agent 的提示词，见 [config/agents/README.md](config/agents/README.md) |
+| `plugin/` | `wechat-bridge.js`：给两个 orchestrator 加上 `wechat_report` 和 `wechat_reply` 的 OpenCode 服务端插件 |
 | `config/launchd/` | server、daemon、watchdog 三个 launchd 模板，分别经 `run-server.sh`、`run-bot.sh`、`scripts/watchdog.sh` 启动 |
 | `scripts/` | `release.sh`、`deploy.sh`、`rollback.sh`、`healthcheck.sh`、`install-agents.sh`、`install-launchd.sh` |
 | `docs/` | [DEPLOY.md](docs/DEPLOY.md) 和设计文档 |
@@ -136,7 +137,7 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 2. `npm run setup`：用微信扫码，再输入基础目录（`config.env` 里的 `workingDirectory`）；项目和 `/cwd` 都必须在它里面。
 3. 选择模型。提示词和默认值用的是你多半没有的 `oneapi*` provider：修改 `config/agents/wechat-orchestrator.md` 和 `wechat-orchestrator-read.md` 里的 `model:`，把 `OPENCODE_DEFAULT_MODEL` 设成同一个模型，把 `OPENCODE_FALLBACK_MODEL` 设成另一个 provider 上的模型。[docs/PROVIDERS.md](docs/PROVIDERS.md) 有 Anthropic、OpenAI、Ollama 和自建网关的示例。
 4. 把这些和其他配置写进 `~/.wechat-opencode-bot/env`，然后 `chmod 600`。
-5. `scripts/install-agents.sh --apply` 把 agent 提示词链接到 `~/.config/opencode/agents/`；不带 `--apply` 时只列出改动。然后用它打印的命令 reload OpenCode，或者重启服务。
+5. `scripts/install-agents.sh --apply` 把 agent 提示词链接到 `~/.config/opencode/agents/`，把桥接插件链接到 `~/.config/opencode/plugins/`；不带 `--apply` 时只列出改动。没有这个插件，任务都给不出回复；`/doctor` 会检查它。然后用它打印的命令 reload OpenCode，或者重启服务。
 
 `accounts/`、`config.env`（`workingDirectory`、`permissionMode`）和 `logs/` 始终在 `~/.wechat-opencode-bot/`；其余内容，包括 `env`、`bots.json` 和 `projects.json`，都在数据目录。
 
@@ -172,7 +173,7 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 | `/bots` | 列出 bot：id、别名、回复前缀、model、是否默认 |
 | `/model [model]` | 查看或设置之后任务的模型，覆盖所有 bot：`provider/model[#variant]` 或只写 id；`/model default` 恢复各 bot 自己的 model |
 | `/models` | 列出服务上的模型 |
-| `/doctor` | 自检：OpenCode、agent、事件流、消息令牌、待补发、数据库、agentmemory、备用模型、熔断、定时任务和运行时长 |
+| `/doctor` | 自检：OpenCode、agent、桥接插件、事件流、消息令牌、待补发、数据库、agentmemory、备用模型、熔断、定时任务和运行时长 |
 | `/panic` | 停止并取消所有任务、拒绝等待中的审批、切到 `plan`、停用所有定时任务 |
 | `/permission [mode]` | 查看或设置 `default`、`acceptEdits`、`plan` 或 `auto` |
 | `/routine …` | 列出定时任务，或对某一个执行 `add`、`rm`、`on`、`off`、`run` |

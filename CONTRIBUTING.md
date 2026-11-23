@@ -43,9 +43,9 @@ Leave the model change from step 2 out of your pull request unless the pull requ
 ## Change an agent prompt
 
 1. Edit the prompt in `config/agents/`, never the links in `~/.config/opencode/agents/`.
-2. Try it. In a checkout without `current/`, `scripts/install-agents.sh --apply` links the repo's `config/agents/`, so after `opencode reload` a `--simulate` run uses your edit.
-3. Keep the output markers. `src/orchestrator.ts` parses `<<<WECHAT_REPLY>>>` and the markers after it, so changing a marker takes a code change and a test in the same pull request.
-4. On an always-on bot, ship it as a release once it is on `main` and CI has passed for that commit: download the commit's artifact and run `scripts/release.sh vX.Y.Z <artifact-dir>`, then `scripts/deploy.sh --apply vX.Y.Z`, as [docs/DEPLOY.md](docs/DEPLOY.md#release) shows. `release.sh` packages CI's `dist/` and compiles nothing. Prompts and code switch together, and the deploy reloads OpenCode when the prompts changed. After the first deploy, rerun `scripts/install-agents.sh --apply` so the links follow `current/`.
+2. Try it. In a checkout without `current/`, `scripts/install-agents.sh --apply` links the repo's `config/agents/` and `plugin/`, so after `opencode reload` a `--simulate` run uses your edit.
+3. Keep the tools in step. The orchestrators answer with `wechat_report` and `wechat_reply`, which `plugin/wechat-bridge.js` defines and `src/opencode/provider.ts` reads, so changing a tool or one of its fields takes a code change and a test in the same pull request.
+4. On an always-on bot, ship it as a release once it is on `main` and CI has passed for that commit: download the commit's artifact and run `scripts/release.sh vX.Y.Z <artifact-dir>`, then `scripts/deploy.sh --apply vX.Y.Z`, as [docs/DEPLOY.md](docs/DEPLOY.md#release) shows. `release.sh` packages CI's `dist/` and compiles nothing. Prompts, the plugin and code switch together, and the deploy reloads OpenCode when the prompts or the plugin changed. After the first deploy, rerun `scripts/install-agents.sh --apply` so the links follow `current/`.
 
 [config/agents/README.md](config/agents/README.md) explains how the prompts are deployed and rolled back.
 

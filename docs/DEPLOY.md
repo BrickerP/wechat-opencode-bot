@@ -9,10 +9,11 @@ The bot runs from a release: a tarball of one commit and the `dist/` that CI bui
 | Path | What it is |
 |---|---|
 | `releases/wechat-bot-<tag>.tgz`, `.tgz.sha256` | A release, packaged by `scripts/release.sh` from a CI artifact |
-| `releases/<tag>/` | An installed release: `dist/`, production `node_modules/`, `config/agents/`, `scripts/` with `healthcheck.sh` and `collect-work-activity.mjs`, and a `RELEASE` file naming its commit |
+| `releases/<tag>/` | An installed release: `dist/`, production `node_modules/`, `config/agents/`, `plugin/`, `scripts/` with `healthcheck.sh` and `collect-work-activity.mjs`, and a `RELEASE` file naming its commit |
 | `current` | Symlink to `releases/<tag>` |
 | `run-bot.sh`, `run-server.sh` | The launchd wrappers. launchd runs the repo's copies, not the ones inside a release |
 | `config/agents/` | OpenCode agent prompts, see [Agents](#agents) |
+| `plugin/` | The OpenCode server plugin with the orchestrators' tools, see [Agents](#agents) |
 | `config/launchd/` | launchd job templates, see [launchd](#launchd) |
 | `~/.wechat-opencode-bot/` | Data: `state.db`, `env`, `logs/`, `backups/` |
 
@@ -34,7 +35,7 @@ scripts/release.sh v1.2.0 "$artifact"
 - If `gh run list` shows nothing, CI for that commit has not finished, has failed, or was cancelled by a later push to `main`: wait for the run, or pull again and release the newer commit once its run passes.
 - Take the push run's artifact. A pull-request run builds GitHub's temporary merge commit, so its artifact and `BUILD_COMMIT` name that commit instead, and `release.sh` refuses it.
 - Download the artifact outside the repo: `release.sh` refuses to run while the working tree has changes, untracked files included.
-- `release.sh` compiles and tests nothing. It checks that `BUILD_COMMIT` holds exactly HEAD's hash, that `dist/main.js` exists and that `dist/` holds only plain files and directories. Then it takes `dist/` from the artifact and `package.json`, `package-lock.json`, `run-bot.sh`, `run-server.sh`, `config/agents/`, `scripts/healthcheck.sh` and `scripts/collect-work-activity.mjs` from HEAD (`git archive`), and adds a `RELEASE` file with the tag, the commit and the time it was packaged.
+- `release.sh` compiles and tests nothing. It checks that `BUILD_COMMIT` holds exactly HEAD's hash, that `dist/main.js` exists and that `dist/` holds only plain files and directories. Then it takes `dist/` from the artifact and `package.json`, `package-lock.json`, `run-bot.sh`, `run-server.sh`, `config/agents/`, `plugin/`, `scripts/healthcheck.sh` and `scripts/collect-work-activity.mjs` from HEAD (`git archive`), and adds a `RELEASE` file with the tag, the commit and the time it was packaged.
 - It writes `releases/wechat-bot-v1.2.0.tgz` and its `.sha256`, and refuses a tag that already has a tarball. It creates no git tag and pushes nothing. CI keeps each artifact for 14 days.
 
 ## Deploy
@@ -115,17 +116,18 @@ Keep `dist-roster/` until the new setup has run for a while: the undo starts it.
 
 ## Agents
 
-The bot runs write tasks on the `wechat-orchestrator` agent, which hands work to `wechat-general` and `wechat-explore`, and the read lane's tasks (read-only bots) on `wechat-orchestrator-read`, which can only hand work to `wechat-explore`. OpenCode loads all four from `~/.config/opencode/agents/`. After `scripts/install-agents.sh --apply`, those files are links into `current/config/agents/`, so a deploy brings its release's prompts and a rollback brings the old ones back.
+The bot runs write tasks on the `wechat-orchestrator` agent, which hands work to `wechat-general` and `wechat-explore`, and the read lane's tasks (read-only bots) on `wechat-orchestrator-read`, which can only hand work to `wechat-explore`. OpenCode loads all four from `~/.config/opencode/agents/`. Both orchestrators answer through `wechat_report` and `wechat_reply`, the tools of the server plugin `plugin/wechat-bridge.js`, which OpenCode loads from `~/.config/opencode/plugins/`; without it no task can answer, and `/doctor` says so. After `scripts/install-agents.sh --apply`, those files are links into `current/config/agents/` and `current/plugin/`, so a deploy brings its release's prompts and plugin and a rollback brings the old ones back.
 
 - Both orchestrators ship together in every release. `deploy.sh` creates no links, so a release that adds a prompt, such as the first with `wechat-orchestrator-read.md`, needs `scripts/install-agents.sh --apply` and a reload right after its deploy; until then OpenCode does not know the agent a read-only bot's task asks for.
-- OpenCode caches agents until it reloads them. `deploy.sh` reloads them when a release changes a prompt, and again when it rolls back. To reload by hand:
+- The first release with the plugin needs `scripts/install-agents.sh --apply` and a reload right after its deploy, as a release that adds a prompt does: its prompts call tools the running OpenCode does not have until then. A rollback to an older release leaves the plugin link pointing nowhere; `install-agents.sh --apply` removes it.
+- OpenCode caches agents and plugins until it reloads them. `deploy.sh` reloads them when a release changes a prompt or the plugin, and again when it rolls back. To reload by hand:
 
   ```bash
   (set -a; . ~/.wechat-opencode-bot/env; set +a; opencode reload --server "${OPENCODE_URL:-http://127.0.0.1:4096}")
   ```
 
 - To change a prompt, edit `config/agents/<name>.md` and get the commit onto `main`, then package CI's artifact of it as in [Release](#release) and deploy. See [config/agents/README.md](../config/agents/README.md).
-- `install-agents.sh` backs up what it replaces to `~/.wechat-opencode-bot/backups/agents-<time>/`. Never keep a backup inside `~/.config/opencode/agents/`: OpenCode also loads `.md` files in its subdirectories as agents, hidden ones included.
+- `install-agents.sh` backs up what it replaces to `~/.wechat-opencode-bot/backups/agents-<time>/`, the plugin link included. Never keep a backup inside `~/.config/opencode/agents/` or `plugins/`: OpenCode also loads `.md` files in the agents' subdirectories as agents, hidden ones included, and every `.js` file in `plugins/` as a plugin.
 - `wechat-ducc.md` is not part of the setup: no agent delegates to Ducc, and `install-agents.sh` does not create it. The old file in a live agents directory can be deleted.
 
 ## launchd
@@ -196,7 +198,7 @@ It changes nothing and exits 1 if any check fails:
 - the bot job runs, and `daemon.lock` names its pid;
 - `main.js --status` succeeds when run with the bot's own node and entry. Its report is printed.
 
-In WeChat, `/doctor` runs the same class of checks from inside the daemon: OpenCode and the four agents, the message token's age, the outbox, `state.db` and `opencode.db` sizes, open breakers, routines and uptime. `/panic` is the kill switch: it stops and cancels every task, denies waiting asks, switches to `plan` and disables every routine.
+In WeChat, `/doctor` runs the same class of checks from inside the daemon: OpenCode, the four agents and the bridge plugin, the message token's age, the outbox, `state.db` and `opencode.db` sizes, open breakers, routines and uptime. `/panic` is the kill switch: it stops and cancels every task, denies waiting asks, switches to `plan` and disables every routine.
 
 It also prints the bot's command line, its working directory and where `current` points.
 

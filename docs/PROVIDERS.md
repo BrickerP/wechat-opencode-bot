@@ -138,6 +138,6 @@ A request gets 30 s. When it fails, the bot asks you to send the message again o
 
 ## Files and images sent back
 
-Either orchestrator can attach up to 3 files to its reply, as a `<<<WECHAT_FILES>>>` section at the end of its output with one absolute path per line. Each must be a regular file, not a symlink, whose real path is inside the task's workspace, of at most 20 MB and of one of these types: png, jpg, jpeg, gif, webp, bmp, pdf, txt, md, patch, diff, csv, json or zip. The daemon uploads each file to the iLink CDN and sends it after the text, images as images and the rest as files. A path that fails a check is dropped: the log says why, and the reply says how many did not come.
+Either orchestrator can attach up to 3 files to its reply, as absolute paths in the `files` of its `wechat_report` call. Each must be a regular file, not a symlink, whose real path is inside the task's workspace, of at most 20 MB and of one of these types: png, jpg, jpeg, gif, webp, bmp, pdf, txt, md, patch, diff, csv, json or zip. The daemon uploads each file to the iLink CDN and sends it after the text, images as images and the rest as files. A path that fails a check is dropped: the log says why, and the reply says how many did not come.
 
 Files never enter the outbox. A file that fails to upload or send is logged and not retried, and while the text still waits in the outbox, the files are not sent at all.

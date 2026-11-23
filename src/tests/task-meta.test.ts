@@ -15,7 +15,7 @@ process.env.HOME = tmp;
 process.env.OWB_DATA_DIR = join(tmp, 'data');
 
 const { openStateDb } = await import('../tasks/db.js');
-const { composePrompt, parseOrchestratorOutput, stripToolMarkup } = await import('../orchestrator.js');
+const { composePrompt, parseOrchestratorOutput, SESSION_READER, stripToolMarkup } = await import('../orchestrator.js');
 const { formatStatus, formatTasks } = await import('../commands/handlers.js');
 
 const MINUTE = 60 * 1000;
@@ -153,6 +153,17 @@ test('no handoff block when it is stale, when the task right before left none, f
     assert.doesNotMatch(prompt, /<last_handoff>/, name);
     assert.ok(!prompt.includes(HANDOFF), name);
   }
+});
+
+test("<recent_tasks> shows each task's session id, and <context> names this build's session reader", () => {
+  const recalled = finished('ids');
+  db.setTaskSession(recalled.id, 'ses_recall');
+  finished('ids');
+  const prompt = composePrompt(db, db.createTask('ids', '它做了什么').task, tmp, none);
+  assert.match(prompt, new RegExp(`^#${recalled.seq} .+ \\[完成\\]（会话 ses_recall） 用户: 改 parser$`, 'm'));
+  const tasks = prompt.split('\n').filter((line) => /^#\d+ /.test(line));
+  assert.equal(tasks.filter((line) => line.includes('（会话 ')).length, 1, 'a task without a session shows none');
+  assert.ok(prompt.split('\n').includes(`session-reader: node ${SESSION_READER} --session`), prompt);
 });
 
 test('/status shows the tokens of the last 24 hours, and their cost when there is one', () => {

@@ -1,12 +1,16 @@
 // /session: a session's last assistant text, read straight from this OpenCode server by id or by a title the
-// session list matches, so the user does not need a task to dig it out.
+// session list matches, so the user does not need a task to dig it out; and --session, the same read with every
+// subagent session's report, which the orchestrators' subagents run to recall an earlier task by its id.
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, beforeEach, test } from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import type { CommandContext } from '../commands/handlers.js';
 
 const tmp = mkdtempSync(join(tmpdir(), 'owb-session-'));
@@ -45,6 +49,18 @@ const MESSAGES: Record<string, unknown[]> = {
   ses_deploy: [{ type: 'assistant', content: [text('部署走流水线')] }],
   ses_empty: [{ type: 'user', content: [text('在吗')] }],
   ses_long: [{ type: 'assistant', content: [text(LONG)] }],
+  // A bot task's orchestrator and its two subagents, one of which wrote no text.
+  ses_task: [{ type: 'assistant', content: [text('编排器的回答')] }],
+  ses_sub1: [{ type: 'assistant', content: [text('子任务一的报告')] }],
+  ses_sub2: [{ type: 'user', content: [text('只有简报')] }],
+};
+/** Child sessions by parent, as GET /api/session?parentID= lists them. */
+const CHILDREN: Record<string, unknown[]> = {
+  ses_task: [
+    { id: 'ses_sub1', title: '查日志' },
+    { id: 'ses_sub2', title: '查配置' },
+  ],
+  ses_long: [{ id: 'ses_long', title: '长回复' }],
 };
 /** The requests the fake OpenCode got, in order. */
 const requests: string[] = [];
@@ -52,6 +68,9 @@ const server = createServer((req, res) => {
   const send = (body: unknown) => void res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(body));
   const url = new URL(req.url ?? '', 'http://fake');
   requests.push(`${url.pathname}${url.search}`);
+  if (url.pathname === '/api/session' && url.searchParams.has('parentID')) {
+    return send({ data: CHILDREN[url.searchParams.get('parentID') ?? ''] ?? [] });
+  }
   if (url.pathname === '/api/session') {
     const page = url.searchParams.get('cursor') === 'page-2' ? 1 : 0;
     return send({ data: PAGES[page], cursor: page === 0 ? { next: 'page-2' } : {} });
@@ -66,7 +85,10 @@ process.env.OPENCODE_URL = `http://127.0.0.1:${(server.address() as AddressInfo)
 
 // provider.ts reads OPENCODE_URL at load, so the bot modules load after the fake server is up.
 const { routeCommand } = await import('../commands/router.js');
+const { readSession } = await import('../commands/handlers.js');
 const { lastAssistantText, listSessions } = await import('../opencode/provider.js');
+/** The CLI next to these tests, in dist/. */
+const MAIN = fileURLToPath(new URL('../main.js', import.meta.url));
 
 after(() => {
   server.closeAllConnections();
@@ -133,4 +155,48 @@ test('/session says when there is no assistant text, cuts a long one, and names 
   const gone = await routeCommand('/session ses_m1only', ctx);
   assert.match(gone, /^⚠️ 读不到这个会话：GET \/api\/session\/ses_m1only\/message.+HTTP 404/);
   assert.match(gone, /它可能不在这台 OpenCode 上；M1\/M3 的会话要在它们自己的机器上读$/);
+});
+
+test("with children, the reader adds each subagent session's title and last text, and says when one wrote none", async () => {
+  const read = await readSession('ses_task', { children: true });
+  assert.equal(read.found, true);
+  assert.equal(
+    read.text,
+    ['ses_task 的最后回复：\n编排器的回答', '子会话 2 个：', '── ses_sub1 查日志\n子任务一的报告', '── ses_sub2 查配置\n（没有助手文本）'].join('\n\n'),
+  );
+  assert.deepEqual(
+    requests,
+    [
+      '/api/session/ses_task/message?limit=100&order=desc',
+      '/api/session?parentID=ses_task&limit=50',
+      '/api/session/ses_sub1/message?limit=100&order=desc',
+      '/api/session/ses_sub2/message?limit=100&order=desc',
+    ],
+    'it only reads',
+  );
+  assert.deepEqual(await readSession('ses_task'), { text: '编排器的回答', found: true }, 'without children, as /session shows it');
+});
+
+test('the reader cuts the whole read at 20,000 characters and finds nothing in a session it cannot read', async () => {
+  const long = await readSession('ses_long', { children: true });
+  assert.equal(long.found, true);
+  assert.match(long.text, /\n\n（已截断，原文 50\d{3} 字）$/, 'the root and its child, 25,000 characters each');
+  assert.ok(long.text.length < 20_100, `${long.text.length} characters`);
+  assert.ok(long.text.startsWith('ses_long 的最后回复：\n长'));
+  const gone = await readSession('ses_m1only', { children: true });
+  assert.equal(gone.found, false);
+  assert.match(gone.text, /^⚠️ 读不到这个会话：/);
+  assert.deepEqual(await readSession('ses_empty', { children: true }), { text: 'ses_empty 的最后回复：\n（没有助手文本）', found: false });
+});
+
+test('--session prints the read and exits 0, or says why on stderr and exits 1', async () => {
+  const run = promisify(execFile);
+  const env = { ...process.env, HOME: tmp, OWB_DATA_DIR: join(tmp, 'data') };
+  const ok = await run(process.execPath, [MAIN, '--session', 'ses_task'], { env });
+  assert.match(ok.stdout, /^ses_task 的最后回复：\n编排器的回答\n\n子会话 2 个：/);
+  await assert.rejects(run(process.execPath, [MAIN, '--session', 'ses_m1only'], { env }), (err: any) => {
+    assert.equal(err.code, 1);
+    assert.match(err.stderr, /读不到这个会话/);
+    return true;
+  });
 });

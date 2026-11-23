@@ -5,7 +5,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { formatStatus, formatTasks, parseTaskLimit, ROUTINE_TICK_MS, tickRoutines, type CommandContext } from './commands/handlers.js';
+import { formatStatus, formatTasks, parseTaskLimit, readSession, ROUTINE_TICK_MS, tickRoutines, type CommandContext } from './commands/handlers.js';
 import { isCommand, routeCommand } from './commands/router.js';
 import { loadConfig, saveConfig } from './config.js';
 import { DATA_DIR } from './constants.js';
@@ -336,6 +336,7 @@ wechat-opencode-bot - 微信接入 OpenCode
   --tasks [数量]       查看最近的任务
   --simulate "<内容>"  在本进程模拟一条微信消息（回复打印到终端）
   --notify "<内容>"    主动给微信发一条消息
+  --session <id|标题>  只读：打印这台 OpenCode 上某个会话的最后回复和它的子会话报告
 
 常驻运行由 launchd 管理（docs/DEPLOY.md）:
   重启  launchctl kickstart -k gui/$(id -u)/com.yupeng.opencode-wechat-bot
@@ -358,7 +359,7 @@ function runStatus(): void {
   console.log(`\n${formatStatus(openStateDb(), cliAccountId())}`);
 }
 
-/** --simulate and --notify report their outcome through the exit code. */
+/** --simulate, --notify and --session report their outcome through the exit code. */
 function runWithExitCode(run: (text: string) => Promise<number>): void {
   const text = process.argv.slice(3).join(' ').trim();
   if (!text) {
@@ -375,6 +376,17 @@ function runWithExitCode(run: (text: string) => Promise<number>): void {
       process.exitCode = 1;
     },
   );
+}
+
+/** --session: what an earlier task's session and its subagents said, for the orchestrators' recall by id. */
+const SESSION_READ_TIMEOUT_MS = 30_000;
+
+/** 0 when it printed a session's text, 1 when there was none or the session could not be read (then on stderr). */
+async function runSession(query: string): Promise<number> {
+  const { text, found } = await readSession(query, { children: true, signal: AbortSignal.timeout(SESSION_READ_TIMEOUT_MS) });
+  if (found) console.log(text);
+  else console.error(text);
+  return found ? 0 : 1;
 }
 
 if (command === '--setup' || command === 'setup') {
@@ -397,6 +409,8 @@ if (command === '--setup' || command === 'setup') {
   runWithExitCode(runSimulate);
 } else if (command === '--notify') {
   runWithExitCode(runNotify);
+} else if (command === '--session') {
+  runWithExitCode(runSession);
 } else if (!command || command === '--help' || command === '-h') {
   showHelp();
 } else {

@@ -23,6 +23,7 @@ import {
   formatModelRef,
   lastAssistantText,
   listAgents,
+  listChildSessions,
   listModels,
   listSessions,
   openCodeInfo,
@@ -295,6 +296,60 @@ function fallbackCheck(fallback: FallbackCheck): Check {
   return ['❌', `备用模型: ${fallback.configured} ${fallback.reason}，上游失败不会重试（在 ${join(DATA_DIR, 'env')} 更新 OPENCODE_FALLBACK_MODEL）`];
 }
 
+/** What readSession shows, and whether it found any assistant text. */
+export interface SessionRead {
+  text: string;
+  found: boolean;
+}
+
+/** Text cut at MAX_SESSION_CHARS, saying how long it was. */
+const cutSession = (text: string): string =>
+  text.length <= MAX_SESSION_CHARS ? text : `${text.slice(0, MAX_SESSION_CHARS)}\n\n（已截断，原文 ${text.length} 字）`;
+
+/**
+ * A session on this OpenCode server, by id or by the one title that contains the query: its last assistant text,
+ * and with children each of its subagent sessions' title and last assistant text, cut at MAX_SESSION_CHARS in all.
+ * /session shows the session alone; `--session`, which the orchestrators' subagents run to recall what an earlier
+ * task did (the recall by id of DeepSeek's Super-agent design), shows the children too. Never throws.
+ */
+export async function readSession(
+  query: string,
+  { children = false, signal }: { children?: boolean; signal?: AbortSignal } = {},
+): Promise<SessionRead> {
+  try {
+    let id = query;
+    if (!query.startsWith('ses_')) {
+      const matches = await listSessions(query, undefined, signal);
+      if (!matches.length) return { text: `没有标题包含「${query}」的会话`, found: false };
+      if (matches.length > 1) {
+        const more = matches.length > SESSION_MATCHES ? [`… 还有 ${matches.length - SESSION_MATCHES} 个`] : [];
+        const text = [
+          `有 ${matches.length} 个会话的标题包含「${query}」，请用 /session <id> 指定：`,
+          ...matches.slice(0, SESSION_MATCHES).map((s) => `${s.id}  ${clip(s.title, 40)}`),
+          ...more,
+        ].join('\n');
+        return { text, found: false };
+      }
+      id = matches[0].id;
+    }
+    const text = await lastAssistantText(id, signal);
+    if (!children) return text ? { text: cutSession(text), found: true } : { text: '会话里没有可返回的助手文本', found: false };
+    const parts = [`${id} 的最后回复：\n${text || '（没有助手文本）'}`];
+    let found = Boolean(text);
+    const subagents = await listChildSessions(id);
+    if (subagents.length) parts.push(`子会话 ${subagents.length} 个：`);
+    for (const child of subagents) {
+      const childText = await lastAssistantText(child.id, signal).catch((err: unknown) => `（读不到：${requestError(err)}）`);
+      found ||= Boolean(childText);
+      parts.push(`── ${child.id} ${clip(child.title, 60)}\n${childText || '（没有助手文本）'}`);
+    }
+    return { text: cutSession(parts.join('\n\n')), found };
+  } catch (err) {
+    logger.warn('Session read failed', { error: requestError(err) });
+    return { text: `⚠️ 读不到这个会话：${requestError(err)}\n它可能不在这台 OpenCode 上；M1/M3 的会话要在它们自己的机器上读`, found: false };
+  }
+}
+
 /**
  * /doctor: one line per thing the daemon depends on, ✅ fine, ⚠️ worth a look, ❌ broken, then how many need
  * attention. The token shows by its age only.
@@ -525,31 +580,7 @@ export const handlers: Record<string, Handler> = {
   async session(args) {
     if (!args) return SESSION_USAGE;
     // Bounded, as /doctor is; the title search pages the session list.
-    const signal = AbortSignal.timeout(OPENCODE_TIMEOUT_MS);
-    let text: string;
-    try {
-      let id = args;
-      if (!args.startsWith('ses_')) {
-        const matches = await listSessions(args, undefined, signal);
-        if (!matches.length) return `没有标题包含「${args}」的会话`;
-        if (matches.length > 1) {
-          const more = matches.length > SESSION_MATCHES ? [`… 还有 ${matches.length - SESSION_MATCHES} 个`] : [];
-          return [
-            `有 ${matches.length} 个会话的标题包含「${args}」，请用 /session <id> 指定：`,
-            ...matches.slice(0, SESSION_MATCHES).map((s) => `${s.id}  ${clip(s.title, 40)}`),
-            ...more,
-          ].join('\n');
-        }
-        id = matches[0].id;
-      }
-      text = await lastAssistantText(id, signal);
-    } catch (err) {
-      logger.warn('Session read failed', { error: requestError(err) });
-      return `⚠️ 读不到这个会话：${requestError(err)}\n它可能不在这台 OpenCode 上；M1/M3 的会话要在它们自己的机器上读`;
-    }
-    if (!text) return '会话里没有可返回的助手文本';
-    if (text.length <= MAX_SESSION_CHARS) return text;
-    return `${text.slice(0, MAX_SESSION_CHARS)}\n\n（已截断，原文 ${text.length} 字）`;
+    return (await readSession(args, { signal: AbortSignal.timeout(OPENCODE_TIMEOUT_MS) })).text;
   },
 
   /**

@@ -156,6 +156,11 @@ const SHARED_MEMORY_GUIDANCE =
  * <context> gives its absolute path, since a task's session opens in the user's workspace, not here.
  */
 export const WORK_ACTIVITY_COLLECTOR = fileURLToPath(new URL('../scripts/collect-work-activity.mjs', import.meta.url));
+/**
+ * This build's CLI: `node <it> --session <id>` prints a session's last answer and its subagents' reports, read only.
+ * <context> gives it as session-reader, so a follow-up can open an earlier task's session by the id <recent_tasks> shows.
+ */
+export const SESSION_READER = fileURLToPath(new URL('./main.js', import.meta.url));
 
 export const STATUS_LABEL: Record<TaskStatus, string> = {
   queued: '排队中',
@@ -172,9 +177,13 @@ function formatRecentTasks(tasks: TaskRow[], defaultBotId: string): string {
     .map((t, i) => {
       // The stored input has its "@alias" stripped; the project id keeps that part of the message.
       const project = t.project_id ? ` @${t.project_id}` : '';
+      // An id the orchestrator can have the session reader open, to recall what the task did.
+      const session = t.session_id ? `（会话 ${t.session_id}）` : '';
       // Rows from before bots, like messages that named none, went to the default bot.
       const to = t.bot_id && t.bot_id !== defaultBotId ? `（对 ${t.bot_id}）` : '';
-      const lines = [`#${t.seq} ${formatTime(t.created_at)} [${STATUS_LABEL[t.status]}]${project} 用户${to}: ${clip(t.input, MAX_INPUT_CHARS)}`];
+      const lines = [
+        `#${t.seq} ${formatTime(t.created_at)} [${STATUS_LABEL[t.status]}]${project}${session} 用户${to}: ${clip(t.input, MAX_INPUT_CHARS)}`,
+      ];
       if (t.summary) lines.push(`摘要: ${t.summary}`);
       if (t.error) lines.push(`错误: ${clip(t.error, MAX_ERROR_CHARS)}`);
       if (t.result && i >= tasks.length - REPLY_EXCERPTS) lines.push(`回复: ${clip(t.result, MAX_REPLY_CHARS)}`);
@@ -223,6 +232,7 @@ export function composePrompt(db: StateDb, task: TaskRow, workspace: string, att
   const { bot, all } = resolveBot(task.bot_id, bots);
   const context = [`workspace: ${workspace}`, `time: ${formatTime(Date.now())} (Asia/Shanghai)`, `task: #${task.seq}`];
   if (existsSync(WORK_ACTIVITY_COLLECTOR)) context.push(`collector: ${WORK_ACTIVITY_COLLECTOR}`);
+  if (existsSync(SESSION_READER)) context.push(`session-reader: node ${SESSION_READER} --session`);
   if (retry) {
     context.push('retry: an earlier attempt at this task stopped midway and may have made changes; check the current state before redoing anything that writes');
   }

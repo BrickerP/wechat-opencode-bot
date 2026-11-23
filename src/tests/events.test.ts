@@ -69,7 +69,7 @@ function handle(req: IncomingMessage, res: ServerResponse): void {
     if (!session) return void res.writeHead(404).end();
     if (action === undefined) return send({ id: session.id });
     if (action === 'message') return send([...session.messages].reverse());
-    if (action === 'permission') return send([]);
+    if (action === 'permission' || action === 'inbox') return send([]);
     if (action === 'interrupt') return void res.writeHead(204).end();
     if (action === 'prompt') {
       const user = message('user');

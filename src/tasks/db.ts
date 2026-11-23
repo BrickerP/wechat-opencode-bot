@@ -28,7 +28,7 @@ export interface TaskRow {
   created_at: number;
   started_at: number | null;
   finished_at: number | null;
-  /** OpenCode session of the task's last attempt; null before it has one and once retention deleted it. */
+  /** OpenCode session of the task's last attempt, or the session a follow-up continues from the start; null before it has one and once retention deleted it. */
   session_id: string | null;
   result: string | null;
   summary: string | null;
@@ -47,8 +47,6 @@ export interface TaskRow {
   lane: TaskLane;
   /** Routine that queued the task; null for a message's task, older rows included. */
   routine_id: string | null;
-  /** Notes a done task left for the next one (files, commands, open questions, next step); never shown to the user. */
-  handoff: string | null;
   /** Tokens the task's sessions read over all its attempts, subagents and cache reads included; null when unknown. */
   tokens_in: number | null;
   /** Tokens they wrote, reasoning included; null when unknown. */
@@ -254,7 +252,8 @@ export function openStateDb(file: string = STATE_DB_PATH) {
       PRAGMA user_version = 8;`);
     }
     if (version < 9) {
-      // A done task leaves notes for the next one, and every task records what its sessions used. Older tasks have neither.
+      // Every task records what its sessions used. The handoff column held a done task's notes for the next one until
+      // tasks continued their sessions instead; it stays for older binaries and is no longer written.
       if (!hasColumn('tasks', 'handoff')) db.exec('ALTER TABLE tasks ADD COLUMN handoff TEXT');
       if (!hasColumn('tasks', 'tokens_in')) db.exec('ALTER TABLE tasks ADD COLUMN tokens_in INTEGER');
       if (!hasColumn('tasks', 'tokens_out')) db.exec('ALTER TABLE tasks ADD COLUMN tokens_out INTEGER');
@@ -288,14 +287,15 @@ export function openStateDb(file: string = STATE_DB_PATH) {
     botId: string | null = null,
     lane: TaskLane = 'write',
     routineId: string | null = null,
+    sessionId: string | null = null,
   ): TaskRow {
     const id = randomUUID();
     const now = Date.now();
     run(
-      `INSERT INTO tasks (id, account_id, input, status, created_at, started_at, message_id, project_id, project_dir, bot_id, lane, routine_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO tasks (id, account_id, input, status, created_at, started_at, message_id, project_id, project_dir, bot_id, lane, routine_id, session_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       id, accountId, input, status, now, status === 'running' ? now : null, messageId, project?.id ?? null, project?.dir ?? null, botId, lane,
-      routineId,
+      routineId, sessionId,
     );
     return getTask(id)!;
   }
@@ -338,7 +338,7 @@ export function openStateDb(file: string = STATE_DB_PATH) {
     /**
      * Queue a task for an inbound message, or for a routine (routineId, no message). iLink can deliver a message
      * again, and the monitor forgets what it saw on restart: the same message id returns the existing task with
-     * created: false.
+     * created: false. A follow-up of a task that had a session gets sessionId: it runs as that session's next turn.
      */
     createTask(
       accountId: string,
@@ -348,6 +348,7 @@ export function openStateDb(file: string = STATE_DB_PATH) {
       botId?: string,
       lane?: TaskLane,
       routineId?: string,
+      sessionId?: string,
     ): { task: TaskRow; created: boolean } {
       return immediate(() => {
         const existing =
@@ -355,8 +356,21 @@ export function openStateDb(file: string = STATE_DB_PATH) {
             ? undefined
             : one<TaskRow>(`${TASK_SELECT} WHERE t.account_id = ? AND t.message_id = ?`, accountId, messageId);
         if (existing) return { task: existing, created: false };
-        return { task: insertTask(accountId, input, 'queued', messageId, project, botId, lane, routineId), created: true };
+        const task = insertTask(accountId, input, 'queued', messageId, project, botId, lane, routineId, sessionId);
+        // task_sessions keeps the task that first ran in a session; tasks.session_id names this one's use of it.
+        if (sessionId) run('INSERT OR IGNORE INTO task_sessions (session_id, task_id, created_at) VALUES (?, ?, ?)', sessionId, task.id, Date.now());
+        return { task, created: true };
       });
+    },
+
+    /**
+     * A follow-up joins a task whose status is one of statuses: its text goes onto the task's input, on a line of its
+     * own, so prompts and /tasks show it. False when the task had moved on.
+     */
+    appendTaskInput(id: string, text: string, statuses: TaskStatus[]): boolean {
+      const marks = statuses.map(() => '?').join(', ');
+      const out = run(`UPDATE tasks SET input = input || char(10) || ? WHERE id = ? AND status IN (${marks})`, text, id, ...statuses);
+      return Number(out.changes) === 1;
     },
 
     /** Insert a task directly as running (--simulate), unless its lane already has a running task. */
@@ -461,25 +475,29 @@ export function openStateDb(file: string = STATE_DB_PATH) {
     },
 
     /**
-     * Sessions retention may delete: every attempt's of the tasks that finished before cutoff (epoch ms), oldest
-     * first. The newest keep finished tasks keep all theirs however old they are. A binary before v8 records a
-     * session only in tasks.session_id, so that counts too; a session no task records never qualifies.
+     * Sessions retention may delete, oldest first: those whose every task finished before cutoff (epoch ms). A
+     * session several tasks ran in, a follow-up continuing it, counts as of its latest task; one a task still queued
+     * or running names never qualifies. The newest keep finished tasks keep all theirs however old they are. A task
+     * names every attempt's session in task_sessions and its own use of one in tasks.session_id, which is all a binary
+     * before v8 recorded; a session no task names never qualifies.
      */
     staleSessionIds: (cutoff: number, keep: number) =>
       all<{ session_id: string }>(
-        `WITH recorded AS (
+        `WITH named AS (
            SELECT session_id, task_id, rowid AS pos FROM task_sessions
            UNION ALL
-           SELECT session_id, id, NULL FROM tasks t
-             WHERE session_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM task_sessions s WHERE s.session_id = t.session_id)
+           SELECT session_id, id, NULL FROM tasks WHERE session_id IS NOT NULL
          ), finished AS (
            SELECT id, finished_at, rowid AS pos FROM tasks WHERE status IN ('done', 'failed', 'interrupted')
-             AND finished_at IS NOT NULL AND id IN (SELECT task_id FROM recorded)
+             AND finished_at IS NOT NULL AND id IN (SELECT task_id FROM named)
+         ), kept AS (
+           SELECT id FROM finished ORDER BY finished_at DESC, pos DESC LIMIT ?
          )
-         SELECT r.session_id FROM recorded r JOIN finished f ON f.id = r.task_id
-         WHERE f.finished_at < ? AND f.id NOT IN (SELECT id FROM finished ORDER BY finished_at DESC, pos DESC LIMIT ?)
-         ORDER BY f.finished_at, f.pos, r.pos NULLS LAST`,
-        cutoff, keep,
+         SELECT n.session_id FROM named n LEFT JOIN finished f ON f.id = n.task_id
+         GROUP BY n.session_id
+         HAVING COUNT(f.id) = COUNT(*) AND MAX(f.finished_at) < ? AND SUM(f.id IN (SELECT id FROM kept)) = 0
+         ORDER BY MAX(f.finished_at), MIN(f.pos), MIN(n.pos) NULLS LAST`,
+        keep, cutoff,
       ).map((row) => row.session_id),
 
     /** The session is gone from OpenCode: task_sessions drops it and no task names it, so retention does not ask again. */
@@ -492,7 +510,7 @@ export function openStateDb(file: string = STATE_DB_PATH) {
 
     /**
      * Finish a running task. Returns false if it was no longer running (stopped or interrupted meanwhile).
-     * notified: the caller already told the user, so the outbox skips the task. An empty handoff or file list stores none.
+     * notified: the caller already told the user, so the outbox skips the task. An empty file list stores none.
      * usage is stored either way: a task /stop finished first still used what its sessions used.
      */
     finishTask(
@@ -503,17 +521,16 @@ export function openStateDb(file: string = STATE_DB_PATH) {
         summary?: string;
         error?: string;
         notified?: boolean;
-        handoff?: string;
         files?: string[];
         usage?: TaskUsage;
       } = {},
     ): boolean {
       return immediate(() => {
         const out = run(
-          `UPDATE tasks SET status = ?, finished_at = ?, result = ?, summary = ?, error = ?, notified = ?, handoff = ?, files = ?
+          `UPDATE tasks SET status = ?, finished_at = ?, result = ?, summary = ?, error = ?, notified = ?, files = ?
            WHERE id = ? AND status = 'running'`,
           status, Date.now(), fields.result ?? null, fields.summary ?? null, fields.error ?? null, fields.notified ? 1 : 0,
-          fields.handoff || null, fields.files?.length ? JSON.stringify(fields.files) : null, id,
+          fields.files?.length ? JSON.stringify(fields.files) : null, id,
         );
         const { usage } = fields;
         if (usage) run('UPDATE tasks SET tokens_in = ?, tokens_out = ?, cost_usd = ? WHERE id = ?', usage.input, usage.output, usage.cost, id);

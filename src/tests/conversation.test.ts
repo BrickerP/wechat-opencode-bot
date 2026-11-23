@@ -28,7 +28,7 @@ interface FakeSession {
 }
 
 const sessions: FakeSession[] = [];
-/** The reads of each new root session, in creation order. */
+/** The reads of each turn, in the order the turns start: each prompt starts one. */
 const turns: Read[][] = [];
 let ids = 0;
 let clock = 0;
@@ -53,7 +53,7 @@ function addSession(fields: Partial<FakeSession> = {}): FakeSession {
   return session;
 }
 
-/** The few OpenCode routes a turn uses. A new root session takes its reads from turns. */
+/** The few OpenCode routes a turn uses. Each prompt takes the next reads from turns. */
 function handle(req: IncomingMessage, res: ServerResponse): void {
   req.resume().on('end', () => {
     const url = new URL(req.url ?? '/', 'http://fake');
@@ -62,7 +62,7 @@ function handle(req: IncomingMessage, res: ServerResponse): void {
     if (url.pathname === '/api/model') return send([{ id: 'gpt-6-astra', providerID: 'oneapi-chat-gpt', variants: [] }]);
     if (url.pathname === '/api/session') {
       if (req.method === 'GET') return send(sessions.filter((s) => s.parentID === url.searchParams.get('parentID')));
-      return send({ id: addSession({ reads: turns.shift() ?? [] }).id });
+      return send({ id: addSession().id });
     }
     const [, , , id, action] = url.pathname.split('/');
     const session = sessions.find((s) => s.id === id);
@@ -72,14 +72,15 @@ function handle(req: IncomingMessage, res: ServerResponse): void {
       session.reads.shift()?.(session);
       return send([...session.messages].reverse());
     }
-    if (action === 'permission') return send([]);
-    if (action === 'interrupt') {
-      session.interrupted = true;
+    if (action === 'permission' || action === 'inbox') return send([]);
+    if (action === 'interrupt' || action === 'model') {
+      if (action === 'interrupt') session.interrupted = true;
       return void res.writeHead(204).end();
     }
     if (action === 'prompt') {
       const user = message('user');
       session.messages.push(user);
+      session.reads = turns.shift() ?? [];
       return send({ time: user.time });
     }
     res.writeHead(404).end();
@@ -139,7 +140,7 @@ interface RunOptions {
   onCommentary?: (stop: () => void) => void;
 }
 
-/** Run one task through the reads of its root sessions. heard is what the user gets: each note, then the outcome. */
+/** Run one task through the reads of its turns. heard is what the user gets: each note, then the outcome. */
 async function run(plays: Read[][], { botId, onCommentary }: RunOptions = {}) {
   turns.push(...plays);
   const task = db.startTaskNow('test', 'hi', undefined, botId)!;
@@ -343,7 +344,7 @@ test('a retry does not say again what was said; notes are cut at 800 characters,
     ],
   ]);
   assert.equal(task.status, 'done');
-  assert.equal(roots.length, 2, 'the provider error is retried on the fallback');
+  assert.equal(roots.length, 1, 'the provider error is retried on the fallback, in the same session');
   assert.deepEqual(heard, ['我先查一下网关日志。', `${'长'.repeat(800)}…`, '第三条', '→ ok']);
   sessions.length = 0;
   assert.deepEqual((await run([[answer]])).heard, ['→ ok'], 'a plain answer is not told ahead of itself');

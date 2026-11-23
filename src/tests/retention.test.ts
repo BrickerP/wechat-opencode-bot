@@ -167,6 +167,26 @@ test('staleSessionIds: every attempt of a stale task, once and in order, even on
   assert.deepEqual(db.staleSessionIds(cutoff, 3), ['ses_first', 'ses_retry'], 'the newest 3 tasks keep every session');
 });
 
+test('staleSessionIds: a session a follow-up continued goes only once every task that ran in it is stale', () => {
+  const { db, raw, seed } = fresh('shared');
+  const first = seed('done', 'ses_shared', T0 - 10 * DAY);
+  seed('done', 'ses_other', T0 - 9 * DAY);
+  const { task: next } = db.createTask('acc', '继续', null, undefined, undefined, 'write', undefined, 'ses_shared');
+  seed('done', 'ses_recent', T0 - DAY);
+  const cutoff = T0 - 7 * DAY;
+  const set = raw.prepare('UPDATE tasks SET status = ?, finished_at = ? WHERE id = ?');
+  assert.deepEqual(db.staleSessionIds(cutoff, 1), ['ses_other'], 'while the follow-up is queued');
+  set.run('running', null, next.id);
+  assert.deepEqual(db.staleSessionIds(cutoff, 1), ['ses_other'], 'while it runs');
+  set.run('done', T0 - 2 * DAY, next.id);
+  assert.deepEqual(db.staleSessionIds(cutoff, 1), ['ses_other'], 'once it finished within the TTL');
+  set.run('done', T0 - 8 * DAY, next.id);
+  assert.deepEqual(db.staleSessionIds(cutoff, 1), ['ses_other', 'ses_shared'], 'as of its latest task');
+  assert.deepEqual(db.staleSessionIds(cutoff, 2), ['ses_other'], 'the follow-up is among the newest 2');
+  db.forgetSession('ses_shared');
+  assert.deepEqual([db.getTask(first)?.session_id, db.getTask(next.id)?.session_id], [null, null], 'forgotten by every task that names it');
+});
+
 test('deleteSession: deleted or already gone resolves; any other failure rejects, a 404 from a missing route too', async () => {
   answers.clear();
   requests.length = 0;

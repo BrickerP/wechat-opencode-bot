@@ -16,21 +16,22 @@ None of this shows that one model is better than another.
 
 - A non-final orchestrator step, one that calls `subagent`, may carry one short sentence for the user. It is optional commentary: the bridge forwards the text of a finished root step that called a tool, best-effort, at most 3 per task and 800 characters each, never text with a marker or tool-call markup, and outside the outbox. No case needs it, and the answer is never scored from it.
 - The bridge's own progress notes (elapsed time, running tools, subagent count) are off unless `OWB_PROGRESS_ENABLED=true`. They come from the bridge, not the model, so they neither earn nor lose points.
-- The final step calls no tool and starts with `<<<WECHAT_REPLY>>>`, then `<<<WECHAT_MEMORY>>>`, `<<<WECHAT_SUMMARY>>>`, `<<<WECHAT_HANDOFF>>>` and, only when sending files, `<<<WECHAT_FILES>>>`. `parseOrchestratorOutput` in `src/orchestrator.ts` reads it. It is the only answer, sent once through the outbox; a turn that ends on a step that calls a tool fails with `OpenCode 执行结束，但模型没有给出最终回复`.
+- The final step calls no tool and starts with `<<<WECHAT_REPLY>>>`, then `<<<WECHAT_MEMORY>>>`, `<<<WECHAT_SUMMARY>>>` and, only when sending files, `<<<WECHAT_FILES>>>`. `parseOrchestratorOutput` in `src/orchestrator.ts` reads it. It is the only answer, sent once through the outbox; a turn that ends on a step that calls a tool fails with `OpenCode 执行结束，但模型没有给出最终回复`.
+- A session holds one piece of work. A follow-up of it comes as the session's next turn, with its own <context>, <memory> and <user_message>; a correction sent while it runs comes as <user_correction>, and a retry after a stopped attempt as <retry>. Every turn ends in the format above, and only the task's last answer reaches the user.
 - The parser uses the text before the first reply marker only when every reply section is empty, so whatever is written before an empty reply section becomes the answer.
-- The bridge saves at most 5 memory bullets per task to agentmemory, 600 characters each; a bullet that starts with an id from <memory> in brackets updates that entry when the prompt showed it whole. It cuts the summary at 100 and the handoff at 1200 characters, and sends at most 3 files. The prompts ask for a summary under 80 and a handoff under 800 characters.
+- The bridge saves at most 5 memory bullets per task to agentmemory, 600 characters each; a bullet that starts with an id from <memory> in brackets updates that entry when the prompt showed it whole. It cuts the summary at 100 characters and sends at most 3 files. The prompts ask for a summary under 80 characters.
 
 ## Rubric
 
 Score each dimension 0 (fails), 1 (partly) or 2 (meets).
 
-1. Scope: looks on the machine, project, session and time range the user means. Asks one short question only when the answer changes where to look; otherwise uses a default and says so. The latest correction beats memory, recent tasks and the handoff.
+1. Scope: looks on the machine, project, session and time range the user means. Asks one short question only when the answer changes where to look; otherwise uses a default and says so. The latest correction beats memory, recent tasks and earlier turns.
 2. Path: direct when no tool is needed, one focused subagent for facts, parallel subagents only for independent sources. No repeated probes and no detours around a failure.
 3. Evidence: every fact traces to a report or the context. Status words match the evidence: committed, merged, tagged, built, deployed, verified. Gaps are named, and a git-only summary says so.
 4. Check: a disputed or inferred claim the answer depends on gets one targeted check; a simple or directly evidenced answer gets none.
 5. Reply: Chinese by default, plain text, result first, length fitting the goal. No subagent or tool names, call counts or elapsed time; words the user asked about, such as session, are fine.
 6. Progress text: at most a short, useful sentence beside a subagent call; none for a direct answer; no reasoning and no markers.
-7. Protocol: the final response follows the agreement above. Memory holds durable facts, each in Chinese with its conclusion, reason and date, or exactly `- 无`; an update starts with an id <memory> showed, and nothing repeats what <memory> already says. The handoff has only files:, commands:, open: and next: lines, or exactly `-`. Files are regular files under the workspace, of an allowed type, at most 20 MB each.
+7. Protocol: the final response follows the agreement above. Memory holds durable facts, each in Chinese with its conclusion, reason and date, or exactly `- 无`; an update starts with an id <memory> showed, and nothing repeats what <memory> already says. Files are regular files under the workspace, of an allowed type, at most 20 MB each.
 
 Any of these fails the case:
 
@@ -38,7 +39,7 @@ Any of these fails the case:
 - An answer from a machine or project other than the one the user meant.
 - An empty reply, no final step, or the answer written before the reply marker.
 - A marker string or tool-call markup inside the reply.
-- A secret, token or one-off result in memory or the handoff.
+- A secret, token or one-off result in memory.
 
 ## Cases
 
@@ -58,8 +59,6 @@ After, with no subagent and no progress text:
     - 无
     <<<WECHAT_SUMMARY>>>
     问候
-    <<<WECHAT_HANDOFF>>>
-    -
 
 ### 2. Work summary: tagged, not deployed
 
@@ -78,9 +77,6 @@ After: optionally the progress text `我先核对今天各仓库的提交和标�
     - 无
     <<<WECHAT_SUMMARY>>>
     汇总 11-12 的 git 工作：3 个提交未合并，v1.4.0 已打标签、未确认部署
-    <<<WECHAT_HANDOFF>>>
-    open: v1.4.0 是否已部署未核对
-    next: 查部署记录确认 v1.4.0
 
 ### 3. Which machine's session
 
@@ -96,11 +92,8 @@ After, with no subagent:
     - 无
     <<<WECHAT_SUMMARY>>>
     询问要查哪台机器上的会话
-    <<<WECHAT_HANDOFF>>>
-    open: 问了用户 11-11 的会话在 M1 还是本机
-    next: 按回答的机器查 11-11 最后一个会话停在哪一步
 
-When the user answers `M1`, the next task picks up the handoff and briefs one `wechat-explore` call for M1 only, for 2026-11-11 in Asia/Shanghai.
+When the user answers `M1`, the answer comes as the next turn of this session, and the orchestrator briefs one `wechat-explore` call for M1 only, for 2026-11-11 in Asia/Shanghai.
 
 ### 4. The machine is offline
 
@@ -116,9 +109,6 @@ After:
     - 无
     <<<WECHAT_SUMMARY>>>
     M1 ssh 超时，未能查最新会话
-    <<<WECHAT_HANDOFF>>>
-    open: M1 ssh 超时，会话没查
-    next: M1 在线后重查最新会话
 
 ### 5. Reports disagree
 
@@ -134,8 +124,6 @@ After: optionally the progress text `部署记录和当前版本对不上，我�
     - 无
     <<<WECHAT_SUMMARY>>>
     确认 v1.4.0 已上线；部署日志缺这次记录
-    <<<WECHAT_HANDOFF>>>
-    open: 部署日志为何没记 v1.4.0
 
 If the check cannot settle it, the reply says what each source shows and that deployment is not confirmed.
 
@@ -148,17 +136,30 @@ Before: pastes the section into the reply as it is, and its marker lines count a
 After: names the markers without angle brackets and sends the file instead of quoting it:
 
     <<<WECHAT_REPLY>>>
-    那一段在 config/agents/wechat-orchestrator.md 的 Output format 一节，整个文件作为附件发你。原文里的分段标记贴进回复会被当成真的分段，所以这里只说要点：回复依次分 WECHAT_REPLY、WECHAT_MEMORY、WECHAT_SUMMARY、WECHAT_HANDOFF 四段，要发文件时最后加 WECHAT_FILES。
+    那一段在 config/agents/wechat-orchestrator.md 的 Output format 一节，整个文件作为附件发你。原文里的分段标记贴进回复会被当成真的分段，所以这里只说要点：回复依次分 WECHAT_REPLY、WECHAT_MEMORY、WECHAT_SUMMARY 三段，要发文件时最后加 WECHAT_FILES。
     <<<WECHAT_MEMORY>>>
     - 无
     <<<WECHAT_SUMMARY>>>
     发送 orchestrator 提示词，说明输出格式
-    <<<WECHAT_HANDOFF>>>
-    -
     <<<WECHAT_FILES>>>
     /Users/me/code/wechat-opencode-bot/config/agents/wechat-orchestrator.md
 
 Logs work the same way: quote the few lines that matter, without marker strings, and attach the whole file when the user wants all of it.
+
+### 7. A follow-up continues the session
+
+Input: `继续，查下部署记录`, as the next turn of case 2's session. Its <context> has only the time and the task number, and <memory> has nothing new.
+
+Before: scans every repository's git log again, or asks which release the user means.
+
+After: one `wechat-explore` brief for the deploy record of v1.4.0 only, with the tag and the merge hash the first turn found. If the record shows the deploy:
+
+    <<<WECHAT_REPLY>>>
+    v1.4.0 已经上线：部署记录显示 11-12 18:02 部署到生产，之后没有回滚。feat/quality 上的 3 个提交还没合并，不在这次发布里。
+    <<<WECHAT_MEMORY>>>
+    - 无
+    <<<WECHAT_SUMMARY>>>
+    查部署记录，确认 v1.4.0 已于 11-12 18:02 上线
 
 ## Using the rubric
 

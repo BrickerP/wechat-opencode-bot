@@ -16,7 +16,7 @@ import { logger } from './logger.js';
 import { checkFallbackAtStartup } from './model-routing.js';
 import { createNotifier, runNotify } from './notify.js';
 import { formatQueueAck, IMAGE_ONLY_INPUT, runTask, saveAttachment } from './orchestrator.js';
-import { initOpenCode, interruptSession } from './opencode/provider.js';
+import { initOpenCode, interruptSession, startEventStream } from './opencode/provider.js';
 import { createPermissionBroker } from './permission.js';
 import { routeMessage } from './projects.js';
 import { PRUNE_INTERVAL_MS, pruneSessions } from './retention.js';
@@ -140,6 +140,8 @@ async function runDaemon(): Promise<void> {
     process.exit(1);
   }
   await reportFallback();
+  // Progress shows on the event stream while a model streams; the daemon follows it for as long as it runs.
+  startEventStream();
 
   const { accountId } = account;
   const allowedIds = (process.env.WECHAT_ALLOWED_IDS || account.userId || '')

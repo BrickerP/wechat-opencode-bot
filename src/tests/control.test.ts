@@ -95,6 +95,7 @@ test('/doctor asks the running OpenCode for its version and agents, and names th
       '❌ Agent: 缺少 wechat-explore',
       '   修复: scripts/install-agents.sh --apply，再 reload：',
       `   (set -a; . ${join(tmp, 'data', 'env')}; set +a; opencode reload --server "\${OPENCODE_URL:-http://127.0.0.1:4096}")`,
+      '⚠️ 事件流: 未启用（进展只靠轮询判断，长时间推理可能被误判为无进展）',
       '✅ 消息令牌: <age>前',
       '✅ 待补发: 无',
       '✅ state.db: <size>',
@@ -103,7 +104,7 @@ test('/doctor asks the running OpenCode for its version and agents, and names th
       '✅ 24小时: 完成 0，失败 0，中断 0',
       '✅ 定时任务: 无',
       '✅ 运行时长: <uptime>',
-      '总体: 有 2 项需要注意',
+      '总体: 有 3 项需要注意',
     ].join('\n'),
     'no opencode.db line without the file',
   );
@@ -130,6 +131,7 @@ test('/doctor flags each thing that needs attention and counts them; a healthy d
     gateways: [{ provider: 'oneapi', openUntil: NOW + 10 * MINUTE }, { provider: 'oneapi-gemini', openUntil: NOW - MINUTE }],
     // The model the retry of 2026-11-22 went to, after it had been removed from the server.
     fallback: { state: 'missing', configured: 'oneapi-chat-gpt/gpt-6-astra', reason: '不在 OpenCode 的模型列表里' },
+    events: { connected: false, since: NOW - 5 * MINUTE },
     uptimeMs: 3 * HOUR + 12 * MINUTE,
   };
   assert.equal(
@@ -138,6 +140,7 @@ test('/doctor flags each thing that needs attention and counts them; a healthy d
       '🩺 自检：',
       '❌ OpenCode: 无法连接（fetch failed (ECONNREFUSED)）',
       '❌ Agent: 无法获取（8 秒无响应）',
+      '⚠️ 事件流: 已断开 5分钟（进展只靠轮询判断，长时间推理可能被误判为无进展）',
       '❌ 消息令牌: 无（结果会等你的下一条消息再发）',
       '⚠️ 待补发: 2 条（最久 1小时30分，重试 2 次）',
       '✅ state.db: <size>',
@@ -147,7 +150,7 @@ test('/doctor flags each thing that needs attention and counts them; a healthy d
       '⚠️ 24小时: 完成 0，失败 1，中断 0（最近失败 19:30 任务 #1：boom）',
       '✅ 定时任务: 2 个，启用 1 个，下次 11-10 09:00（daily）',
       '✅ 运行时长: 3小时12分',
-      '总体: 有 7 项需要注意',
+      '总体: 有 8 项需要注意',
     ].join('\n'),
   );
 
@@ -155,7 +158,7 @@ test('/doctor flags each thing that needs attention and counts them; a healthy d
   raw.prepare('UPDATE users SET context_token_at = ? WHERE account_id = ?').run(NOW - 13 * HOUR, 'sick');
   const stale = formatDoctor(db, 'sick', sick, NOW);
   assert.match(stale, /^⚠️ 消息令牌: 13小时0分前（超过 12 小时，可能已失效）$/m);
-  assert.match(stale, /^总体: 有 7 项需要注意$/m);
+  assert.match(stale, /^总体: 有 8 项需要注意$/m);
 
   db.saveContextToken('well', 'wx-well', TOKEN);
   raw.prepare('UPDATE users SET context_token_at = ? WHERE account_id = ?').run(NOW - 5 * MINUTE, 'well');
@@ -164,6 +167,7 @@ test('/doctor flags each thing that needs attention and counts them; a healthy d
     agents: fulfilled(['build', ...REQUIRED_AGENTS].map((id) => ({ id }))),
     gateways: [{ provider: 'oneapi-gemini', openUntil: NOW - MINUTE }],
     fallback: { state: 'ok', model: 'oneapi-claude/Claude Sonnet 5.5' },
+    events: { connected: true, since: NOW - HOUR },
     uptimeMs: 90_000,
   };
   assert.equal(
@@ -172,6 +176,7 @@ test('/doctor flags each thing that needs attention and counts them; a healthy d
       '🩺 自检：',
       '✅ OpenCode: 已连接',
       '✅ Agent: 4 个已就绪',
+      '✅ 事件流: 已连接',
       '✅ 消息令牌: 5分钟前',
       '✅ 待补发: 无',
       '✅ state.db: <size>',

@@ -1,5 +1,6 @@
 import { logger } from "../logger.js";
 import type { ErrorKind } from "../model-routing.js";
+import { createEventStream, lastActivityAt, lastOutputAt, type EventStream, type EventStreamState } from "./events.js";
 import { execSync, spawn } from "node:child_process";
 import { basename } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -131,6 +132,25 @@ function authHeaders(): Record<string, string> {
   const token = Buffer.from(`opencode:${OPENCODE_PASSWORD}`).toString("base64");
   return { Authorization: `Basic ${token}` };
 }
+
+let events: EventStream | undefined;
+
+/**
+ * Follow the server's event stream, which shows a turn's progress while it streams (see events.ts). The daemon and
+ * --simulate start it; the short commands do not, and a turn without it is judged from polling alone.
+ */
+export function startEventStream(): void {
+  events ??= createEventStream(`${OPENCODE_URL}/api/event`, authHeaders());
+}
+
+/** Close the event stream, so a short-lived process can exit. */
+export function stopEventStream(): void {
+  events?.stop();
+  events = undefined;
+}
+
+/** The stream's state for /doctor; undefined when this process does not follow it. */
+export const eventStreamState = (): EventStreamState | undefined => events?.state();
 
 async function api<T = any>(path: string, init: RequestInit = {}): Promise<T> {
   const headers: Record<string, string> = {
@@ -581,7 +601,9 @@ function announceSteps(sessionId: string, assistants: any[], announced: Set<stri
 /**
  * Poll until the turn goes idle, answering permission requests on the way and announcing the root steps that
  * call a tool (announceSteps). Two watchdogs give up on a silent upstream model: no first output within
- * FIRST_RESPONSE_TIMEOUT_MS, or no visible change in the session or its subagent sessions for STALL_TIMEOUT_MS.
+ * FIRST_RESPONSE_TIMEOUT_MS, or no sign of progress in the session or its subagent sessions for STALL_TIMEOUT_MS.
+ * Signs of progress are a changed snapshot, a running tool or a pending permission, and what the event stream
+ * shows streaming (events.ts): without it a long reasoning step looked like silence.
  * The answer is the text of the last step that says or does anything, and only if that step calls no tool: a turn
  * that ends on a tool step, or on nothing at all, fails rather than pass what was said on the way off as the answer.
  */
@@ -675,7 +697,12 @@ async function waitForTurn(sessionId: string, since: number, options: QueryOptio
       progress = signature;
       progressAt = now;
     }
-    const responded = turn.some((m) => m?.type === "assistant" && (m.content?.length || m.time?.streamed));
+    // The event stream shows reasoning, text and tool input while they stream; a snapshot only once they are done.
+    const streamedAt = lastActivityAt([sessionId, ...children.map((c) => c.id)]);
+    if (streamedAt !== undefined && streamedAt > progressAt) progressAt = streamedAt;
+    const responded =
+      turn.some((m) => m?.type === "assistant" && (m.content?.length || m.time?.streamed)) ||
+      (lastOutputAt([sessionId]) ?? 0) >= startedAt;
     if (!responded && now - startedAt > FIRST_RESPONSE_TIMEOUT_MS) {
       throw new TurnTimeout(`上游模型 ${FIRST_RESPONSE_TIMEOUT_MS / 1000} 秒无响应`);
     }

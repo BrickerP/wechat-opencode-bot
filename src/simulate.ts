@@ -1,6 +1,6 @@
 import { isReadOnlyBot } from './bots.js';
 import { resultText, runTask, type TaskIO } from './orchestrator.js';
-import { pingOpenCode } from './opencode/provider.js';
+import { pingOpenCode, startEventStream, stopEventStream } from './opencode/provider.js';
 import { routeMessage } from './projects.js';
 import { openStateDb } from './tasks/db.js';
 
@@ -54,12 +54,15 @@ export async function runSimulate(text: string): Promise<number> {
   const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
   for (const name of signals) process.once(name, onSignal);
   process.once('exit', release);
+  // As in the daemon, so a long reasoning step is not taken for silence; closed below, so the process can exit.
+  startEventStream();
   try {
     await runTask(db, task, io, controller.signal);
   } catch (err) {
     db.finishTask(task.id, 'failed', { error: err instanceof Error ? err.message : String(err) });
     console.error('[simulate] 任务异常:', err);
   } finally {
+    stopEventStream();
     for (const name of signals) process.off(name, onSignal);
     process.off('exit', release);
     release();

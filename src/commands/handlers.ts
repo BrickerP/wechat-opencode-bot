@@ -19,6 +19,7 @@ import {
   taskWarnTokens,
 } from '../orchestrator.js';
 import {
+  eventStreamState,
   formatModelRef,
   lastAssistantText,
   listAgents,
@@ -28,6 +29,7 @@ import {
   resolveModelRef,
   steerSession,
 } from '../opencode/provider.js';
+import type { EventStreamState } from '../opencode/events.js';
 import type { PermissionBroker } from '../permission.js';
 import {
   addProject,
@@ -122,7 +124,7 @@ Bot：
   /permission [模式] 查看或设置权限模式
 
 其他：
-  /doctor           自检：OpenCode 与 agent、消息令牌、待补发、数据库、备用模型、熔断和定时任务
+  /doctor           自检：OpenCode 与 agent、事件流、消息令牌、待补发、数据库、备用模型、熔断和定时任务
   /help             显示帮助
   /version          查看版本
 
@@ -261,6 +263,8 @@ export interface DoctorProbe {
   gateways: Gateway[];
   /** checkFallback(): OPENCODE_FALLBACK_MODEL against GET /api/model. */
   fallback: FallbackCheck;
+  /** eventStreamState(): undefined when this process does not follow GET /api/event. */
+  events: EventStreamState | undefined;
   /** How long the daemon has been up. */
   uptimeMs: number;
 }
@@ -308,6 +312,12 @@ export function formatDoctor(db: StateDb, accountId: string, probe: DoctorProbe,
     const missing = REQUIRED_AGENTS.filter((id) => !ids.has(id));
     checks.push(missing.length ? ['❌', `Agent: 缺少 ${missing.join('、')}\n${AGENTS_FIX}`] : ['✅', `Agent: ${REQUIRED_AGENTS.length} 个已就绪`]);
   }
+  const { events } = probe;
+  checks.push(
+    events?.connected
+      ? ['✅', '事件流: 已连接']
+      : ['⚠️', `事件流: ${events ? `已断开 ${formatElapsed(events.since, now)}` : '未启用'}（进展只靠轮询判断，长时间推理可能被误判为无进展）`],
+  );
   const tokenAt = db.getUser(accountId)?.context_token_at;
   checks.push(
     !tokenAt
@@ -496,7 +506,14 @@ export const handlers: Record<string, Handler> = {
       Promise.allSettled([openCodeInfo(signal), listAgents(signal)]),
       checkFallback(signal),
     ]);
-    return formatDoctor(db, accountId, { server, agents, fallback, gateways: breaker.snapshot(), uptimeMs: process.uptime() * 1000 });
+    return formatDoctor(db, accountId, {
+      server,
+      agents,
+      fallback,
+      events: eventStreamState(),
+      gateways: breaker.snapshot(),
+      uptimeMs: process.uptime() * 1000,
+    });
   },
 
   tasks: (args, { accountId, db }) => formatTasks(db, accountId, parseTaskLimit(args)),

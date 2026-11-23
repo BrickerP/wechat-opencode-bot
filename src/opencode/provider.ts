@@ -315,6 +315,21 @@ export async function listModels(signal?: AbortSignal): Promise<ProviderModel[]>
   }));
 }
 
+/** One stateless model call, with no session and no tools: the text of the answer. Throws on an empty one. */
+export async function generateText(prompt: string, model: string, signal?: AbortSignal): Promise<string> {
+  const ref = parseModelRef(model);
+  if (!ref) throw new Error(`无效的模型: ${model}`);
+  const out = await api<{ data?: { text?: unknown } }>("/api/experimental/generate/text", {
+    method: "POST",
+    body: JSON.stringify({ prompt, model: ref }),
+    signal,
+  });
+  const answer = out?.data?.text;
+  const text = typeof answer === "string" ? answer.trim() : "";
+  if (!text) throw new Error("模型没有给出回答");
+  return text;
+}
+
 export type ModelRef = { providerID: string; id: string; variant?: string };
 
 /**

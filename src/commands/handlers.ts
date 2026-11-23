@@ -130,10 +130,10 @@ Bot：
   /help             显示帮助
   /version          查看版本
 
-直接发送文字或图片即创建任务；任务运行时新消息会排队，按顺序执行。只读 bot（如 @research）的任务单独排队，不等其他任务；它们只读不改，要改文件请发给其他 bot（如 @eng）。
+直接发送文字或图片即可。有运行中、排队中或 24 小时内结束的任务时，先由快速模型判断这条消息是接着其中一个任务（排队中就并入，运行中就交给它在下一个步骤采纳，已结束就在它的会话里接着做）、停止某个任务，还是新任务；新任务按顺序排队执行。只读 bot（如 @research）的任务单独排队，不等其他任务；它们只读不改，要改文件请发给其他 bot（如 @eng）。
 以 @bot 别名开头指定由哪个 bot 回复，@all 交给默认 bot 统筹，不指定时由默认 bot 回复（发送 /bots 查看）。
 以 @别名 开头或提到项目别名，任务就在该项目目录运行；可同时指定 bot 和项目，顺序不限，如 @research @miaoda 看下发布流程。
-以“继续”这类词开头的简短追问（2 小时内）跟着上一个任务：它还在排队就并入它，正在运行就交给它在下一个步骤采纳，已经结束就在它的会话里接着做；以“新话题：”开头则都不沿用，以 @base 开头则在工作目录运行。
+以 @bot、@项目、@base 或“新话题：”开头的消息总是新任务，不经判断；@base 开头则在工作目录运行。
 定时任务到点创建普通任务，内容可以带 @bot 和 @项目；它的上一个任务还没结束就跳过这次，bot 停机期间错过的只补一次。结果发不出去时，会在你下一条消息后补发。`;
 
 const PERMISSION_MODES: Record<PermissionMode, string> = {
@@ -515,7 +515,7 @@ function splitWord(text: string): [string, string] {
   return [word, rest];
 }
 
-/** /routine add <name> <schedule> <prompt>. The prompt is routed like a message, except that it never follows the last task. */
+/** /routine add <name> <schedule> <prompt>. The prompt is routed like a message, and its tasks are always new work. */
 function createRoutine(db: StateDb, accountId: string, args: string, now: number): string {
   const [word, tail] = splitWord(args);
   const [when, text] = splitWord(tail);
@@ -530,7 +530,7 @@ function createRoutine(db: StateDb, accountId: string, args: string, now: number
   // As with a message, a prompt that no "@bot" opened may name its bot after "@project".
   const opened = first.botId !== defaultBotId || first.input !== text;
   const base = loadConfig().workingDirectory;
-  const project = detectProject(first.input, loadProjects(base, PROJECTS_PATH, bots), null);
+  const project = detectProject(first.input, loadProjects(base, PROJECTS_PATH, bots));
   const rest = project ? stripProjectPrefix(first.input, project) : first.input;
   const { botId, input } = opened ? { botId: first.botId, input: rest } : detectBot(rest, bots);
   const added = db.addRoutine(accountId, {
@@ -553,6 +553,24 @@ const version: Handler = () => {
     return 'wechat-opencode-bot (version unknown)';
   }
 };
+
+/**
+ * Stop one task, as a message the task router reads as "stop #N" asks: a queued task is cancelled as /cancel does,
+ * a running one stopped alone, unlike /stop. As there, the row is finished first, so its runner stays quiet, and the
+ * reply is the user's notice; then its permission asks are denied, so its runner waits on none, and its run aborted.
+ */
+export function stopOneTask({ accountId, db, queue, broker }: CommandContext, seq: number): string {
+  if (db.cancelQueuedTask(accountId, seq, '用户取消')) return `🗑 已取消任务 #${seq}`;
+  const task = db.taskBySeq(accountId, seq);
+  if (!task) return `⚠️ 没有任务 #${seq}，发送 /tasks 查看`;
+  if (task.status === 'running' && db.finishTask(task.id, 'interrupted', { error: '用户停止', notified: true })) {
+    broker.rejectTask(accountId, task.id);
+    queue.stopTask(accountId, task.id);
+    logger.info('Task stopped on its own', { taskId: task.id, seq });
+    return `⏹ 已停止任务 #${seq}`;
+  }
+  return `任务 #${seq} 已经结束（${STATUS_LABEL[db.getTask(task.id)?.status ?? task.status]}）`;
+}
 
 export const handlers: Record<string, Handler> = {
   help: () => HELP_TEXT,

@@ -46,8 +46,8 @@ flowchart LR
 ### Task lifecycle
 
 1. The daemon long-polls iLink and ignores anyone not in `WECHAT_ALLOWED_IDS`. Each message refreshes the chat's `context_token`, which every reply needs.
-2. `y`/`n` answers a waiting permission ask and a `/` command gets a direct reply. Anything else becomes a task: the daemon downloads the first image, routes the text to a bot and a project, and stores the task in `state.db`. With tasks ahead it replies `⏳ 已排队：任务 #N（前面还有 X 个任务）` and an estimate.
-3. The lane's worker takes the oldest queued task and opens a new OpenCode session at the project root, or in the chat's working directory. OpenCode loads that directory's `AGENTS.md` and `opencode.json`, whose rules take precedence over memory and recent tasks. A follow-up of a finished task instead continues that task's session (see Routing), and a retry continues the session it failed in.
+2. `y`/`n` answers a waiting permission ask and a `/` command gets a direct reply. Anything else is for a task: the daemon downloads the first image and routes the text to a bot and a project. While the chat has open tasks, a message without a prefix first goes to the task router (see Routing), which may merge it into a task, hand it to a running one or stop one; otherwise the daemon stores a new task in `state.db`. With tasks ahead it replies `⏳ 已排队：任务 #N（前面还有 X 个任务）` and an estimate.
+3. The lane's worker takes the oldest queued task and opens a new OpenCode session at the project root, or in the chat's working directory. OpenCode loads that directory's `AGENTS.md` and `opencode.json`, whose rules take precedence over memory and recent tasks. A message the router attaches to a finished task instead continues that task's session (see Routing), and a retry continues the session it failed in.
 4. A new session's prompt carries the context: time, attachments, the bot's role, the project, up to 8 agentmemory entries that match the message (each with its id and date) and the last 8 tasks, each with its session id and with reply excerpts for the latest 2. When a message needs what an earlier task did, the orchestrator has `wechat-explore` read that session with `--session <id>` (its path is in the prompt), instead of searching for it.
 5. The orchestrator hands the work to `wechat-explore` or `wechat-general`, at most 3 at once and 6 per task. Permission asks go to WeChat. A short sentence the orchestrator writes before a subagent call can reach the chat as commentary; the daemon's own progress notes (elapsed time, running tools, subagent count) are off by default.
 6. The orchestrator ends its output with `<<<WECHAT_REPLY>>>`, `<<<WECHAT_MEMORY>>>`, `<<<WECHAT_SUMMARY>>>`, and an optional `<<<WECHAT_FILES>>>` section. The daemon keeps the reply, saves up to 5 facts to agentmemory (a fact that starts with an entry's id updates that entry), stores the summary, the token usage of this task's turns and the file paths, and sends the files after the text.
@@ -63,12 +63,15 @@ flowchart LR
 | `@myproj …` (a project alias first) | default, or an `@bot` right after | that project |
 | `@base …` | default, or an `@bot` right after | none: the chat's working directory |
 | `@all …`, `@everyone …` | the default bot, which splits the work among the specialists, up to 3 at once, and merges one reply | found in the rest |
-| `新话题：…` (or `换个话题`, `new topic`) | found in the rest | found in the rest, never the last task's |
-| a follow-up: `继续`, `接着`, `然后`, `再`, `还有`, `改一下`, `看一下`… | the last task's | the last task's; with the same bot and project it joins that task (below) |
+| `新话题：…` (or `换个话题`, `new topic`) | found in the rest | found in the rest |
+| anything else, while the chat has open tasks | that of the open task the router attaches it to (below), else as above | the same |
 
 - Without an `@`, the default bot answers; a bot is never guessed from the text. The project then comes from an alias of 2 or more characters mentioned anywhere (ASCII aliases as whole words), else none. Only `projects.json` counts: a path in the text is never opened as a directory. A project alias that a bot also uses is dropped.
-- A follow-up is at most 32 characters, opens with a cue word and comes within 2 hours of the last task; an image without text counts too. `@eng 继续` keeps the project and switches the bot, which makes it new work.
-- A follow-up with the last task's bot and project joins that task. Still queued, its text is added to the task's input (`↪️ 已合并到排队中的任务 #N`). Running, the task steers it into its session at the next step, or gives it a turn of its own if the turn has already answered, and the task's one reply covers it (`↪️ 已追加到正在运行的任务 #N…`). Finished, it becomes a new task that continues the session, so it has the whole work so far; if the session is gone, the task starts a new one. An image follow-up of a running or queued task always becomes a task of its own.
+- A message that opens with a prefix from the table (`@bot`, `@project`, `@base`, `@all`, `新话题`) is always new work. Any other message, while the chat has open tasks, goes to the task router first (`src/task-router.ts`): one call to `OPENCODE_DEFAULT_MODEL` through OpenCode's `POST /api/experimental/generate/text`, with no session and no tools, about 2 s and at most 15 s. Open tasks are the running and queued ones and those finished within 24 hours whose session still exists: the newest 6, a continued conversation counted once. The router sees each one's status, age, bot, project, input, summary and the question its reply ended with, if any, and answers one of these:
+  - attach #N: the message continues, corrects, narrows or answers task #N. Still queued, the text is added to its input (`↪️ 已合并到排队中的任务 #N`). Running, the task steers it into its session at the next step, or gives it a turn of its own if the turn has already answered, and the task's one reply covers it (`↪️ 已追加到正在运行的任务 #N…`). Finished, it becomes a new task with #N's bot and project that continues #N's session, so it has the whole work so far; if the session is gone, the task starts a new one. An image always becomes a task of its own that follows #N.
+  - stop #N: a queued task is cancelled (`🗑 已取消任务 #N`), a running one is stopped alone (`⏹ 已停止任务 #N`). `/stop` still stops every running task.
+  - new: a new task, routed as the table says.
+- A failed or slow call, or an answer that names no open task, makes a new task, and the log says why. The log has each decision and its latency, never the message. `--simulate` routes against its own tasks the same way, but only prints a stop.
 
 ### Concurrency
 
@@ -113,7 +116,7 @@ When OpenCode asks for approval, the daemon applies the mode in `config.env`, re
 
 | Path | Contents |
 |---|---|
-| `src/` | The daemon: `main.ts` (CLI, inbound messages), `orchestrator.ts` (prompt, run, result), `opencode/` (HTTP client, watchdogs), `tasks/` (`state.db`, lanes), `wechat/` (iLink client), `commands/`, `tests/` |
+| `src/` | The daemon: `main.ts` (CLI, inbound messages), `task-router.ts` (the open task a message belongs to), `orchestrator.ts` (prompt, run, result), `opencode/` (HTTP client, watchdogs), `tasks/` (`state.db`, lanes), `wechat/` (iLink client), `commands/`, `tests/` |
 | `config/agents/` | The four agent prompts, see [config/agents/README.md](config/agents/README.md) |
 | `config/launchd/` | launchd job templates for the server, the daemon and the watchdog, run through `run-server.sh`, `run-bot.sh` and `scripts/watchdog.sh` |
 | `scripts/` | `release.sh`, `deploy.sh`, `rollback.sh`, `healthcheck.sh`, `install-agents.sh`, `install-launchd.sh` |
@@ -205,7 +208,7 @@ Every `node dist/main.js` command loads `env` from the data directory, and varia
 | `OPENCODE_PORT` | `4096` | Port of the server the daemon starts when none answers |
 | `OPENCODE_SERVER_PASSWORD` | empty | Server password, sent as Basic auth for the user `opencode` |
 | `WECHAT_ALLOWED_IDS` | the bound account | WeChat user ids the bot listens to, comma-separated |
-| `OPENCODE_DEFAULT_MODEL` | `oneapi/DeepSeek-V4.1-Flash` | The model routing assumes without `/model`; keep it equal to the orchestrators' `model:` |
+| `OPENCODE_DEFAULT_MODEL` | `oneapi/DeepSeek-V4.1-Flash` | The model routing assumes without `/model`, and the task router's model; keep it equal to the orchestrators' `model:` |
 | `OPENCODE_FALLBACK_MODEL` | none | The model for the one retry after an upstream failure, even on the same provider. Used only while the server lists it; checked at startup, by `/doctor` and before each use. Unset: no retry |
 | `OPENCODE_FIRST_RESPONSE_TIMEOUT_MS`, `OPENCODE_STALL_TIMEOUT_MS` | `120000`, `180000` | Silence allowed before the first output, and between signs of progress (streamed output on the event stream counts) |
 | `OWB_BREAKER_THRESHOLD`, `OWB_BREAKER_COOLDOWN_MS` | `3`, `600000` | Upstream failures in a row that open a breaker, and its first cooldown |

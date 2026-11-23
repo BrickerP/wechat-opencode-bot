@@ -297,6 +297,8 @@ export function openStateDb(file: string = STATE_DB_PATH) {
       id, accountId, input, status, now, status === 'running' ? now : null, messageId, project?.id ?? null, project?.dir ?? null, botId, lane,
       routineId, sessionId,
     );
+    // task_sessions keeps the task that first ran in a session; tasks.session_id names this one's use of it.
+    if (sessionId) run('INSERT OR IGNORE INTO task_sessions (session_id, task_id, created_at) VALUES (?, ?, ?)', sessionId, id, now);
     return getTask(id)!;
   }
 
@@ -356,10 +358,7 @@ export function openStateDb(file: string = STATE_DB_PATH) {
             ? undefined
             : one<TaskRow>(`${TASK_SELECT} WHERE t.account_id = ? AND t.message_id = ?`, accountId, messageId);
         if (existing) return { task: existing, created: false };
-        const task = insertTask(accountId, input, 'queued', messageId, project, botId, lane, routineId, sessionId);
-        // task_sessions keeps the task that first ran in a session; tasks.session_id names this one's use of it.
-        if (sessionId) run('INSERT OR IGNORE INTO task_sessions (session_id, task_id, created_at) VALUES (?, ?, ?)', sessionId, task.id, Date.now());
-        return { task, created: true };
+        return { task: insertTask(accountId, input, 'queued', messageId, project, botId, lane, routineId, sessionId), created: true };
       });
     },
 
@@ -373,12 +372,34 @@ export function openStateDb(file: string = STATE_DB_PATH) {
       return Number(out.changes) === 1;
     },
 
-    /** Insert a task directly as running (--simulate), unless its lane already has a running task. */
-    startTaskNow(accountId: string, input: string, project?: TaskProject, botId?: string, lane: TaskLane = 'write'): TaskRow | null {
+    /**
+     * Insert a task directly as running (--simulate), unless its lane already has a running task. sessionId, as with
+     * createTask, is the session it continues.
+     */
+    startTaskNow(
+      accountId: string,
+      input: string,
+      project?: TaskProject,
+      botId?: string,
+      lane: TaskLane = 'write',
+      sessionId?: string,
+    ): TaskRow | null {
       return immediate(() =>
-        hasRunning(accountId, lane) ? null : insertTask(accountId, input, 'running', null, project, botId, lane),
+        hasRunning(accountId, lane) ? null : insertTask(accountId, input, 'running', null, project, botId, lane, null, sessionId),
       );
     },
+
+    /**
+     * The tasks a new message may belong to, newest first: those running or queued, and those that finished at or
+     * after since and still name a session (retention forgets the sessions it deleted). limit bounds the rows read.
+     */
+    openTasks: (accountId: string, since: number, limit: number) =>
+      all<TaskRow>(
+        `${TASK_SELECT} WHERE t.account_id = ?
+           AND (t.status IN ('running', 'queued') OR (t.finished_at >= ? AND t.session_id IS NOT NULL))
+         ORDER BY t.rowid DESC LIMIT ?`,
+        accountId, since, limit,
+      ),
 
     /** Atomically move the lane's oldest queued task to running; null if the lane is busy or has nothing queued. */
     claimNextTask(accountId: string, lane: TaskLane): TaskRow | null {

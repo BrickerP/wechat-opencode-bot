@@ -10,17 +10,17 @@ import { isCommand, routeCommand } from './commands/router.js';
 import { loadConfig, saveConfig } from './config.js';
 import { DATA_DIR } from './constants.js';
 import { backupStateDb } from './backup.js';
-import { isReadOnlyBot } from './bots.js';
 import { acquireDaemonLock, lockHolder, releaseDaemonLock } from './lifecycle.js';
 import { logger } from './logger.js';
 import { checkFallbackAtStartup } from './model-routing.js';
 import { createNotifier, runNotify } from './notify.js';
-import { formatQueueAck, IMAGE_ONLY_INPUT, joinRunningTask, runTask, saveAttachment } from './orchestrator.js';
+import { formatQueueAck, IMAGE_ONLY_INPUT, runTask, saveAttachment } from './orchestrator.js';
 import { initOpenCode, interruptSession, startEventStream } from './opencode/provider.js';
 import { createPermissionBroker } from './permission.js';
 import { routeMessage } from './projects.js';
 import { PRUNE_INTERVAL_MS, pruneSessions } from './retention.js';
 import { runSimulate, SIMULATE_ACCOUNT } from './simulate.js';
+import { placeMessage } from './task-router.js';
 import { openStateDb } from './tasks/db.js';
 import { createTaskQueue } from './tasks/queue.js';
 import { loadLatestAccount } from './wechat/accounts.js';
@@ -252,31 +252,18 @@ async function runDaemon(): Promise<void> {
       await notifier.reply(accountId, '⚠️ 图片下载失败，请重新发送');
       return;
     }
-    const { input: routed, project, botId, follows } = routeMessage(db, accountId, text);
-    // Marked after routing, which reads "@bot", "@project" and "继续" at the start of the text.
-    const body = voiceText ? `[语音] ${routed}` : routed;
+    const routed = routeMessage(text);
+    // Marked after routing, which reads "@bot", "@project" and "新话题" at the start of the text.
+    const body = voiceText ? `[语音] ${routed.input}` : routed.input;
     const input = image ? (body ? `${IMAGE_ONLY_INPUT} ${body}` : IMAGE_ONLY_INPUT) : body;
-    // A follow-up in words joins the work it follows while that is still open: merged into it while it waits,
-    // handed to it while it runs. Both are synchronous, so the task cannot start or close in between.
-    if (follows && !image) {
-      if (db.appendTaskInput(follows.id, input, ['queued'])) {
-        logger.info('Follow-up merged into a queued task', { taskId: follows.id, seq: follows.seq });
-        await notifier.reply(accountId, `↪️ 已合并到排队中的任务 #${follows.seq}`);
-        return;
-      }
-      if (joinRunningTask(follows.id, input)) {
-        db.appendTaskInput(follows.id, input, ['running']);
-        logger.info('Follow-up handed to a running task', { taskId: follows.id, seq: follows.seq });
-        await notifier.reply(accountId, `↪️ 已追加到正在运行的任务 #${follows.seq}，它会在下一个步骤采纳`);
-        return;
-      }
+    // A message may belong to an open task: merged into it, handed to it, or a task that continues it (task-router.ts).
+    const placed = await placeMessage(ctx, { input, image: Boolean(image), routed });
+    if ('reply' in placed) {
+      await notifier.reply(accountId, placed.reply);
+      return;
     }
+    const { project, botId, lane, continues } = placed.task;
     const messageId = msg.message_id ? String(msg.message_id) : null;
-    // A read-only bot's task runs in its own lane and does not wait for a running write task.
-    const lane = isReadOnlyBot(botId) ? 'read' : 'write';
-    // A follow-up of work that has closed continues its session, which holds that work; it runs in the same lane,
-    // so after the task it follows.
-    const continues = follows ? (db.getTask(follows.id)?.session_id ?? undefined) : undefined;
     const { task, created } = db.createTask(accountId, input, messageId, project, botId, lane, undefined, continues);
     if (!created) {
       logger.debug('Duplicate message ignored', { messageId, taskId: task.id, seq: task.seq });

@@ -10,6 +10,8 @@ export interface PendingPermission {
   toolInput: string;
   /** Names the asking task in replies, such as "任务 #3（eng）". */
   label?: string;
+  /** The asking task, so stopping that task alone can deny its asks. */
+  taskId?: string;
   /** The promise createPending returned; it also identifies the ask. */
   answer: Promise<boolean>;
   resolve: (allowed: boolean) => void;
@@ -35,7 +37,7 @@ export function createPermissionBroker(onTimeout?: OnPermissionTimeout) {
     ask.resolve(allowed);
   }
 
-  function createPending(accountId: string, toolName: string, toolInput: string, label?: string): Promise<boolean> {
+  function createPending(accountId: string, toolName: string, toolInput: string, label?: string, taskId?: string): Promise<boolean> {
     const asks = pending.get(accountId) ?? [];
     if (asks.length >= MAX_PENDING) {
       logger.warn('Too many pending permissions, auto-denied', { accountId, toolName, label });
@@ -48,6 +50,7 @@ export function createPermissionBroker(onTimeout?: OnPermissionTimeout) {
       toolName,
       toolInput,
       label,
+      taskId,
       answer,
       resolve,
       timer: setTimeout(() => {
@@ -90,9 +93,9 @@ export function createPermissionBroker(onTimeout?: OnPermissionTimeout) {
     return (pending.get(accountId) ?? []).findIndex((ask) => ask.answer === answer);
   }
 
-  /** Rejects the ask that createPending returned this answer for, or with no answer every ask of the account. */
-  function rejectPending(accountId: string, answer?: Promise<boolean>): boolean {
-    const asks = (pending.get(accountId) ?? []).filter((ask) => !answer || ask.answer === answer);
+  /** Rejects the account's asks that match; true when there was one. */
+  function rejectWhere(accountId: string, matches: (ask: PendingPermission) => boolean): boolean {
+    const asks = (pending.get(accountId) ?? []).filter(matches);
     for (const ask of asks) {
       settle(accountId, ask, false);
       logger.info('Permission auto-rejected', { accountId, toolName: ask.toolName, label: ask.label });
@@ -100,7 +103,14 @@ export function createPermissionBroker(onTimeout?: OnPermissionTimeout) {
     return asks.length > 0;
   }
 
-  return { createPending, resolvePermission, rejectPending, isTimedOut, clearTimedOut, getPending, asksAhead };
+  /** Rejects the ask that createPending returned this answer for, or with no answer every ask of the account. */
+  const rejectPending = (accountId: string, answer?: Promise<boolean>): boolean =>
+    rejectWhere(accountId, (ask) => !answer || ask.answer === answer);
+
+  /** Rejects the asks of one task, stopped on its own: its runner must not go on waiting for an answer. */
+  const rejectTask = (accountId: string, taskId: string): boolean => rejectWhere(accountId, (ask) => ask.taskId === taskId);
+
+  return { createPending, resolvePermission, rejectPending, rejectTask, isTimedOut, clearTimedOut, getPending, asksAhead };
 }
 
 export type PermissionBroker = ReturnType<typeof createPermissionBroker>;

@@ -67,6 +67,13 @@ export function createTaskQueue(db: StateDb, runTask: TaskRunner, onFinished: (a
     return running.map(({ task }) => task);
   }
 
+  /** Abort one task, if this process is running it for the account; true when it was. */
+  function stopTask(accountId: string, taskId: string): boolean {
+    const running = [...(active.get(accountId)?.values() ?? [])].find(({ task }) => task.id === taskId);
+    running?.controller.abort();
+    return running !== undefined;
+  }
+
   /** Start draining now and keep polling for tasks queued while busy. */
   function start(accountId: string): () => void {
     kick(accountId);
@@ -74,7 +81,7 @@ export function createTaskQueue(db: StateDb, runTask: TaskRunner, onFinished: (a
     return () => clearInterval(timer);
   }
 
-  return { kick, stop, start };
+  return { kick, stop, stopTask, start };
 }
 
 export type TaskQueue = ReturnType<typeof createTaskQueue>;

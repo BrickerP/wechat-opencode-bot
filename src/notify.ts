@@ -183,7 +183,7 @@ export function createNotifier(db: StateDb, api: WeChatApi, sender: Sender) {
       async onPermission(request) {
         const label = taskLabel(task);
         // Register before asking so a quick answer cannot arrive ahead of the pending entry.
-        const answer = broker.createPending(accountId, request.action, request.resources.join(', '), label);
+        const answer = broker.createPending(accountId, request.action, request.resources.join(', '), label, task.id);
         const ahead = broker.asksAhead(accountId, answer);
         // A full queue denied it already: showing it would only point the next y/n at another task's ask.
         if (ahead < 0) {

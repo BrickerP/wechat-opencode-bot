@@ -166,7 +166,7 @@ The `com.yupeng.opencode-wechat-watchdog` job runs `scripts/watchdog.sh` at logi
 - It only restarts the bot. It leaves a down OpenCode server or a broken release alone; the notification names the check that failed.
 - It does nothing while the bot job is not loaded, so a bot stopped with `launchctl bootout` stays stopped until the next login.
 
-Once a day after a passing check, and on `scripts/watchdog.sh --smoke`, it runs a smoke test: `node current/dist/main.js --simulate "只回复 ok"`, or `dist/main.js` without `current`. The task goes through the real OpenCode server and model under the `simulate` account, so the chat's history and memory stay untouched. A test that has not finished after 180 s is stopped and fails. A failure sends a notification and logs the last 20 lines of the output; the next test still waits a day.
+Once a day after a passing check, and on `scripts/watchdog.sh --smoke`, it runs a smoke test: `node current/dist/main.js --simulate "只回复 ok"`, or `dist/main.js` without `current`. The task goes through the real OpenCode server and model under the `simulate` account, so the chat's history stays untouched; it reads agentmemory but never saves to it. A test that has not finished after 180 s is stopped and fails. A failure sends a notification and logs the last 20 lines of the output; the next test still waits a day.
 
 A healthy run writes nothing, apart from the daily smoke-test result and a failed ping. `~/.wechat-opencode-bot/logs/watchdog.log` gets failures, restarts and smoke-test results, with the healthcheck's `ok` and `FAIL` lines but never its `--status` report or the env file. In a terminal, `scripts/watchdog.sh` does the same, restart included, and prints what it found.
 

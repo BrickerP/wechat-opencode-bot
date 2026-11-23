@@ -54,11 +54,12 @@ Leave the model change from step 2 out of your pull request unless the pull requ
 - `node:test` and `node:assert/strict`, one file per area in `src/tests/`.
 - No real network, WeChat account or model. A test that needs OpenCode starts a fake server with `node:http` on `127.0.0.1:0`, as `control.test.ts` does.
 - Tests that touch state point `HOME` and `OWB_DATA_DIR` at a `mkdtempSync` directory before they load the bot's modules. Tests that need OpenCode also set `OPENCODE_URL` first and load the modules with `await import(...)`, because `src/opencode/provider.ts` reads `OPENCODE_URL` when it loads.
+- A test that runs a task never reaches your agentmemory engine: it deletes `AGENTMEMORY_URL` and `AGENTMEMORY_SECRET`, so memory is off under the temporary `HOME`, or points them at a fake engine, as `watchdog.test.ts` does.
 - A test that sets an environment variable deletes it again, as `model-routing.test.ts` does.
 
 ## Secrets and state
 
-The bot keeps its state outside the checkout, in `~/.wechat-opencode-bot/`: `env`, `accounts/` (the iLink token), `state.db`, `memory/`, `attachments/` and `logs/`. Keep all of it out of commits, issues and test fixtures, and do not point `OWB_DATA_DIR` inside the repo. The same goes for real WeChat ids, tokens, keys and gateway URLs. `.gitignore` covers build output and `*.log`, not these files.
+The bot keeps its state outside the checkout, in `~/.wechat-opencode-bot/`: `env`, `accounts/` (the iLink token), `state.db`, `attachments/` and `logs/`; memories live in your agentmemory engine. Keep all of it out of commits, issues and test fixtures, and do not point `OWB_DATA_DIR` inside the repo. The same goes for real WeChat ids, tokens, keys and gateway URLs. `.gitignore` covers build output and `*.log`, not these files.
 
 CI scans the whole history with gitleaks, so a secret that a later commit deletes still fails the check. Drop it from your branch's history and rotate it as [SECURITY.md](SECURITY.md#secrets) describes.
 

@@ -22,6 +22,7 @@ The transcript is illustrative; the bot's replies are plain text in Chinese unle
 flowchart LR
   wechat["WeChat<br/>(iLink bot API)"] -- "long poll" --> daemon["bot daemon<br/>(Node.js)"]
   daemon <--> db[("state.db<br/>task queue, outbox, routines")]
+  daemon -- "search, save" --> memory[("agentmemory<br/>your memories")]
   daemon -- "HTTP API" --> server["OpenCode server"]
   server --> orch["orchestrator session<br/>(one per task)"]
   orch --> general["wechat-general"]
@@ -39,6 +40,7 @@ flowchart LR
 | Orchestrators | Primary agents `wechat-orchestrator` and `wechat-orchestrator-read` | Plan each task, delegate the work, write the reply |
 | Subagents | `wechat-general` (can edit files) and `wechat-explore` (cannot) | Do the work: read code, run commands, edit files |
 | `state.db` | SQLite through `node:sqlite`, in the data directory | Tasks, outbox, routines, per-chat settings |
+| agentmemory | Your memory engine, REST on `127.0.0.1:3111`; optional | Holds every memory: searched before a task, written after it. The bot keeps none of its own |
 | launchd | Two macOS user jobs, optional | Keep the server and the daemon running ([docs/DEPLOY.md](docs/DEPLOY.md)) |
 
 ### Task lifecycle
@@ -46,9 +48,9 @@ flowchart LR
 1. The daemon long-polls iLink and ignores anyone not in `WECHAT_ALLOWED_IDS`. Each message refreshes the chat's `context_token`, which every reply needs.
 2. `y`/`n` answers a waiting permission ask and a `/` command gets a direct reply. Anything else becomes a task: the daemon downloads the first image, routes the text to a bot and a project, and stores the task in `state.db`. With tasks ahead it replies `⏳ 已排队：任务 #N（前面还有 X 个任务）` and an estimate.
 3. The lane's worker takes the oldest queued task and opens a new OpenCode session at the project root, or in the chat's working directory. OpenCode loads that directory's `AGENTS.md` and `opencode.json`, whose rules take precedence over memory and recent tasks.
-4. Sessions are never resumed, so the prompt carries the context: time, attachments, the bot's role, the project, the chat's memory and the last 8 tasks, each with its session id and with reply excerpts for the latest 2. When a message needs what an earlier task did, the orchestrator has `wechat-explore` read that session with `--session <id>` (its path is in the prompt), instead of searching for it.
+4. Sessions are never resumed, so the prompt carries the context: time, attachments, the bot's role, the project, up to 8 agentmemory entries that match the message (each with its id and date) and the last 8 tasks, each with its session id and with reply excerpts for the latest 2. When a message needs what an earlier task did, the orchestrator has `wechat-explore` read that session with `--session <id>` (its path is in the prompt), instead of searching for it.
 5. The orchestrator hands the work to `wechat-explore` or `wechat-general`, at most 3 at once and 6 per task. Permission asks go to WeChat. A short sentence the orchestrator writes before a subagent call can reach the chat as commentary; the daemon's own progress notes (elapsed time, running tools, subagent count) are off by default.
-6. The orchestrator ends its output with `<<<WECHAT_REPLY>>>`, `<<<WECHAT_MEMORY>>>`, `<<<WECHAT_SUMMARY>>>`, an optional `<<<WECHAT_HANDOFF>>>` and optional `<<<WECHAT_FILES>>>` sections. The daemon keeps the reply, adds up to 5 dated facts to memory, stores the summary, handoff, token usage and file paths, and sends the files after the text.
+6. The orchestrator ends its output with `<<<WECHAT_REPLY>>>`, `<<<WECHAT_MEMORY>>>`, `<<<WECHAT_SUMMARY>>>`, an optional `<<<WECHAT_HANDOFF>>>` and optional `<<<WECHAT_FILES>>>` sections. The daemon keeps the reply, saves up to 5 facts to agentmemory (a fact that starts with an entry's id updates that entry), stores the summary, handoff, token usage and file paths, and sends the files after the text.
 7. The next task within 2 hours gets the previous task's handoff (files, commands, open work, next step), so "继续" does not start from the summary alone. The result goes to the outbox once, in 2048-character chunks; a failure reads `⚠️ 任务 #N 失败：…`, a restart `⏹ 任务 #N 已中断…`.
 
 ### Routing
@@ -94,7 +96,7 @@ Paths are in the data directory (`OWB_DATA_DIR`, default `~/.wechat-opencode-bot
 | Tasks, outbox, routines, per-chat settings | `state.db`: `tasks`, `task_sessions`, `pending_notices`, `routines`, `users` | Migrations run on open (`PRAGMA user_version`, additive only) |
 | Backups of `state.db` | `backups/state-<time>.db` | Taken at start-up when the newest is over a day old; 7 kept |
 | OpenCode sessions | the OpenCode server | Deleted through its API 7 days after the task finished, keeping the newest 300; checked at start-up and daily |
-| Memory | `memory/<account>/MEMORY.md` (shared, written by the default bot), `memory/<account>/bots/<id>.md` | 5 facts per task, 300 characters each; each file adds up to 8 KB to the prompt and is capped at 16 KB |
+| Memory | Your agentmemory engine (`AGENTMEMORY_URL`), shared with your other agents | As the engine keeps it. A prompt shows the 8 best matches, cut at 600 characters; a task saves or updates up to 5 facts of 600 characters, tagged `wechat-opencode-bot`. `--simulate` reads but never saves. The bot no longer reads `memory/` in the data directory |
 | Images | `attachments/<task>/` | 24 hours; a text task within 10 minutes of an image task reuses its images |
 | Logs | `~/.wechat-opencode-bot/logs/` | One file a day, 3 kept |
 
@@ -139,7 +141,7 @@ When OpenCode asks for approval, the daemon applies the mode in `config.env`, re
 | Command | What it does |
 |---|---|
 | `node dist/main.js --daemon` | Run the bot in the foreground. It holds `daemon.lock`, so a second one prints `already running (pid N)` and exits |
-| `node dist/main.js --simulate "列出工作目录"` | Run one task as if it came from WeChat and print the reply. It needs a running server, uses the account `simulate` and denies every permission ask |
+| `node dist/main.js --simulate "列出工作目录"` | Run one task as if it came from WeChat and print the reply. It needs a running server, uses the account `simulate`, denies every permission ask, and reads memories but saves none |
 | `node dist/main.js --status` | The daemon's pid and the `/status` report, without breakers |
 | `node dist/main.js --tasks [n]` | The last n tasks |
 | `node dist/main.js --notify "<text>"` | Send a message to the chat. Exit code 2 (`no_context_token`) or 3 (`send_failed`) leaves it in the outbox |
@@ -154,7 +156,7 @@ An always-on bot runs a release instead. CI builds every push to `main` and uplo
 | Command | What it does |
 |---|---|
 | `/help` | Show the help |
-| `/status` | Working directory, project, bots, model, permission mode, running and queued tasks, memory; then 24-hour outcomes, tokens used, open breakers, the outbox backlog and the token's age |
+| `/status` | Working directory, project, bots, model, permission mode, running and queued tasks, where memories come from; then 24-hour outcomes, tokens used, open breakers, the outbox backlog and the token's age |
 | `/tasks [n]` | The last n tasks (default 5, at most 20), with token usage when recorded; ⚠️ marks a task at or over `OWB_TASK_WARN_TOKENS` |
 | `/session <id\|title>` | Read a session on this OpenCode server directly: its last assistant text, as is (cut at 20,000 characters); a title that matches several lists up to 5 ids |
 | `/stop` | Stop the running tasks in both lanes and deny waiting asks; `/stop all` also cancels the queue |
@@ -166,7 +168,7 @@ An always-on bot runs a release instead. CI builds every push to `main` and uplo
 | `/bots` | List the bots: id, aliases, reply prefix, model, default |
 | `/model [model]` | Show or set the model for the next tasks, overriding every bot: `provider/model[#variant]` or a bare id; `/model default` returns to each bot's own model |
 | `/models` | List the server's models |
-| `/doctor` | Self-check: OpenCode, agents, the event stream, message token, outbox, databases, fallback model, breakers, routines and uptime |
+| `/doctor` | Self-check: OpenCode, agents, the event stream, message token, outbox, databases, agentmemory, fallback model, breakers, routines and uptime |
 | `/panic` | Stop and cancel every task, deny waiting asks, switch to `plan` and disable every routine |
 | `/permission [mode]` | Show or set `default`, `acceptEdits`, `plan` or `auto` |
 | `/routine …` | List routines, or `add`, `rm`, `on`, `off` or `run` one |
@@ -214,6 +216,8 @@ Every `node dist/main.js` command loads `env` from the data directory, and varia
 | `OWB_PROGRESS_FIRST_MS`, `OWB_PROGRESS_MIN_GAP_MS`, `OWB_PROGRESS_EVERY_MS`, `OWB_PROGRESS_MAX` | `20000`, `90000`, `300000`, `4` | Progress notes, with `OWB_PROGRESS_ENABLED=true`: first after, minimum gap, regular interval, maximum per task; `OWB_PROGRESS_MAX=0` sends none |
 | `OWB_TASK_WARN_TOKENS` | `500000` | Prompt tokens (cache included) from which a task is logged as costly and marked ⚠️ in `/tasks` |
 | `OWB_ASR_URL`, `OWB_ASR_MODEL`, `OWB_ASR_API_KEY` | empty, `whisper-1`, empty | OpenAI-compatible transcription endpoint for voice without WeChat's own text; SILK is decoded to WAV first |
+| `AGENTMEMORY_URL` | `http://127.0.0.1:3111` | The agentmemory engine. Set it to use an engine without a secret |
+| `AGENTMEMORY_SECRET` | the contents of `~/.agentmemory/secret` | The engine's bearer token. Without it or `AGENTMEMORY_URL`, memory is off and `/doctor` says so |
 | `OWB_DATA_DIR` | `~/.wechat-opencode-bot` | The data directory |
 | `OWB_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
 

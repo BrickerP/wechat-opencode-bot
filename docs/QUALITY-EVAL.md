@@ -18,7 +18,7 @@ None of this shows that one model is better than another.
 - The bridge's own progress notes (elapsed time, running tools, subagent count) are off unless `OWB_PROGRESS_ENABLED=true`. They come from the bridge, not the model, so they neither earn nor lose points.
 - The final step calls no tool and starts with `<<<WECHAT_REPLY>>>`, then `<<<WECHAT_MEMORY>>>`, `<<<WECHAT_SUMMARY>>>`, `<<<WECHAT_HANDOFF>>>` and, only when sending files, `<<<WECHAT_FILES>>>`. `parseOrchestratorOutput` in `src/orchestrator.ts` reads it. It is the only answer, sent once through the outbox; a turn that ends on a step that calls a tool fails with `OpenCode 执行结束，但模型没有给出最终回复`.
 - The parser uses the text before the first reply marker only when every reply section is empty, so whatever is written before an empty reply section becomes the answer.
-- The bridge keeps at most 5 memory bullets per task, 300 characters each, cuts the summary at 100 and the handoff at 1200 characters, and sends at most 3 files. The prompts ask for a summary under 80 and a handoff under 800 characters.
+- The bridge saves at most 5 memory bullets per task to agentmemory, 600 characters each; a bullet that starts with an id from <memory> in brackets updates that entry when the prompt showed it whole. It cuts the summary at 100 and the handoff at 1200 characters, and sends at most 3 files. The prompts ask for a summary under 80 and a handoff under 800 characters.
 
 ## Rubric
 
@@ -30,7 +30,7 @@ Score each dimension 0 (fails), 1 (partly) or 2 (meets).
 4. Check: a disputed or inferred claim the answer depends on gets one targeted check; a simple or directly evidenced answer gets none.
 5. Reply: Chinese by default, plain text, result first, length fitting the goal. No subagent or tool names, call counts or elapsed time; words the user asked about, such as session, are fine.
 6. Progress text: at most a short, useful sentence beside a subagent call; none for a direct answer; no reasoning and no markers.
-7. Protocol: the final response follows the agreement above. Memory holds durable facts or exactly `- 无`. The handoff has only files:, commands:, open: and next: lines, or exactly `-`. Files are regular files under the workspace, of an allowed type, at most 20 MB each.
+7. Protocol: the final response follows the agreement above. Memory holds durable facts, each in Chinese with its conclusion, reason and date, or exactly `- 无`; an update starts with an id <memory> showed, and nothing repeats what <memory> already says. The handoff has only files:, commands:, open: and next: lines, or exactly `-`. Files are regular files under the workspace, of an allowed type, at most 20 MB each.
 
 Any of these fails the case:
 

@@ -20,7 +20,8 @@ These paths hold secrets or private data. They are the defaults: `OWB_DATA_DIR` 
 | `~/.wechat-opencode-bot/env` | Provider and gateway keys, `OPENCODE_SERVER_PASSWORD`, `OWB_ASR_API_KEY`, webhook URLs. Keep it at `chmod 600` |
 | `~/.wechat-opencode-bot/accounts/` | The iLink bot token that setup stores |
 | `~/.wechat-opencode-bot/state.db`, `backups/`, `logs/` | Every task's text and reply, chat settings and routines; the logs record accounts, tasks and errors |
-| `~/.wechat-opencode-bot/memory/`, `attachments/` | What the bot remembers about you, and the images you sent |
+| `~/.wechat-opencode-bot/attachments/`, `memory/` | The images you sent; `memory/` is the memory of older versions, which this one neither reads nor writes |
+| `~/.agentmemory/secret`, your agentmemory engine | The engine's token, and the memories tasks read and save. The memories that match a message go into that task's prompt, so its model provider sees them |
 | `~/.local/share/opencode/opencode.db`, `auth.json` | OpenCode's sessions with their tool output, and the credentials OpenCode stores |
 
 Never commit these files or paste them into an issue. CI runs gitleaks over the whole history, which catches many keys but not all.
@@ -30,7 +31,8 @@ Never commit these files or paste them into an issue. CI runs gitleaks over the 
 1. A provider or gateway key: revoke it with the provider, create a new one, put it where the old one was (`env`, OpenCode's config, or `opencode auth login`), then restart the OpenCode server.
 2. The iLink token: run `npm run setup` again to bind a new session, then restart the daemon. We have not confirmed that a new binding revokes the old token.
 3. `OPENCODE_SERVER_PASSWORD`, `OWB_ASR_API_KEY` or a webhook URL: replace it in `env`, then restart the server and the daemon ([launchd](docs/DEPLOY.md#launchd) has the commands).
-4. `state.db`, the memory files or OpenCode's database: these cannot be rotated. Treat their contents as disclosed, and rotate any secret a task ever printed.
+4. The agentmemory secret: replace it as the engine's documentation says. The bot reads `AGENTMEMORY_SECRET` or `~/.agentmemory/secret` on every call, so it needs no restart, unless the secret is set in `env`.
+5. `state.db`, the agentmemory store or OpenCode's database: these cannot be rotated. Treat their contents as disclosed, and rotate any secret a task ever printed.
 
 A secret pushed to a public repository is public from that moment, whatever happens to the history later. Rotate it first.
 

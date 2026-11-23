@@ -11,8 +11,8 @@ const RETRY_MS = 2000;
 
 /**
  * --simulate: run one task in this process against the real OpenCode server, as if it came from
- * WeChat. It keeps its own task history and memory under SIMULATE_ACCOUNT, so the chat's history
- * and memory stay untouched; replies print instead of being sent.
+ * WeChat. It keeps its own task history under SIMULATE_ACCOUNT, so the chat's history stays
+ * untouched, and it reads the owner's memories but saves none; replies print instead of being sent.
  */
 export async function runSimulate(text: string): Promise<number> {
   if (!(await pingOpenCode())) {
@@ -42,6 +42,7 @@ export async function runSimulate(text: string): Promise<number> {
       console.log(`[wechat] 🔧 权限请求 ${request.action}: ${request.resources.join(', ') || '(无)'} → 拒绝（simulate 不审批）`);
       return 'reject';
     },
+    readOnlyMemory: true,
   };
   const controller = new AbortController();
   // Free the account before the session winds down: a running row left behind blocks every later

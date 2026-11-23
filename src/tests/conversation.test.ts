@@ -87,7 +87,7 @@ function handle(req: IncomingMessage, res: ServerResponse): void {
 }
 
 const tmp = mkdtempSync(join(tmpdir(), 'owb-conversation-'));
-// Logs and config follow HOME, state and memory OWB_DATA_DIR: keep all of them away from the real bot.
+// Logs and config follow HOME, state OWB_DATA_DIR: keep all of them away from the real bot.
 process.env.HOME = tmp;
 process.env.OWB_DATA_DIR = join(tmp, 'data');
 process.env.OPENCODE_SERVER_PASSWORD = '';
@@ -104,6 +104,9 @@ process.env.OPENCODE_FALLBACK_MODEL = 'oneapi-chat-gpt/gpt-6-astra';
 delete process.env.OPENCODE_DEFAULT_MODEL;
 delete process.env.OWB_BREAKER_THRESHOLD;
 delete process.env.OWB_BREAKER_COOLDOWN_MS;
+// No secret under the temporary HOME and no URL: memory is off, so no task here reaches a real agentmemory engine.
+delete process.env.AGENTMEMORY_URL;
+delete process.env.AGENTMEMORY_SECRET;
 
 const server = createServer(handle);
 await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));

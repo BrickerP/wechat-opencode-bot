@@ -2,11 +2,11 @@ import { existsSync, lstatSync, mkdirSync, readdirSync, rmSync, statSync, writeF
 import { extname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { maybeAlertFailures } from './alerts.js';
+import { saveMemories, searchMemories, type Memory } from './agentmemory.js';
 import { defaultBot, loadBots, resolveBot, type Bot } from './bots.js';
 import { loadConfig } from './config.js';
 import { DATA_DIR } from './constants.js';
 import { logger } from './logger.js';
-import { appendMemory, memoryPath, readMemory } from './memory.js';
 import { breaker, checkFallback, DEFAULT_MODEL, providerOf, type FallbackCheck } from './model-routing.js';
 import { openCodeQuery, type PermissionDecision, type PermissionRequest, type QueryResult, type Usage } from './opencode/provider.js';
 import { isRealPathInside } from './projects.js';
@@ -54,6 +54,8 @@ export interface TaskIO {
    */
   commentary?(text: string): void | Promise<void>;
   onPermission?(request: PermissionRequest): Promise<PermissionDecision>;
+  /** The task reads memories but saves none: --simulate, so smoke tests and evaluations leave the owner's store alone. */
+  readOnlyMemory?: boolean;
 }
 
 export const shortId = (id: string): string => id.slice(0, 6);
@@ -149,8 +151,6 @@ const PERSONA_PRECEDENCE =
   "The repository's AGENTS.md and opencode.json take precedence over this persona role, <memory> and <recent_tasks>.";
 const ALL_GUIDANCE =
   'The user addressed everyone (@all): give independent parts to the specialists, at most 3 subagents at once, then merge them into one reply.';
-const SHARED_MEMORY_GUIDANCE =
-  'Your WECHAT_MEMORY bullets go to the shared memory that every persona reads: keep cross-persona user preferences there. Never store repo instructions.';
 /**
  * The work-activity collector beside this build: scripts/ next to dist/, in a checkout and in an installed release.
  * <context> gives its absolute path, since a task's session opens in the user's workspace, not here.
@@ -205,12 +205,13 @@ function formatPersona(bots: Bot[], bot: Bot, all: boolean): string {
     );
     if (all) lines.push(ALL_GUIDANCE);
   }
-  lines.push(
-    bot.default
-      ? SHARED_MEMORY_GUIDANCE
-      : `Your WECHAT_MEMORY bullets are kept for ${bot.name} only, under "${bot.name} 的记忆" in <memory>: keep facts about this role and its projects there. Never store repo instructions.`,
-  );
   return `<persona>\n${lines.join('\n')}\n</persona>`;
+}
+
+/** The owner's memories that matched the message, best first, each with the id an update names and its date. */
+function formatMemories(memories: Memory[]): string {
+  if (!memories.length) return '(暂无)';
+  return memories.map((m) => `- [${m.id}${m.date ? ` ${m.date}` : ''}] ${m.text}`).join('\n');
 }
 
 /**
@@ -223,11 +224,22 @@ function lastHandoff(task: TaskRow, previous: TaskRow | undefined): string[] {
   return [`<last_handoff>\ntask: #${previous.seq}\n${previous.handoff}\n</last_handoff>`];
 }
 
-/**
- * Each orchestrator session starts empty: everything it knows about the chat comes from this prompt.
- * retry: an earlier session for this task gave up, possibly after its subagents had changed something.
- */
-export function composePrompt(db: StateDb, task: TaskRow, workspace: string, attachments: Attachments, retry = false): string {
+/** What composePrompt adds to the chat's own context. */
+export interface PromptOptions {
+  /** An earlier session for this task gave up, possibly after its subagents had changed something. */
+  retry?: boolean;
+  /** The owner's memories that matched the message; every attempt of a task shows the same ones. */
+  memories?: Memory[];
+}
+
+/** Each orchestrator session starts empty: everything it knows about the chat comes from this prompt. */
+export function composePrompt(
+  db: StateDb,
+  task: TaskRow,
+  workspace: string,
+  attachments: Attachments,
+  { retry = false, memories = [] }: PromptOptions = {},
+): string {
   const bots = loadBots();
   const { bot, all } = resolveBot(task.bot_id, bots);
   const context = [`workspace: ${workspace}`, `time: ${formatTime(Date.now())} (Asia/Shanghai)`, `task: #${task.seq}`];
@@ -248,14 +260,11 @@ export function composePrompt(db: StateDb, task: TaskRow, workspace: string, att
   const project = task.project_id
     ? [`<project>\nid: ${task.project_id}\ndir: ${task.project_dir}\n${PROJECT_PRECEDENCE}\n</project>`]
     : [];
-  // Every bot reads the shared memory; any other bot's own facts follow, seen only by that bot.
-  const shared = readMemory(memoryPath(task.account_id)) || '(暂无)';
-  const own = bot.default ? '' : `\n\n${bot.name} 的记忆:\n${readMemory(memoryPath(task.account_id, bot)) || '(暂无)'}`;
   return [
     `<context>\n${context.join('\n')}\n</context>`,
     formatPersona(bots, bot, all),
     ...project,
-    `<memory>\n${shared}${own}\n</memory>`,
+    `<memory>\n${formatMemories(memories)}\n</memory>`,
     `<recent_tasks>\n${formatRecentTasks(recent, defaultBot(bots).id)}\n</recent_tasks>`,
     ...lastHandoff(task, recent.at(-1)),
     `<user_message>\n${input}\n</user_message>`,
@@ -548,6 +557,8 @@ function commentaryNotes(task: TaskRow, io: TaskIO, running: () => boolean) {
  * the cooldown is over, and the user gets one notice when that begins. While it runs, what the orchestrator writes on
  * a step that calls a tool reaches the user best-effort (commentaryNotes); the bridge's own progress notes
  * (progressNotes) are diagnostics behind OWB_PROGRESS_ENABLED.
+ * Memory lives in the owner's agentmemory engine: the memories that match the message go into every attempt's prompt,
+ * and a done task's WECHAT_MEMORY facts are saved there, unless io.readOnlyMemory (agentmemory.ts).
  * A task that was finished elsewhere meanwhile (/stop, restart) is not reported again.
  */
 export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: AbortSignal): Promise<void> {
@@ -571,12 +582,16 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
   };
   // Where the task runs, and so where the files it sends must be.
   let workspace = '';
+  // The owner's memories the prompt shows, searched once before the first attempt.
+  let memories: Memory[] = [];
   try {
     pruneAttachments();
     const user = db.getUser(task.account_id);
     // A project task opens at the repo root, so OpenCode loads that repo's AGENTS.md and opencode.json.
     workspace = task.project_dir || user?.workspace || loadConfig().workingDirectory;
     const attachments = resolveAttachments(db, task);
+    // An image alone has no words to search with.
+    memories = await searchMemories(task.input === IMAGE_ONLY_INPUT ? '' : task.input);
     // /stop and restarts finish the task elsewhere; only a failing or silent model is worth a second try.
     const running = () => !signal.aborted && db.getTask(task.id)?.status === 'running';
     const onProgress = progressEnabled() ? progressNotes(task, io, running) : undefined;
@@ -585,7 +600,7 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
       model = next;
       attempts++;
       const out = await openCodeQuery({
-        prompt: composePrompt(db, task, workspace, attachments, retry),
+        prompt: composePrompt(db, task, workspace, attachments, { retry, memories }),
         cwd: workspace,
         agent: task.lane === 'read' ? ORCHESTRATOR_READ_AGENT : ORCHESTRATOR_AGENT,
         model: next,
@@ -672,6 +687,7 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
 
   // Queued ahead of the outcome, so the user reads the notice before the answer.
   if (notice) db.addNotice(task.account_id, notice);
+  let saving: Promise<void> | undefined;
   if (result.interrupted) {
     if (!db.finishTask(task.id, 'interrupted', { error: result.error, usage })) return;
   } else if (result.error) {
@@ -686,10 +702,13 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
     const note = dropped.length ? `（有 ${dropped.length} 个附件未发送：路径不在工作区、类型/大小不支持或超过 ${MAX_FILES} 个）` : '';
     const reply = [output.reply, note].filter(Boolean).join('\n');
     if (!db.finishTask(task.id, 'done', { result: reply, summary: output.summary, handoff: output.handoff, files, usage })) return;
-    try {
-      appendMemory(memoryPath(task.account_id, resolveBot(task.bot_id).bot), output.memory);
-    } catch (err) {
-      logger.warn('Failed to update memory', { taskId: task.id, error: String(err) });
+    if (!io.readOnlyMemory) {
+      // Only a memory the prompt showed whole may be replaced. The writes run beside the delivery, so the reply never
+      // waits for the memory engine.
+      const updatable = new Set(memories.filter((m) => m.full).map((m) => m.id));
+      saving = saveMemories(output.memory, updatable).then((writes) => {
+        if (writes.saved || writes.updated || writes.failed) logger.info('Memory written', { taskId: task.id, seq: task.seq, ...writes });
+      });
     }
   }
 
@@ -706,5 +725,10 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
     errorKind: result.errorKind,
     usage,
   });
-  await io.deliver(finished);
+  try {
+    await io.deliver(finished);
+  } finally {
+    // The lane takes its next task only once this one's memory is written, so that task can find it.
+    await saving;
+  }
 }

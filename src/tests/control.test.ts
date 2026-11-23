@@ -1,8 +1,8 @@
 // /doctor: one line per thing the daemon depends on, from OpenCode and its agents to the bot's own state, then how
 // many need attention; /panic: every task stopped or cancelled, every ask denied, plan mode, every routine off;
-// /cancel: one queued task off the queue; /steer: a correction into a running task's session, the queue untouched.
+// /cancel: one queued task off the queue; /steer: the running task a correction is for, which the task itself takes in.
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -27,9 +27,7 @@ writeFileSync(join(tmp, '.wechat-opencode-bot', 'config.env'), `workingDirectory
 
 /** The fake OpenCode's agents: a built-in and config/agents without wechat-explore. */
 const AGENTS = ['build', 'wechat-orchestrator', 'wechat-orchestrator-read', 'wechat-general'];
-/** A session the fake OpenCode no longer has, as after retention deleted it. */
-const GONE = 'ses_gone';
-/** The prompts /steer sent, by session. */
+/** The prompts any session got: /steer must send none itself. */
 const prompts: Array<{ session: string; text: string; delivery: string }> = [];
 const server = createServer((req, res) => {
   const send = (body: unknown) => void res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(body));
@@ -40,10 +38,8 @@ const server = createServer((req, res) => {
   let body = '';
   req.on('data', (chunk) => (body += chunk));
   req.on('end', () => {
-    const session = decodeURIComponent(prompt[1]);
-    if (session === GONE) return void res.writeHead(404).end(JSON.stringify({ name: 'SessionNotFoundError' }));
     const { text, delivery } = JSON.parse(body);
-    prompts.push({ session, text, delivery });
+    prompts.push({ session: decodeURIComponent(prompt[1]), text, delivery });
     send({ data: { id: `msg_${prompts.length}`, time: { created: Date.now() } } });
   });
 });
@@ -308,51 +304,35 @@ test('/cancel takes one queued task off the queue, and says why when it cannot',
   assert.match(await routeCommand('/help', ctx), /^ {2}\/cancel <编号> {4}取消一个排队中的任务$/m);
 });
 
-test('/steer sends a correction into the running task\'s session as delivery "steer", and leaves the queue alone', async () => {
+test('/steer picks the running task the correction is for, and refuses one with no runner to hand it to', async () => {
   const ctx = { accountId: 'steer', db } as CommandContext;
   const usage = '用法：/steer [#任务编号] <修正内容>，如 /steer #3 先别改测试；只有一个任务在运行时可省略编号';
-  const sent = (seq: number) => `🎯 已把修正发给任务 #${seq}，运行中会在下一个步骤采纳`;
+  const closed = (seq: number) => `⚠️ 任务 #${seq} 已经在给出回复，修正没有发出；等它回复后再发消息`;
   assert.equal(await routeCommand('/steer', ctx), usage);
   assert.equal(await routeCommand('/steer #1', ctx), usage, 'the text is required');
   assert.equal(await routeCommand('/steer 先别改测试', ctx), '没有运行中的任务');
 
-  const write = db.createTask('steer', '修一下登录').task;
+  // Running rows with no runTask behind them, as a task looks once it has closed: it takes no correction.
+  db.createTask('steer', '修一下登录');
   db.claimNextTask('steer', 'write');
-  assert.equal(await routeCommand('/steer 先别改测试', ctx), '⚠️ 任务 #1 还没有会话，稍后再试');
-  db.setTaskSession(write.id, 'ses_write');
-  // The one running task needs no number.
-  assert.equal(await routeCommand('/steer 先别改测试，\n只看 src', ctx), sent(1));
-  assert.deepEqual(prompts.map((p) => [p.session, p.delivery]), [['ses_write', 'steer']]);
-  assert.match(prompts[0].text, /^<user_correction>\n先别改测试，\n只看 src\n<\/user_correction>\n\n/, 'line breaks kept');
-
+  assert.equal(await routeCommand('/steer 先别改测试', ctx), closed(1), 'the one running task needs no number');
   // A read-lane task runs beside it, and another write task waits behind the first.
-  const read = db.createTask('steer', '研究一下发布流程', null, undefined, 'research', 'read').task;
+  db.createTask('steer', '研究一下发布流程', null, undefined, 'research', 'read');
   db.claimNextTask('steer', 'read');
-  db.setTaskSession(read.id, 'ses_read');
   db.createTask('steer', '之后再做');
   assert.equal(
     await routeCommand('/steer 换个思路', ctx),
     ['有多个任务在运行，请用 /steer #编号 <内容> 指定：', '#1 chief：修一下登录', '#2 research：研究一下发布流程'].join('\n'),
   );
-  assert.equal(prompts.length, 1, 'nothing goes out without a target');
-  assert.equal(await routeCommand('/steer ＃2 换个思路', ctx), sent(2));
-  assert.deepEqual(prompts.slice(1).map((p) => [p.session, p.delivery]), [['ses_read', 'steer']]);
-  assert.match(prompts[1].text, /<user_correction>\n换个思路\n<\/user_correction>/);
+  assert.equal(await routeCommand('/steer ＃2 换个思路', ctx), closed(2));
   for (const seq of [3, 7]) {
     assert.equal(await routeCommand(`/steer #${seq} 换个思路`, ctx), `⚠️ 任务 #${seq} 没有在运行，发送 /status 查看`);
   }
-
-  // OpenCode no longer has the session: the reply says the correction did not go out.
-  db.setTaskSession(read.id, GONE);
-  assert.equal(
-    await routeCommand('/steer #2 换个思路', ctx),
-    `⚠️ 修正没有发出：POST /api/session/${GONE}/prompt -> HTTP 404: {"name":"SessionNotFoundError"}`,
+  assert.equal(prompts.length, 0, 'the runner steers, never the command itself');
+  assert.deepEqual(
+    db.recentTasks('steer', 10).map((t) => [t.seq, t.status, t.input]),
+    [[3, 'queued', '之后再做'], [2, 'running', '研究一下发布流程'], [1, 'running', '修一下登录']],
+    'no new task, and no input changed',
   );
-  assert.equal(prompts.length, 2);
-  assert.deepEqual(db.recentTasks('steer', 10).map((t) => [t.seq, t.status]), [[3, 'queued'], [2, 'running'], [1, 'running']], 'no new task');
-  const logs = join(tmp, '.wechat-opencode-bot', 'logs');
-  const log = readdirSync(logs).map((name) => readFileSync(join(logs, name), 'utf-8')).join('');
-  assert.match(log, /INFO Steer sent \{"taskId":"[^"]+","seq":1,"sessionId":"ses_write"\}/);
-  assert.ok(!log.includes('先别改测试') && !log.includes('换个思路'), 'the correction is the user\'s, like a message');
   assert.match(await routeCommand('/help', ctx), /^ {2}\/steer \[#编号\] <内容> {2}给运行中的任务发修正/m);
 });

@@ -5,7 +5,7 @@ import { ALL_BOTS, botAliases, defaultBot, detectBot, loadBots, type Bot } from 
 import { loadConfig } from './config.js';
 import { DATA_DIR } from './constants.js';
 import { logger } from './logger.js';
-import type { StateDb, TaskProject } from './tasks/db.js';
+import type { StateDb, TaskProject, TaskRow } from './tasks/db.js';
 
 /**
  * A repo a task can run in. The registry only routes messages: the task's session opens at the
@@ -243,12 +243,14 @@ export function stripProjectPrefix(text: string, project: Project): string {
  * message that opens with "@project" or "@base" may name its bot right after it: "@miaoda @eng …".
  * A short follow-up such as "继续" that names no bot stays with the last task's bot, as it stays in
  * the last task's project; "新话题：…" follows neither. No project means the account's workspace.
+ * follows is that last task when the message is a follow-up of it with the same bot and project: the daemon then
+ * joins the message to that task, or continues its session.
  */
 export function routeMessage(
   db: StateDb,
   accountId: string,
   text: string,
-): { input: string; project?: TaskProject; botId: string } {
+): { input: string; project?: TaskProject; botId: string; follows?: TaskRow } {
   const bots = loadBots();
   const topic = NEW_TOPIC.exec(text);
   const message = (topic && text.slice(topic[0].length).trim()) || text;
@@ -262,11 +264,15 @@ export function routeMessage(
   const last = topic ? undefined : db.recentTasks(accountId, 1)[0];
   const recent = last && Date.now() - last.created_at <= FOLLOW_UP_MS ? last : undefined;
   const project = detectProject(rest, loadProjects(base, PROJECTS_PATH, bots), recent?.project_id);
-  const routed = withBot(project ? stripProjectPrefix(rest, project) : rest);
+  const routed: { input: string; botId: string; follows?: TaskRow } = withBot(project ? stripProjectPrefix(rest, project) : rest);
   // A follow-up opens with its cue, so no "@project" and no "@bot" stands before it.
   const lastBot = recent?.bot_id;
   if (!opened && lastBot && isFollowUp(rest) && (lastBot === ALL_BOTS || bots.some((bot) => bot.id === lastBot))) {
     routed.botId = lastBot;
   }
+  // Rows from before bots went to the default bot.
+  const sameWork =
+    recent && routed.botId === (recent.bot_id ?? defaultBot(bots).id) && (project?.id ?? null) === recent.project_id;
+  if (sameWork && isFollowUp(rest)) routed.follows = recent;
   return project ? { ...routed, project: { id: project.id, dir: resolveProjectDir(base, project) } } : routed;
 }

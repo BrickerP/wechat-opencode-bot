@@ -1,6 +1,6 @@
-// What a task leaves the next one and what it used: the handoff the orchestrator writes after its summary, the
-// <last_handoff> block the next task's prompt carries while it is fresh, the v9 columns that store both, and the
-// tokens and cost /status and /tasks show.
+// What a task records and what its prompts carry: the reply, memory and summary sections the orchestrator ends with,
+// the v9 usage columns and the tokens and cost /status and /tasks show, a follow-up's text joined to the task it
+// follows, a follow-up task created with the session it continues, and the prompts of a continued session.
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -15,12 +15,12 @@ process.env.HOME = tmp;
 process.env.OWB_DATA_DIR = join(tmp, 'data');
 
 const { openStateDb } = await import('../tasks/db.js');
-const { composePrompt, parseOrchestratorOutput, SESSION_READER, stripToolMarkup } = await import('../orchestrator.js');
+const { composeContinuation, composePrompt, composeRetry, composeSteer, parseOrchestratorOutput, SESSION_READER, stripToolMarkup } =
+  await import('../orchestrator.js');
 const { formatStatus, formatTasks } = await import('../commands/handlers.js');
 
 const MINUTE = 60 * 1000;
 const HOUR = 60 * MINUTE;
-const HANDOFF = 'files: /repo/src/parser.ts\ncommands: npm test\nopen: 两个用例还没跑\nnext: 修 parser 的边界情况';
 const none = { paths: [], carried: false };
 
 const file = join(tmp, 'state.db');
@@ -32,65 +32,36 @@ after(() => {
   rmSync(tmp, { recursive: true, force: true });
 });
 
-/** A done task of the account, with the given handoff and usage, that finished at the given time. */
-function finished(account: string, fields: { handoff?: string; usage?: TaskUsage } = {}, at = Date.now()): TaskRow {
+/** A done task of the account, with the given usage, that finished at the given time. */
+function finished(account: string, fields: { usage?: TaskUsage } = {}, at = Date.now()): TaskRow {
   const task = db.startTaskNow(account, '改 parser')!;
   db.finishTask(task.id, 'done', { result: 'ok', summary: '改了 parser', ...fields });
   raw.prepare('UPDATE tasks SET finished_at = ? WHERE id = ?').run(at, task.id);
   return db.getTask(task.id)!;
 }
 
-/** An answer with the reply, memory and summary sections, then rest. */
-const answer = (rest = '') => `<<<WECHAT_REPLY>>>\n改好了\n<<<WECHAT_MEMORY>>>\n- 无\n<<<WECHAT_SUMMARY>>>\n修了 parser${rest}`;
-
-test('the handoff is what follows its marker, and the reply, memory and summary stop before it', () => {
-  const text = `<<<WECHAT_REPLY>>>\n改好了\n<<<WECHAT_MEMORY>>>\n- 用户喜欢简短的回复\n<<<WECHAT_SUMMARY>>>\n修了 parser\n<<<WECHAT_HANDOFF>>>\n${HANDOFF}\n`;
-  assert.deepEqual(parseOrchestratorOutput(text), {
-    reply: '改好了',
-    memory: ['用户喜欢简短的回复'],
-    summary: '修了 parser',
-    handoff: HANDOFF,
-    files: [],
-  });
+test('the reply, the memory and the summary each run to the next marker', () => {
+  const text = '<<<WECHAT_REPLY>>>\n改好了\n<<<WECHAT_MEMORY>>>\n- 用户喜欢简短的回复\n<<<WECHAT_SUMMARY>>>\n修了 parser\n';
+  assert.deepEqual(parseOrchestratorOutput(text), { reply: '改好了', memory: ['用户喜欢简短的回复'], summary: '修了 parser', files: [] });
 });
 
-test('an answer without a handoff marker has no handoff, and "-" or "无" after the marker means none too', () => {
-  const plain = parseOrchestratorOutput(answer());
-  assert.equal(plain.handoff, '');
-  assert.equal(plain.summary, '修了 parser');
-  for (const empty of ['-', '- 无', '无', '  -  ', '']) {
-    const out = parseOrchestratorOutput(answer(`\n<<<WECHAT_HANDOFF>>>\n${empty}\n`));
-    assert.equal(out.handoff, '', JSON.stringify(empty));
-    assert.equal(out.summary, '修了 parser');
-  }
-});
-
-test('the last handoff marker counts: a draft or a reply that quotes one does not cut the answer short', () => {
+test('the last summary marker counts: a draft or a reply that quotes one does not cut the answer short', () => {
   const out = parseOrchestratorOutput(
     [
-      '先打个草稿 <<<WECHAT_REPLY>>> 草稿 <<<WECHAT_HANDOFF>>> next: 草稿里的',
+      '先打个草稿 <<<WECHAT_REPLY>>> 草稿 <<<WECHAT_SUMMARY>>> 草稿里的',
       '<<<WECHAT_REPLY>>>',
-      '交接标记写作 <<<WECHAT_HANDOFF>>>，放在摘要后面',
+      '摘要标记写作 <<<WECHAT_SUMMARY>>>，放在记忆后面',
       '<<<WECHAT_MEMORY>>>',
       '- 无',
       '<<<WECHAT_SUMMARY>>>',
-      '解释了交接标记',
-      '<<<WECHAT_HANDOFF>>>',
-      'next: 等用户确认',
+      '解释了摘要标记',
     ].join('\n'),
   );
-  assert.equal(out.reply, '交接标记写作 <<<WECHAT_HANDOFF>>>，放在摘要后面');
-  assert.equal(out.summary, '解释了交接标记');
-  assert.equal(out.handoff, 'next: 等用户确认');
+  assert.equal(out.reply, '摘要标记写作 <<<WECHAT_SUMMARY>>>，放在记忆后面');
+  assert.equal(out.summary, '解释了摘要标记');
 });
 
-test('a long handoff is clipped to 1200 characters, its lines trimmed and its blank lines dropped', () => {
-  const out = parseOrchestratorOutput(answer(`\n<<<WECHAT_HANDOFF>>>\n\n  files: a.ts  \n\n   \nnext: ${'很'.repeat(2000)}\n`));
-  assert.equal(out.handoff.length, 1200);
-  assert.match(out.handoff, /^files: a\.ts\nnext: 很+$/);
-});
-
-test('a v8 database gains the handoff and usage columns and keeps its rows', () => {
+test('a v8 database gains the usage columns, and the handoff column older binaries read, and keeps its rows', () => {
   const v8 = join(tmp, 'v8.db');
   const { task } = openStateDb(v8).createTask('acc', 'old task');
   const old = new DatabaseSync(v8);
@@ -104,14 +75,14 @@ test('a v8 database gains the handoff and usage columns and keeps its rows', () 
   assert.equal((old.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 10);
   old.close();
   const row = migrated.getTask(task.id)!;
-  assert.deepEqual([row.input, row.handoff, row.tokens_in, row.tokens_out, row.cost_usd], ['old task', null, null, null, null]);
+  assert.deepEqual([row.input, row.tokens_in, row.tokens_out, row.cost_usd], ['old task', null, null, null]);
 });
 
-test('finishTask stores the handoff and the usage, the usage even when /stop finished the task first', () => {
-  const done = finished('fin', { handoff: HANDOFF, usage: { input: 5000, output: 250, cost: 0.25 } });
-  assert.deepEqual([done.handoff, done.tokens_in, done.tokens_out, done.cost_usd], [HANDOFF, 5000, 250, 0.25]);
-  const bare = finished('fin', { handoff: '' });
-  assert.deepEqual([bare.handoff, bare.tokens_in, bare.tokens_out, bare.cost_usd], [null, null, null, null], 'unknown, not 0');
+test('finishTask stores the usage, even when /stop finished the task first', () => {
+  const done = finished('fin', { usage: { input: 5000, output: 250, cost: 0.25 } });
+  assert.deepEqual([done.tokens_in, done.tokens_out, done.cost_usd], [5000, 250, 0.25]);
+  const bare = finished('fin');
+  assert.deepEqual([bare.tokens_in, bare.tokens_out, bare.cost_usd], [null, null, null], 'unknown, not 0');
   const stopped = db.startTaskNow('fin', '跑测试')!;
   assert.ok(db.finishTask(stopped.id, 'interrupted', { error: '用户停止', notified: true }));
   assert.equal(db.finishTask(stopped.id, 'interrupted', { error: 'aborted', usage: { input: 10, output: 2, cost: 0 } }), false);
@@ -130,31 +101,6 @@ test('usageSince sums what the tasks that finished since then used, and is 0 whe
   assert.deepEqual({ ...db.usageSince('nobody', 0) }, { input: 0, output: 0, cost: 0 });
 });
 
-test('the next task gets the handoff the task right before it left, while under 2 hours old', () => {
-  const previous = finished('chat', { handoff: HANDOFF }, Date.now() - 90 * MINUTE);
-  const prompt = composePrompt(db, db.createTask('chat', '继续').task, tmp, none);
-  const block = `<last_handoff>\ntask: #${previous.seq}\n${HANDOFF}\n</last_handoff>`;
-  assert.ok(prompt.includes(`</recent_tasks>\n\n${block}\n\n<user_message>\n继续\n</user_message>`), prompt);
-});
-
-test('no handoff block when it is stale, when the task right before left none, for a routine or for a first task', () => {
-  finished('stale', { handoff: HANDOFF }, Date.now() - 2 * HOUR - MINUTE);
-  finished('gap', { handoff: HANDOFF });
-  finished('gap');
-  finished('rt', { handoff: HANDOFF });
-  const routine = db.addRoutine('rt', { name: '日报', prompt: '写日报', schedule: 'daily09:00', nextRunAt: Date.now() })!;
-  const prompts = {
-    stale: composePrompt(db, db.createTask('stale', '继续').task, tmp, none),
-    gap: composePrompt(db, db.createTask('gap', '继续').task, tmp, none),
-    routine: composePrompt(db, db.createTask('rt', '写日报', null, undefined, undefined, 'write', routine.id).task, tmp, none),
-    first: composePrompt(db, db.createTask('first', '你好').task, tmp, none),
-  };
-  for (const [name, prompt] of Object.entries(prompts)) {
-    assert.doesNotMatch(prompt, /<last_handoff>/, name);
-    assert.ok(!prompt.includes(HANDOFF), name);
-  }
-});
-
 test("<recent_tasks> shows each task's session id, and <context> names this build's session reader", () => {
   const recalled = finished('ids');
   db.setTaskSession(recalled.id, 'ses_recall');
@@ -164,6 +110,7 @@ test("<recent_tasks> shows each task's session id, and <context> names this buil
   const tasks = prompt.split('\n').filter((line) => /^#\d+ /.test(line));
   assert.equal(tasks.filter((line) => line.includes('（会话 ')).length, 1, 'a task without a session shows none');
   assert.ok(prompt.split('\n').includes(`session-reader: node ${SESSION_READER} --session`), prompt);
+  assert.doesNotMatch(prompt, /<last_handoff>/, 'a follow-up continues the session instead');
 });
 
 test('/status shows the tokens of the last 24 hours, and their cost when there is one', () => {
@@ -177,17 +124,16 @@ test('/status shows the tokens of the last 24 hours, and their cost when there i
   assert.match(formatStatus(db, 'quiet'), /^📊 24h tokens: ↑0 ↓0$/m);
 });
 
-test('/tasks shows what each task used and the next step its handoff names', () => {
-  finished('list', { handoff: `files: a.ts\nnext: ${'修'.repeat(70)}`, usage: { input: 5_000, output: 250, cost: 0.25 } });
+test('/tasks shows what each task used, and its summary', () => {
+  finished('list', { usage: { input: 5_000, output: 250, cost: 0.25 } });
   finished('list', { usage: { input: 23_456, output: 2_500, cost: 0 } });
   finished('list');
   const lines = formatTasks(db, 'list', 5).split('\n');
-  assert.equal(lines.length, 7, lines.join('\n'));
+  assert.equal(lines.length, 6, lines.join('\n'));
   assert.match(lines[0], /^#3 .+\] 改 parser$/, 'no usage, no suffix');
   assert.match(lines[2], /^#2 .+\] 改 parser {2}↑23\.5k ↓2\.5k$/);
   assert.match(lines[4], /^#1 .+\] 改 parser {2}↑5k ↓250 \$0\.25$/);
   assert.equal(lines[5], '    改了 parser');
-  assert.equal(lines[6], `    ↳ next: ${'修'.repeat(60)}…`);
 });
 
 test('/tasks flags a task whose prompt tokens reach OWB_TASK_WARN_TOKENS, keeping its counts', () => {
@@ -204,19 +150,66 @@ test('/tasks flags a task whose prompt tokens reach OWB_TASK_WARN_TOKENS, keepin
   }
 });
 
-test('the reply is the last reply marker with text after it: an empty last section falls back to an earlier one', () => {
-  const out = parseOrchestratorOutput(
-    '<<<WECHAT_REPLY>>>\n第一版回复\n<<<WECHAT_REPLY>>>\n\n<<<WECHAT_MEMORY>>>\n- 无\n<<<WECHAT_SUMMARY>>>\n回答了\n<<<WECHAT_HANDOFF>>>\nnext: 无',
+test('a follow-up joins a task only while the task has one of the statuses given, on a line of its own', () => {
+  const { task } = db.createTask('join', '看下日志');
+  assert.equal(db.appendTaskInput(task.id, '还有 nginx 的', ['queued']), true);
+  assert.equal(db.getTask(task.id)!.input, '看下日志\n还有 nginx 的');
+  assert.equal(db.appendTaskInput(task.id, '晚了', ['running']), false, 'still queued');
+  db.claimNextTask('join', 'write');
+  assert.equal(db.appendTaskInput(task.id, '再看下 redis', ['queued']), false, 'started meanwhile');
+  assert.equal(db.appendTaskInput(task.id, '再看下 redis', ['running']), true);
+  db.finishTask(task.id, 'done', { result: 'ok' });
+  assert.equal(db.appendTaskInput(task.id, '太晚了', ['queued', 'running']), false);
+  assert.equal(db.getTask(task.id)!.input, '看下日志\n还有 nginx 的\n再看下 redis');
+});
+
+test('a follow-up task names the session it continues from the start; task_sessions keeps the task that ran there first', () => {
+  const first = finished('cont');
+  db.setTaskSession(first.id, 'ses_work');
+  const { task } = db.createTask('cont', '继续', 'msg-1', undefined, undefined, 'write', undefined, 'ses_work');
+  assert.equal(task.session_id, 'ses_work');
+  assert.equal(task.status, 'queued');
+  const owners = raw.prepare("SELECT task_id FROM task_sessions WHERE session_id = 'ses_work'").all().map((row) => row.task_id);
+  assert.deepEqual(owners, [first.id]);
+  assert.equal(db.createTask('cont', '新的').task.session_id, null, 'any other task starts without one');
+});
+
+test('a continued session gets what is new only: the time, the task number, the attachments, the memories, the message', () => {
+  const task = db.createTask('next', '[图片]').task;
+  const memories = [{ id: 'mem_a', text: '用户在 M5 上工作', full: true, date: '2026-11-18' }];
+  const prompt = composeContinuation(task, { paths: ['/data/attachments/x/image-1.png'], carried: false }, memories);
+  assert.match(
+    prompt,
+    new RegExp(
+      `^<context>\\ntime: .+ \\(Asia/Shanghai\\)\\ntask: #${task.seq}\\nattachments:\\n- /data/attachments/x/image-1\\.png\\n</context>\\n\\n` +
+        '<memory>\\n- \\[mem_a 2026-11-18\\] 用户在 M5 上工作\\n</memory>\\n\\n<user_message>\\n\\[图片\\] 请分析这张图片\\n</user_message>\\n\\n' +
+        'This message follows up on the work in this session\\.',
+    ),
   );
-  assert.deepEqual([out.reply, out.summary, out.handoff], ['第一版回复', '回答了', 'next: 无']);
+  assert.doesNotMatch(prompt, /<persona>|<recent_tasks>|<project>|workspace:/, 'the session has those already');
+  assert.match(composeContinuation(db.createTask('next', '那第二个呢').task, none), /\n<memory>\n\(暂无\)\n<\/memory>\n/);
+});
+
+test('a retry names what stopped the attempt; a steer says that only the last answer reaches the user', () => {
+  const retry = composeRetry(`上游模型 120 秒无响应${'。'.repeat(300)}`);
+  assert.match(retry, /^<retry>\nYour previous attempt stopped: 上游模型 120 秒无响应。+…\n<\/retry>\n\n/);
+  assert.match(retry, /Check the current state, then continue from where it stopped instead of starting over/);
+  const steer = composeSteer('先别改测试，\n只看 src');
+  assert.match(steer, /^<user_correction>\n先别改测试，\n只看 src\n<\/user_correction>\n\n/, 'line breaks kept');
+  assert.match(steer, /Only your last answer reaches the user, so if you have already answered, answer again in full/);
+});
+
+test('the reply is the last reply marker with text after it: an empty last section falls back to an earlier one', () => {
+  const out = parseOrchestratorOutput('<<<WECHAT_REPLY>>>\n第一版回复\n<<<WECHAT_REPLY>>>\n\n<<<WECHAT_MEMORY>>>\n- 无\n<<<WECHAT_SUMMARY>>>\n回答了');
+  assert.deepEqual([out.reply, out.summary], ['第一版回复', '回答了']);
 });
 
 test('when every reply section is empty, the text before the first reply marker is the reply', () => {
   const answerFirst = '那个 medo 架构的学习 session 讲了三层：\n1. 网关\n2. 服务\n3. 存储\n';
   const out = parseOrchestratorOutput(
-    `${answerFirst}<<<WECHAT_REPLY>>>\n\n<<<WECHAT_MEMORY>>>\n- 用户在学 medo 架构\n<<<WECHAT_SUMMARY>>>\n总结了 medo 架构\n<<<WECHAT_HANDOFF>>>\n-`,
+    `${answerFirst}<<<WECHAT_REPLY>>>\n\n<<<WECHAT_MEMORY>>>\n- 用户在学 medo 架构\n<<<WECHAT_SUMMARY>>>\n总结了 medo 架构`,
   );
-  assert.deepEqual(out, { reply: answerFirst.trim(), memory: ['用户在学 medo 架构'], summary: '总结了 medo 架构', handoff: '', files: [] });
+  assert.deepEqual(out, { reply: answerFirst.trim(), memory: ['用户在学 medo 架构'], summary: '总结了 medo 架构', files: [] });
   assert.equal(parseOrchestratorOutput('  \n<<<WECHAT_REPLY>>>\n<<<WECHAT_SUMMARY>>>\nx').reply, '', 'nothing before it either');
   assert.equal(parseOrchestratorOutput('<<<WECHAT_SUMMARY>>>\n<<<WECHAT_REPLY>>>\n').reply, '', 'markers only');
   assert.equal(parseOrchestratorOutput('没有标记的整段回复').reply, '没有标记的整段回复');
@@ -225,16 +218,12 @@ test('when every reply section is empty, the text before the first reply marker 
 /** A DeepSeek tool-call tag as it leaks into an answer: "<｜｜DSML｜｜invoke>" or "</｜｜DSML｜｜ invoke>". */
 const dsml = (name: string, close = false) => (close ? `</｜｜DSML｜｜ ${name}>` : `<｜｜DSML｜｜${name}>`);
 
-test('DeepSeek tool markup is stripped from the handoff, the reply and the memory, and a handoff left as "-" is none', () => {
-  const closers = ['parameter', 'invoke', 'calls'].map((name) => dsml(name, true)).join('\n');
-  const tail = parseOrchestratorOutput(answer(`\n<<<WECHAT_HANDOFF>>>\n${HANDOFF}\n${closers}\n`));
-  assert.equal(tail.handoff, HANDOFF, 'stray closing tags after the handoff');
-
+test('DeepSeek tool markup is stripped from the reply, the memory and the summary', () => {
   const call = `${dsml('calls')}${dsml('invoke')}${dsml('parameter')}path${dsml('parameter', true)}${dsml('invoke', true)}${dsml('calls', true)}`;
   const out = parseOrchestratorOutput(
-    `<<<WECHAT_REPLY>>>\n改好了\n${call}\n\n\n\n还剩一个用例\n<<<WECHAT_MEMORY>>>\n- 用户喜欢简短的回复${dsml('invoke', true)}\n<<<WECHAT_SUMMARY>>>\n修了 parser\n<<<WECHAT_HANDOFF>>>\n- ${dsml('calls', true)}\n`,
+    `<<<WECHAT_REPLY>>>\n改好了\n${call}\n\n\n\n还剩一个用例\n<<<WECHAT_MEMORY>>>\n- 用户喜欢简短的回复${dsml('invoke', true)}\n<<<WECHAT_SUMMARY>>>\n修了 parser${dsml('calls', true)}\n`,
   );
-  assert.deepEqual(out, { reply: '改好了\n\n还剩一个用例', memory: ['用户喜欢简短的回复'], summary: '修了 parser', handoff: '', files: [] });
+  assert.deepEqual(out, { reply: '改好了\n\n还剩一个用例', memory: ['用户喜欢简短的回复'], summary: '修了 parser', files: [] });
 });
 
 test('stripToolMarkup leaves text without the markup as it is, trimmed', () => {

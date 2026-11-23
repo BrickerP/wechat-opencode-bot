@@ -8,7 +8,7 @@ import { loadConfig } from './config.js';
 import { DATA_DIR } from './constants.js';
 import { logger } from './logger.js';
 import { breaker, checkFallback, DEFAULT_MODEL, providerOf, type FallbackCheck } from './model-routing.js';
-import { openCodeQuery, type PermissionDecision, type PermissionRequest, type QueryResult, type Usage } from './opencode/provider.js';
+import { openCodeQuery, type FollowUps, type PermissionDecision, type PermissionRequest, type QueryResult, type Usage } from './opencode/provider.js';
 import { isRealPathInside } from './projects.js';
 import type { StateDb, TaskRow, TaskStatus, TaskUsage } from './tasks/db.js';
 
@@ -20,14 +20,10 @@ export const ORCHESTRATOR_READ_AGENT = 'wechat-orchestrator-read';
 const RECENT_TASKS = 8;
 const MAX_SUMMARY_CHARS = 100;
 const MAX_ERROR_CHARS = 200;
-const MAX_HANDOFF_CHARS = 1200;
-/** How long a handoff stays fresh: the same 2 hours in which projects.ts still routes "继续" after the last task. */
-const HANDOFF_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 
 const REPLY_MARKER = '<<<WECHAT_REPLY>>>';
 const MEMORY_MARKER = '<<<WECHAT_MEMORY>>>';
 const SUMMARY_MARKER = '<<<WECHAT_SUMMARY>>>';
-const HANDOFF_MARKER = '<<<WECHAT_HANDOFF>>>';
 const FILES_MARKER = '<<<WECHAT_FILES>>>';
 
 /** The files a task may send after its text, and the size of each. */
@@ -118,9 +114,13 @@ function attachmentPaths(taskId: string): string[] {
   return existsSync(dir) ? readdirSync(dir).sort().map((name) => join(dir, name)) : [];
 }
 
-function resolveAttachments(db: StateDb, task: TaskRow): Attachments {
+/**
+ * The task's own images, or with carry and none of its own those of the task right before it, when that came
+ * within CARRY_OVER_MS. A task that continues a session does not carry: that session has seen them already.
+ */
+function resolveAttachments(db: StateDb, task: TaskRow, carry = true): Attachments {
   const own = attachmentPaths(task.id);
-  if (own.length) return { paths: own, carried: false };
+  if (own.length || !carry) return { paths: own, carried: false };
   const [previous] = db.recentTasks(task.account_id, 1, task.id);
   if (previous && task.created_at - previous.created_at <= CARRY_OVER_MS) {
     const paths = attachmentPaths(previous.id);
@@ -214,15 +214,14 @@ function formatMemories(memories: Memory[]): string {
   return memories.map((m) => `- [${m.id}${m.date ? ` ${m.date}` : ''}] ${m.text}`).join('\n');
 }
 
-/**
- * The notes the task right before this one left, while fresh, so a follow-up such as "继续" picks up where it
- * stopped. A routine's task starts afresh: like its routing, it never follows the last task.
- */
-function lastHandoff(task: TaskRow, previous: TaskRow | undefined): string[] {
-  if (task.routine_id || !previous?.handoff || previous.finished_at === null) return [];
-  if (task.created_at - previous.finished_at > HANDOFF_MAX_AGE_MS) return [];
-  return [`<last_handoff>\ntask: #${previous.seq}\n${previous.handoff}\n</last_handoff>`];
-}
+/** The task's message as the prompt gives it: an image alone comes with the request to look at it. */
+const messageText = (task: TaskRow): string => (task.input === IMAGE_ONLY_INPUT ? `${IMAGE_ONLY_INPUT} 请分析这张图片` : task.input);
+
+/** The attachment lines of <context>. */
+const attachmentLines = (attachments: Attachments): string[] =>
+  attachments.paths.length
+    ? [`attachments${attachments.carried ? ' (from the previous message)' : ''}:`, ...attachments.paths.map((path) => `- ${path}`)]
+    : [];
 
 /** What composePrompt adds to the chat's own context. */
 export interface PromptOptions {
@@ -232,7 +231,7 @@ export interface PromptOptions {
   memories?: Memory[];
 }
 
-/** Each orchestrator session starts empty: everything it knows about the chat comes from this prompt. */
+/** A new orchestrator session starts empty: everything it knows about the chat comes from this prompt. */
 export function composePrompt(
   db: StateDb,
   task: TaskRow,
@@ -248,14 +247,8 @@ export function composePrompt(
   if (retry) {
     context.push('retry: an earlier attempt at this task stopped midway and may have made changes; check the current state before redoing anything that writes');
   }
-  if (attachments.paths.length) {
-    context.push(
-      `attachments${attachments.carried ? ' (from the previous message)' : ''}:`,
-      ...attachments.paths.map((path) => `- ${path}`),
-    );
-  }
+  context.push(...attachmentLines(attachments));
   const recent = db.recentTasks(task.account_id, RECENT_TASKS, task.id).reverse();
-  const input = task.input === IMAGE_ONLY_INPUT ? `${IMAGE_ONLY_INPUT} 请分析这张图片` : task.input;
   // The repo's own instructions reach the session through OpenCode, never through this prompt.
   const project = task.project_id
     ? [`<project>\nid: ${task.project_id}\ndir: ${task.project_dir}\n${PROJECT_PRECEDENCE}\n</project>`]
@@ -266,20 +259,44 @@ export function composePrompt(
     ...project,
     `<memory>\n${formatMemories(memories)}\n</memory>`,
     `<recent_tasks>\n${formatRecentTasks(recent, defaultBot(bots).id)}\n</recent_tasks>`,
-    ...lastHandoff(task, recent.at(-1)),
-    `<user_message>\n${input}\n</user_message>`,
+    `<user_message>\n${messageText(task)}\n</user_message>`,
   ].join('\n\n');
 }
 
 /**
- * What /steer sends into a running task's session. The session has the task's prompt already; the frame tells
- * the orchestrator that this changes that task, and that the answer keeps its format.
+ * The next turn of a session for a follow-up of the task that ran there. The session holds that work, its persona
+ * and project included, so only what is new comes: the time and task number, the attachments, the memories that
+ * match the new message, and the message.
+ */
+export function composeContinuation(task: TaskRow, attachments: Attachments, memories: Memory[] = []): string {
+  const context = [`time: ${formatTime(Date.now())} (Asia/Shanghai)`, `task: #${task.seq}`, ...attachmentLines(attachments)];
+  return [
+    `<context>\n${context.join('\n')}\n</context>`,
+    `<memory>\n${formatMemories(memories)}\n</memory>`,
+    `<user_message>\n${messageText(task)}\n</user_message>`,
+    'This message follows up on the work in this session. Answer it in the output format as before.',
+  ].join('\n\n');
+}
+
+/** The next turn of a session after an attempt that stopped: what stopped it, and to check before redoing anything. */
+export function composeRetry(error: string): string {
+  return [
+    `<retry>\nYour previous attempt stopped: ${clip(error, MAX_ERROR_CHARS)}\n</retry>`,
+    'It may already have changed files or started work, and its last step may be cut off. Check the current state, ' +
+      'then continue from where it stopped instead of starting over. Answer in the output format as before.',
+  ].join('\n\n');
+}
+
+/**
+ * What a follow-up or /steer sends into a running task's session. The session has the task's prompt already; the
+ * frame tells the orchestrator that this changes that task, and that only its last answer reaches the user.
  */
 export function composeSteer(text: string): string {
   return [
     `<user_correction>\n${text}\n</user_correction>`,
-    'The user sent this correction while the task runs. It changes the task in <user_message>: apply it from here on, ' +
-      'and check work already done or delegated where it matters. End the run with the four markers as usual.',
+    'The user sent this while the task runs. It changes the task in <user_message>: apply it from here on, ' +
+      'and check work already done or delegated where it matters. Only your last answer reaches the user, so if you ' +
+      'have already answered, answer again in full, in the output format as before.',
   ].join('\n\n');
 }
 
@@ -289,8 +306,6 @@ export interface OrchestratorOutput {
   reply: string;
   memory: string[];
   summary: string;
-  /** Notes for the next task, never part of the reply; '' when there are none. */
-  handoff: string;
   /** Paths to send after the reply, as listed and not yet checked (checkTaskFiles); [] when there are none. */
   files: string[];
 }
@@ -301,12 +316,6 @@ function section(body: string, start: number, ...markers: number[]): string {
 }
 
 const trimmedLines = (text: string): string[] => text.split('\n').map((line) => line.trim());
-
-/** The handoff's lines, trimmed and without blank ones; "-", "无" or "- 无" means there is none. */
-function cleanHandoff(text: string): string {
-  const handoff = trimmedLines(text).filter(Boolean).join('\n').slice(0, MAX_HANDOFF_CHARS).trim();
-  return /^(?:-\s*)?(?:无)?$/.test(handoff) ? '' : handoff;
-}
 
 /** One path per line, without a "-" bullet or backticks; "-" or "无" means there are none. A repeated path counts once. */
 function cleanFiles(text: string): string[] {
@@ -335,22 +344,21 @@ export function stripToolMarkup(text: string): string {
     .trim();
 }
 
-/** Where the sections of an answer start: the first memory and summary markers, the last handoff marker and the files marker after them. */
+/** Where the sections of an answer start: the first memory marker, the last summary marker and the files marker after them. */
 function sectionStarts(body: string) {
   const memoryAt = body.indexOf(MEMORY_MARKER);
-  const summaryAt = body.indexOf(SUMMARY_MARKER);
-  // The handoff ends the required sections, so its last marker counts: one the reply quotes cannot cut the reply short.
-  const handoffAt = body.lastIndexOf(HANDOFF_MARKER);
+  // The summary ends the required sections, so its last marker counts: one the reply quotes cannot cut the reply short.
+  const summaryAt = body.lastIndexOf(SUMMARY_MARKER);
   // The files come after every other section and run to the end; a files marker before one of them is quoted.
   const lastFilesAt = body.lastIndexOf(FILES_MARKER);
-  const filesAt = lastFilesAt > Math.max(memoryAt, summaryAt, handoffAt) ? lastFilesAt : -1;
-  return { memoryAt, summaryAt, handoffAt, filesAt };
+  const filesAt = lastFilesAt > Math.max(memoryAt, summaryAt) ? lastFilesAt : -1;
+  return { memoryAt, summaryAt, filesAt };
 }
 
 /** The reply part of an answer body: its text up to the first section marker. */
 function replyOf(body: string): string {
-  const { memoryAt, summaryAt, handoffAt, filesAt } = sectionStarts(body);
-  return section(body, 0, memoryAt, summaryAt, handoffAt, filesAt);
+  const { memoryAt, summaryAt, filesAt } = sectionStarts(body);
+  return section(body, 0, memoryAt, summaryAt, filesAt);
 }
 
 /** Where each reply marker starts, first to last. */
@@ -361,11 +369,11 @@ function replyMarkers(text: string): number[] {
 }
 
 /**
- * Split the orchestrator's answer into the WeChat reply, new memory facts, a one-line summary, the handoff and the
- * files. The sections follow the last reply marker, so a marker quoted in a draft cannot cut the answer. The reply
- * is the last reply marker's text that is not empty, each running to the next marker; when every one is empty, the
- * model wrote its answer before the markers, and the text before the first one is the reply. No marker: the whole
- * text is the reply. DeepSeek tool-call markup is stripped from every field but the files.
+ * Split the orchestrator's answer into the WeChat reply, new memory facts, a one-line summary and the files. The
+ * sections follow the last reply marker, so a marker quoted in a draft cannot cut the answer. The reply is the last
+ * reply marker's text that is not empty, each running to the next marker; when every one is empty, the model wrote
+ * its answer before the markers, and the text before the first one is the reply. No marker: the whole text is the
+ * reply. DeepSeek tool-call markup is stripped from every field but the files.
  */
 export function parseOrchestratorOutput(text: string): OrchestratorOutput {
   const stripped = new Set<string>();
@@ -377,7 +385,7 @@ export function parseOrchestratorOutput(text: string): OrchestratorOutput {
 
   const markers = replyMarkers(text);
   const body = markers.length ? text.slice(markers.at(-1)! + REPLY_MARKER.length) : text;
-  const { memoryAt, summaryAt, handoffAt, filesAt } = sectionStarts(body);
+  const { memoryAt, summaryAt, filesAt } = sectionStarts(body);
 
   let reply = '';
   for (let i = markers.length - 1; i >= 0 && !reply; i--) {
@@ -392,18 +400,16 @@ export function parseOrchestratorOutput(text: string): OrchestratorOutput {
   const memory =
     memoryAt === -1
       ? []
-      : trimmedLines(clean('memory', section(body, memoryAt + MEMORY_MARKER.length, summaryAt, handoffAt, filesAt)))
+      : trimmedLines(clean('memory', section(body, memoryAt + MEMORY_MARKER.length, summaryAt, filesAt)))
           .map((line) => /^[-*]\s+(.+)$/.exec(line)?.[1].trim() ?? '')
           .filter(Boolean);
   const summary =
     summaryAt === -1
       ? ''
-      : (trimmedLines(clean('summary', section(body, summaryAt + SUMMARY_MARKER.length, memoryAt, handoffAt, filesAt))).find(Boolean) ?? '');
-  const handoff =
-    handoffAt === -1 ? '' : cleanHandoff(clean('handoff', section(body, handoffAt + HANDOFF_MARKER.length, memoryAt, summaryAt, filesAt)));
+      : (trimmedLines(clean('summary', section(body, summaryAt + SUMMARY_MARKER.length, memoryAt, filesAt))).find(Boolean) ?? '');
   const files = filesAt === -1 ? [] : cleanFiles(body.slice(filesAt + FILES_MARKER.length));
   if (stripped.size) logger.warn('Stripped tool markup', { fields: [...stripped] });
-  return { reply, memory, summary: clip(summary || reply, MAX_SUMMARY_CHARS), handoff, files };
+  return { reply, memory, summary: clip(summary || reply, MAX_SUMMARY_CHARS), files };
 }
 
 /** The attachments a task may send, and the listed paths it may not, each with the reason. */
@@ -549,19 +555,56 @@ function commentaryNotes(task: TaskRow, io: TaskIO, running: () => boolean) {
   };
 }
 
+/** The follow-ups waiting for the open tasks of this process, by task id; see joinRunningTask. */
+const openTasks = new Map<string, string[]>();
+
 /**
- * Run one task in a fresh orchestrator session and report the outcome. The task runs on the chat's /model,
- * else its bot's model, else the orchestrator agent's own. A model whose gateway fails or goes silent gets
- * one retry on OPENCODE_FALLBACK_MODEL, if the server lists it at that moment, and the user hears only the
- * final outcome. Repeated upstream failures open that gateway's breaker: later tasks start on the fallback until
- * the cooldown is over, and the user gets one notice when that begins. While it runs, what the orchestrator writes on
- * a step that calls a tool reaches the user best-effort (commentaryNotes); the bridge's own progress notes
- * (progressNotes) are diagnostics behind OWB_PROGRESS_ENABLED.
- * Memory lives in the owner's agentmemory engine: the memories that match the message go into every attempt's prompt,
+ * Hand a follow-up or a /steer correction to a task this process is running. The task steers it into its session at
+ * the next poll, or gives it a turn of its own once the current turn has answered, so the task's one answer covers
+ * it. False once the task has closed: its answer is final, and the text needs a task of its own.
+ */
+export function joinRunningTask(taskId: string, text: string): boolean {
+  const waiting = openTasks.get(taskId);
+  if (!waiting) return false;
+  waiting.push(composeSteer(text));
+  return true;
+}
+
+/**
+ * Run one task and report the outcome. The task runs in a new orchestrator session, or, when it was created with
+ * the session of the task it follows up on, as that session's next turn; a session that is gone gets replaced by a
+ * new one. It runs on the chat's /model, else its bot's model, else the orchestrator agent's own. A model whose
+ * gateway fails or goes silent gets one retry on OPENCODE_FALLBACK_MODEL, if the server lists it at that moment:
+ * the same session switches to it and continues from where the attempt stopped, and the user hears only the final
+ * outcome. Repeated upstream failures open that gateway's breaker: later tasks start on the fallback until the
+ * cooldown is over, and the user gets one notice when that begins. Follow-ups that join the task while it runs
+ * (joinRunningTask) go into its session. While it runs, what the orchestrator writes on a step that calls a tool
+ * reaches the user best-effort (commentaryNotes); the bridge's own progress notes (progressNotes) are diagnostics
+ * behind OWB_PROGRESS_ENABLED.
+ * Memory lives in the owner's agentmemory engine: the memories that match the message go into the task's prompt,
  * and a done task's WECHAT_MEMORY facts are saved there, unless io.readOnlyMemory (agentmemory.ts).
  * A task that was finished elsewhere meanwhile (/stop, restart) is not reported again.
  */
 export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: AbortSignal): Promise<void> {
+  // Open for follow-ups from the start: nothing is awaited before this, so none falls between the claim and here.
+  const waiting: string[] = [];
+  openTasks.set(task.id, waiting);
+  const followUps: FollowUps = {
+    take: () => waiting.splice(0),
+    close: () => {
+      if (waiting.length) return false;
+      openTasks.delete(task.id);
+      return true;
+    },
+  };
+  try {
+    await runOpenTask(db, task, io, signal, followUps);
+  } finally {
+    openTasks.delete(task.id);
+  }
+}
+
+async function runOpenTask(db: StateDb, task: TaskRow, io: TaskIO, signal: AbortSignal, followUps: FollowUps): Promise<void> {
   let result: QueryResult;
   // The last attempt's model; undefined runs the orchestrator agent's own model, taken to be DEFAULT_MODEL.
   let model: string | undefined;
@@ -589,29 +632,54 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
     const user = db.getUser(task.account_id);
     // A project task opens at the repo root, so OpenCode loads that repo's AGENTS.md and opencode.json.
     workspace = task.project_dir || user?.workspace || loadConfig().workingDirectory;
-    const attachments = resolveAttachments(db, task);
+    // The session the work runs in: the one this task continues, if any, then the one its last attempt ran in.
+    let sessionId = task.session_id ?? undefined;
+    const attachments = resolveAttachments(db, task, sessionId === undefined);
     // An image alone has no words to search with.
     memories = await searchMemories(task.input === IMAGE_ONLY_INPUT ? '' : task.input);
     // /stop and restarts finish the task elsewhere; only a failing or silent model is worth a second try.
     const running = () => !signal.aborted && db.getTask(task.id)?.status === 'running';
     const onProgress = progressEnabled() ? progressNotes(task, io, running) : undefined;
     const onAssistantText = commentaryNotes(task, io, running);
-    const attempt = async (next: string | undefined, retry: boolean): Promise<QueryResult> => {
-      model = next;
-      attempts++;
-      const out = await openCodeQuery({
-        prompt: composePrompt(db, task, workspace, attachments, { retry, memories }),
+    const query = (prompt: string, next: string | undefined, session: string | undefined, retry: boolean) =>
+      openCodeQuery({
+        prompt,
         cwd: workspace,
         agent: task.lane === 'read' ? ORCHESTRATOR_READ_AGENT : ORCHESTRATOR_AGENT,
-        model: next,
+        // A continued session switches to this attempt's model; the agent's own counts as DEFAULT_MODEL there.
+        model: session ? next ?? DEFAULT_MODEL : next,
+        sessionId: session,
         title: `微信 #${task.seq}${retry ? ' 重试' : ''}: ${clip(task.input, 20)}`,
-        files: attachments.paths,
+        // A retry's session has the attachments already.
+        files: session && retry ? undefined : attachments.paths,
         signal,
         onPermission: (request) => decidePermission(request, io),
-        onSession: (sessionId) => db.setTaskSession(task.id, sessionId),
+        onSession: (id) => db.setTaskSession(task.id, id),
         onProgress,
         onAssistantText,
+        followUps,
       });
+    /**
+     * One attempt on model next. A retry (failed set) continues the failed attempt's session and a follow-up task the
+     * session it was created with, each with a short prompt; without a session to continue, or when it is gone, a new
+     * session gets the whole prompt.
+     */
+    const attempt = async (next: string | undefined, failed?: QueryResult): Promise<QueryResult> => {
+      model = next;
+      attempts++;
+      if (sessionId) {
+        const prompt = failed ? composeRetry(failed.error ?? '') : composeContinuation(task, attachments, memories);
+        const out = await query(prompt, next, sessionId, Boolean(failed));
+        addUsage(out.usage);
+        if (!out.gone) return out;
+        logger.warn('Session to continue is gone; starting a new one', { taskId: task.id, seq: task.seq, sessionId });
+      }
+      // The row as it is now: its input has the follow-ups that joined it, so the ones still waiting to be steered in
+      // are dropped rather than sent twice.
+      followUps.take();
+      const current = db.getTask(task.id) ?? task;
+      const out = await query(composePrompt(db, current, workspace, attachments, { retry: Boolean(failed), memories }), next, undefined, Boolean(failed));
+      sessionId = out.sessionId || undefined;
       addUsage(out.usage);
       return out;
     };
@@ -649,7 +717,7 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
         model: fallback,
       });
     }
-    result = await attempt(usedFallback ? fallback : primary, false);
+    result = await attempt(usedFallback ? fallback : primary);
     if (result.upstream && running()) {
       const opened = recordFailure();
       const check = usedFallback ? undefined : await checkNow();
@@ -666,7 +734,7 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
         // Only the failure that opens the breaker carries the notice, so the user hears it once per outage.
         if (opened) notice = `⚠️ ${primaryProvider} 连续 ${breaker.threshold} 次失败，已切到备用模型 ${fallback}（后续任务自动跳过该网关，稍后自动恢复）`;
         usedFallback = true;
-        result = await attempt(fallback, true);
+        result = await attempt(fallback, result);
         if (result.upstream && running()) recordFailure();
         if (result.error && !result.interrupted) result.error = `备用模型重试后仍失败：${result.error}`;
       } else if (check?.state === 'missing' && result.error && !result.interrupted) {
@@ -701,7 +769,7 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
     // The user hears how many did not come; the log says which and why.
     const note = dropped.length ? `（有 ${dropped.length} 个附件未发送：路径不在工作区、类型/大小不支持或超过 ${MAX_FILES} 个）` : '';
     const reply = [output.reply, note].filter(Boolean).join('\n');
-    if (!db.finishTask(task.id, 'done', { result: reply, summary: output.summary, handoff: output.handoff, files, usage })) return;
+    if (!db.finishTask(task.id, 'done', { result: reply, summary: output.summary, files, usage })) return;
     if (!io.readOnlyMemory) {
       // Only a memory the prompt showed whole may be replaced. The writes run beside the delivery, so the reply never
       // waits for the memory engine.

@@ -198,19 +198,17 @@ test('sendImage and sendFile upload the file, then send one image or one file it
   assert.notEqual(first.client_id, second.client_id);
 });
 
-/** An answer with the four required sections, then rest. */
-const answer = (rest = '') =>
-  `<<<WECHAT_REPLY>>>\n图表做好了\n<<<WECHAT_MEMORY>>>\n- 无\n<<<WECHAT_SUMMARY>>>\n画了图表\n<<<WECHAT_HANDOFF>>>\nnext: 等反馈${rest}`;
+/** An answer with the three required sections, then rest. */
+const answer = (rest = '') => `<<<WECHAT_REPLY>>>\n图表做好了\n<<<WECHAT_MEMORY>>>\n- 无\n<<<WECHAT_SUMMARY>>>\n画了图表${rest}`;
 
-test('the files section follows the handoff and runs to the end: one path per line, without bullets or backticks', () => {
+test('the files section follows the summary and runs to the end: one path per line, without bullets or backticks', () => {
   const out = parseOrchestratorOutput(answer('\n<<<WECHAT_FILES>>>\n/ws/chart.png\n\n  - `/ws/report.pdf`  \n/ws/chart.png\n'));
-  assert.deepEqual([out.reply, out.summary, out.handoff], ['图表做好了', '画了图表', 'next: 等反馈'], 'the handoff ends at the marker');
+  assert.deepEqual([out.reply, out.summary], ['图表做好了', '画了图表'], 'the summary ends at the marker');
   assert.deepEqual(out.files, ['/ws/chart.png', '/ws/report.pdf'], 'a repeated path counts once');
 });
 
 test('no files without the marker, or when the section is empty, "-" or "无"', () => {
-  const plain = parseOrchestratorOutput(answer());
-  assert.deepEqual([plain.handoff, plain.files], ['next: 等反馈', []]);
+  assert.deepEqual(parseOrchestratorOutput(answer()).files, []);
   for (const none of ['-', '无', '', '  ']) {
     assert.deepEqual(parseOrchestratorOutput(answer(`\n<<<WECHAT_FILES>>>\n${none}\n`)).files, [], JSON.stringify(none));
   }
@@ -219,12 +217,17 @@ test('no files without the marker, or when the section is empty, "-" or "无"', 
 test('a files marker the reply quotes is text: it cuts nothing short and sends nothing', () => {
   const quoted = '附件写在 <<<WECHAT_FILES>>> 后面\n/etc/passwd';
   const out = parseOrchestratorOutput(answer().replace('图表做好了', quoted));
-  assert.deepEqual([out.reply, out.summary, out.handoff, out.files], [quoted, '画了图表', 'next: 等反馈', []]);
+  assert.deepEqual([out.reply, out.summary, out.files], [quoted, '画了图表', []]);
 });
 
-test('without a handoff the files section still ends the answer', () => {
+test('without a memory section the files section still ends the answer', () => {
   const out = parseOrchestratorOutput('<<<WECHAT_REPLY>>>\n好了\n<<<WECHAT_SUMMARY>>>\n发了图\n<<<WECHAT_FILES>>>\n/ws/a.png');
-  assert.deepEqual([out.reply, out.summary, out.handoff, out.files], ['好了', '发了图', '', ['/ws/a.png']]);
+  assert.deepEqual([out.reply, out.summary, out.files], ['好了', '发了图', ['/ws/a.png']]);
+});
+
+test('a handoff section from a session begun before handoffs went away changes nothing else', () => {
+  const out = parseOrchestratorOutput(answer('\n<<<WECHAT_HANDOFF>>>\nnext: 等反馈\n<<<WECHAT_FILES>>>\n/ws/chart.png'));
+  assert.deepEqual([out.reply, out.memory, out.summary, out.files], ['图表做好了', ['无'], '画了图表', ['/ws/chart.png']]);
 });
 
 test('checkTaskFiles keeps regular files inside the workspace and says why it drops each other path', () => {

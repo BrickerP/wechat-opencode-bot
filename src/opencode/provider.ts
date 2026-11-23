@@ -10,8 +10,16 @@ export interface QueryOptions {
   cwd: string;
   /** OpenCode agent that owns the new session. */
   agent?: string;
-  /** "provider/model" or "provider/model#variant"; omitted means the agent's own model. */
+  /**
+   * "provider/model" or "provider/model#variant"; omitted means the agent's own model for a new session, and the
+   * model it already has for a continued one.
+   */
   model?: string;
+  /**
+   * Continue this session instead of creating one: prompt is its next turn, after a switch to model when the
+   * session runs another. A session OpenCode no longer has ends the query with gone set, before anything ran.
+   */
+  sessionId?: string;
   title?: string;
   /** Local files (images) attached to the prompt. */
   files?: string[];
@@ -20,6 +28,12 @@ export interface QueryOptions {
   onPermission?: (request: PermissionRequest) => Promise<PermissionDecision>;
   /** Called once the session exists, before the prompt is sent. */
   onSession?: (sessionId: string) => void;
+  /**
+   * More input for the same work that arrives while the query runs (follow-ups, /steer): take() hands over what came
+   * since the last call, which a running turn takes in at its next step and an answered one gets as a turn of its own;
+   * close() ends the query once nothing is waiting, true when it did, and must refuse more input from then on.
+   */
+  followUps?: FollowUps;
   /**
    * Called while the turn runs, at most once per poll: how long it has run, how many subagent sessions exist and
    * which tools are running in the session and in them (each name once, at most PROGRESS_TOOLS).
@@ -32,6 +46,12 @@ export interface QueryOptions {
    * anything once the signal aborts; a callback that throws or rejects is only logged.
    */
   onAssistantText?: (update: { messageId: string; text: string }) => void | Promise<void>;
+}
+
+/** See QueryOptions.followUps. Both calls are synchronous, so nothing can come in between a check and a close. */
+export interface FollowUps {
+  take(): string[];
+  close(): boolean;
 }
 
 export interface PermissionRequest {
@@ -54,7 +74,9 @@ export interface QueryResult {
   upstream?: boolean;
   /** Set when OpenCode or a watchdog ended the turn, not for local failures such as an unreachable server. */
   errorKind?: ErrorKind;
-  /** What the session and its subagent sessions used; undefined when OpenCode could not say. */
+  /** The session to continue is gone from OpenCode; nothing ran. */
+  gone?: boolean;
+  /** What this query's turns used in the session and its subagent sessions; undefined when OpenCode could not say. */
   usage?: Usage;
 }
 
@@ -353,13 +375,19 @@ function readUsage(session: any): Usage {
   };
 }
 
-/** Sessions spawned by the subagent tool carry parentID. */
+/** Sessions spawned by the subagent tool carry parentID. created is when OpenCode created the session. */
 export async function listChildSessions(
   parentId: string,
-): Promise<Array<{ id: string; title: string; agent?: string; usage: Usage }>> {
+): Promise<Array<{ id: string; title: string; agent?: string; created?: number; usage: Usage }>> {
   const params = new URLSearchParams({ parentID: parentId, limit: "50" });
   const out = await api<{ data: any[] }>(`/api/session?${params.toString()}`);
-  return (out.data || []).map((s) => ({ id: s.id, title: s.title || s.id, agent: s.agent, usage: readUsage(s) }));
+  return (out.data || []).map((s) => ({
+    id: s.id,
+    title: s.title || s.id,
+    agent: s.agent,
+    created: typeof s.time?.created === "number" ? s.time.created : undefined,
+    usage: readUsage(s),
+  }));
 }
 
 /**
@@ -401,29 +429,52 @@ export async function lastAssistantText(sessionId: string, signal?: AbortSignal)
   return "";
 }
 
+const ZERO_USAGE: Usage = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+
+const addUsage = (a: Usage, b: Usage): Usage => ({
+  input: a.input + b.input,
+  output: a.output + b.output,
+  reasoning: a.reasoning + b.reasoning,
+  cacheRead: a.cacheRead + b.cacheRead,
+  cacheWrite: a.cacheWrite + b.cacheWrite,
+  cost: a.cost + b.cost,
+});
+
 /**
- * What a session and its subagent sessions used. OpenCode counts a session's own model calls only, and the
- * orchestrator's subagents start none of their own, so the root and its children are the whole turn.
- * Best effort: undefined when OpenCode cannot say.
+ * What a session and its subagent sessions used over all their turns. OpenCode counts a session's own model calls
+ * only, and the orchestrator's subagents start none of their own, so the root and its children are the whole tree.
+ * Throws when OpenCode cannot say; SessionGone when it no longer has the session.
  */
+async function sessionTotals(sessionId: string): Promise<Usage> {
+  const [root, children] = await Promise.all([
+    api<{ data: any }>(`/api/session/${encodeURIComponent(sessionId)}`).catch(rethrowGone),
+    listChildSessions(sessionId),
+  ]);
+  return [readUsage(root?.data), ...children.map((child) => child.usage)].reduce(addUsage);
+}
+
+/** sessionTotals, best effort: undefined when OpenCode cannot say. */
 export async function sessionUsage(sessionId: string): Promise<Usage | undefined> {
   try {
-    const [root, children] = await Promise.all([
-      api<{ data: any }>(`/api/session/${encodeURIComponent(sessionId)}`),
-      listChildSessions(sessionId),
-    ]);
-    return [readUsage(root?.data), ...children.map((child) => child.usage)].reduce((sum, u) => ({
-      input: sum.input + u.input,
-      output: sum.output + u.output,
-      reasoning: sum.reasoning + u.reasoning,
-      cacheRead: sum.cacheRead + u.cacheRead,
-      cacheWrite: sum.cacheWrite + u.cacheWrite,
-      cost: sum.cost + u.cost,
-    }));
+    return await sessionTotals(sessionId);
   } catch (err) {
     logger.warn("Failed to read session usage", { sessionId, error: String(err) });
     return undefined;
   }
+}
+
+/** What was used between two readings of a session's totals; undefined when either is unknown. */
+function usedSince(after: Usage | undefined, before: Usage | undefined): Usage | undefined {
+  if (!after || !before) return undefined;
+  const less = (key: keyof Usage) => Math.max(0, after[key] - before[key]);
+  return {
+    input: less("input"),
+    output: less("output"),
+    reasoning: less("reasoning"),
+    cacheRead: less("cacheRead"),
+    cacheWrite: less("cacheWrite"),
+    cost: less("cost"),
+  };
 }
 
 /** Best effort: stop the session and the subagent sessions it spawned. Idle sessions are a no-op. */
@@ -444,19 +495,68 @@ export async function interruptSession(sessionId: string): Promise<void> {
 }
 
 /**
- * More input for a session's running turn. OpenCode admits it at once and takes it in at the turn's next safe
- * step, not after the whole turn, so the waitForTurn already polling that session still gets the answer.
+ * More input for a session's running turn, which takes it in at its next step, not after the whole turn, so the
+ * waitForTurn already polling the session still gets the answer. resume: false keeps it from starting a turn of its
+ * own when the turn has just ended: it then waits in the session's inbox, where takeInbox finds it.
  */
-export async function steerSession(sessionId: string, text: string, signal?: AbortSignal): Promise<void> {
+async function steerSession(sessionId: string, text: string, signal?: AbortSignal): Promise<void> {
   await api(`/api/session/${encodeURIComponent(sessionId)}/prompt`, {
     method: "POST",
-    body: JSON.stringify({ text, delivery: "steer" }),
+    body: JSON.stringify({ text, delivery: "steer", resume: false }),
     signal,
   });
 }
 
 /** OpenCode's 404 for a session that does not exist, as opposed to a route it does not have. */
 const SESSION_NOT_FOUND = /-> HTTP 404: .*"SessionNotFoundError"/;
+
+/** The session to continue no longer exists on the server. */
+class SessionGone extends Error {
+  constructor(sessionId: string) {
+    super(`会话 ${sessionId} 已不存在`);
+    this.name = "SessionGone";
+  }
+}
+
+/** For a .catch: a request about a session that is gone throws SessionGone, any other failure itself. */
+function rethrowGone(err: unknown): never {
+  const match = SESSION_NOT_FOUND.exec(String(err));
+  if (match) throw new SessionGone(/sessionID":"([^"]+)"/.exec(String(err))?.[1] ?? "");
+  throw err;
+}
+
+/** The model the session's later turns run on. */
+async function switchModel(sessionId: string, model: string): Promise<void> {
+  const ref = parseModelRef(model);
+  if (!ref) throw new Error(`无效的模型: ${model}`);
+  await api(`/api/session/${encodeURIComponent(sessionId)}/model`, { method: "POST", body: JSON.stringify({ model: ref }) }).catch(
+    rethrowGone,
+  );
+  logger.info("Session model switched", { sessionId, model });
+}
+
+/**
+ * The text of every user input waiting in the session's inbox, oldest first, taken out of it: input steered in
+ * after the turn's last step, which no turn took in. Only this process steers into its sessions, and it reads the
+ * inbox only between turns, so nothing else takes the items. Best effort: [] when OpenCode cannot say.
+ */
+async function takeInbox(sessionId: string): Promise<string[]> {
+  const path = `/api/session/${encodeURIComponent(sessionId)}/inbox`;
+  try {
+    const waiting = (await api<{ data?: any[] }>(path))?.data || [];
+    const texts: string[] = [];
+    for (const item of waiting) {
+      const text = item?.type === "user" && typeof item.payload?.text === "string" ? item.payload.text.trim() : "";
+      if (!text) continue;
+      await api(`${path}/${encodeURIComponent(String(item.id))}`, { method: "DELETE" });
+      texts.push(text);
+    }
+    return texts;
+  } catch (err) {
+    logger.warn("Failed to read the session inbox", { sessionId, error: String(err) });
+    return [];
+  }
+}
 
 /** Delete a session; OpenCode deletes its child sessions with it. One that is already gone counts as deleted. */
 export async function deleteSession(sessionId: string): Promise<void> {
@@ -606,8 +706,10 @@ function announceSteps(sessionId: string, assistants: any[], announced: Set<stri
  * shows streaming (events.ts): without it a long reasoning step looked like silence.
  * The answer is the text of the last step that says or does anything, and only if that step calls no tool: a turn
  * that ends on a tool step, or on nothing at all, fails rather than pass what was said on the way off as the answer.
+ * Follow-ups (options.followUps) are steered in at every poll; one whose steer fails goes to held, for the next turn.
+ * A continued session's subagent sessions from earlier turns are left out.
  */
-async function waitForTurn(sessionId: string, since: number, options: QueryOptions): Promise<string> {
+async function waitForTurn(sessionId: string, since: number, options: QueryOptions, held: string[]): Promise<string> {
   const startedAt = Date.now();
   const deadline = startedAt + TURN_TIMEOUT_MS;
   const handledPermissions = new Set<string>();
@@ -618,8 +720,21 @@ async function waitForTurn(sessionId: string, since: number, options: QueryOptio
   while (Date.now() < deadline) {
     if (options.signal?.aborted) throw new TurnInterrupted();
 
+    const incoming = options.followUps?.take() ?? [];
+    if (incoming.length) {
+      try {
+        await steerSession(sessionId, incoming.join("\n\n"), options.signal);
+        logger.info("Follow-up steered into the running turn", { sessionId, inputs: incoming.length });
+      } catch (err) {
+        held.push(...incoming);
+        logger.warn("Follow-up steer failed; it gets the next turn", { sessionId, error: String(err) });
+      }
+    }
+
     // Real work runs in subagent sessions, and each of them asks for its own permissions.
-    const children = await listChildSessions(sessionId).catch(() => [] as Array<{ id: string }>);
+    const children = (await listChildSessions(sessionId).catch(() => [] as Array<{ id: string; created?: number }>)).filter(
+      (child) => (child.created ?? since) >= since,
+    );
     const pending = (await Promise.all([sessionId, ...children.map((c) => c.id)].map(listPendingPermissions))).flat();
     for (const request of pending) {
       if (handledPermissions.has(request.id)) continue;
@@ -726,39 +841,84 @@ async function waitForTurn(sessionId: string, since: number, options: QueryOptio
   throw new Error("OpenCode 执行超时（30 分钟）");
 }
 
-/** Run one turn in a brand-new session. Sessions are never resumed: context lives outside OpenCode. */
+/** Sends text as the session's next turn; resolves with the time OpenCode admitted it. */
+async function sendTurn(sessionId: string, text: string, files?: string[]): Promise<number> {
+  const body: Record<string, unknown> = { text, delivery: "queue" };
+  if (files?.length) body.files = files.map((p) => ({ uri: pathToFileURL(p).href, name: basename(p) }));
+  const admitted = await api<{ data: { time?: { created?: number } } }>(`/api/session/${encodeURIComponent(sessionId)}/prompt`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  }).catch(rethrowGone);
+  return admitted?.data?.time?.created ?? Date.now();
+}
+
+/**
+ * Run one piece of work: a turn in a new session, or the next turn of options.sessionId, after a switch to
+ * options.model when given. Input for the same work that came while it ran and that no turn took in (follow-ups the
+ * turn had answered by, a steer that came after its last step) then gets a turn of its own, until close() finds
+ * nothing waiting; the answer is the last turn's. usage counts these turns only: a continued session's totals from
+ * before are subtracted.
+ */
 export async function openCodeQuery(options: QueryOptions): Promise<QueryResult> {
   const { prompt, cwd, agent, model, title, files, signal } = options;
-  logger.info("Starting OpenCode query", { cwd, agent, model, promptLength: prompt.length, files: files?.length ?? 0 });
+  const continued = options.sessionId;
+  logger.info("Starting OpenCode query", { cwd, agent, model, continued, promptLength: prompt.length, files: files?.length ?? 0 });
 
-  let sessionId = "";
+  let sessionId = continued ?? "";
+  // A new session starts from nothing; a continued one's totals so far are read before its turn.
+  let before: Usage | undefined = ZERO_USAGE;
+  // Whether OpenCode took a turn: a session gone after that is an error like any other, not a reason to start afresh.
+  let admitted = false;
+  // Follow-ups whose steer failed, for the next turn.
+  const held: string[] = [];
+  /** text as the session's next turn, and the answer to it. */
+  const turn = async (text: string, turnFiles?: string[]): Promise<string> => {
+    const since = await sendTurn(sessionId, text, turnFiles);
+    admitted = true;
+    return waitForTurn(sessionId, since, options, held);
+  };
   try {
-    sessionId = await createSession(title || "微信任务", cwd, agent, model);
+    if (continued) {
+      // Best effort, as usage is: only a session that is gone stops the query here.
+      before = await sessionTotals(continued).catch((err: unknown) => {
+        if (err instanceof SessionGone) throw err;
+        logger.warn("Failed to read session usage", { sessionId: continued, error: String(err) });
+        return undefined;
+      });
+      if (model) await switchModel(continued, model);
+    } else {
+      sessionId = await createSession(title || "微信任务", cwd, agent, model);
+    }
     options.onSession?.(sessionId);
     if (signal?.aborted) throw new TurnInterrupted();
 
-    const body: Record<string, unknown> = { text: prompt, delivery: "queue" };
-    if (files?.length) body.files = files.map((p) => ({ uri: pathToFileURL(p).href, name: basename(p) }));
-
-    const admitted = await api<{ data: { time?: { created?: number } } }>(
-      `/api/session/${sessionId}/prompt`,
-      { method: "POST", body: JSON.stringify(body) },
-    );
-    const since = admitted?.data?.time?.created ?? Date.now();
-
-    const text = await waitForTurn(sessionId, since, options);
+    let text = await turn(prompt, files);
+    for (;;) {
+      // Synchronous from take() to close(), once the inbox has been read: nothing can come in between.
+      const waiting = [...held.splice(0), ...(await takeInbox(sessionId)), ...(options.followUps?.take() ?? [])];
+      if (waiting.length) {
+        logger.info("Another turn for input the last one did not take in", { sessionId, inputs: waiting.length });
+        text = await turn(waiting.join("\n\n"));
+        continue;
+      }
+      if (!options.followUps || options.followUps.close()) break;
+    }
     logger.info("OpenCode query completed", { sessionId, textLength: text.length });
-    return { text, sessionId, usage: await sessionUsage(sessionId) };
+    return { text, sessionId, usage: usedSince(await sessionUsage(sessionId), before) };
   } catch (err) {
+    if (err instanceof SessionGone && !admitted) {
+      logger.warn("Session to continue is gone", { sessionId });
+      return { text: "", sessionId, error: err.message, gone: true };
+    }
     const interrupted = err instanceof TurnInterrupted;
     const upstream = err instanceof UpstreamError;
     // Errors from the local OpenCode server itself (unreachable, HTTP errors) have no kind and are never upstream.
     const errorKind = err instanceof TurnFailed ? err.errorKind : undefined;
     const error = err instanceof Error ? err.message : String(err);
-    // Timeouts, aborts and transport errors can leave the session executing on the server.
+    // Timeouts, aborts and transport errors can leave the session executing on the server; an idle one is a no-op.
     if (sessionId) await interruptSession(sessionId);
     // Read once the interrupt is in, so the stopped sessions are counted as they ended.
-    const usage = sessionId ? await sessionUsage(sessionId) : undefined;
+    const usage = sessionId ? usedSince(await sessionUsage(sessionId), before) : undefined;
     if (interrupted) logger.info("OpenCode query interrupted", { sessionId });
     else logger.error("OpenCode query failed", { sessionId, error, upstream, errorKind });
     return { text: "", sessionId, error, interrupted, upstream, errorKind, usage };

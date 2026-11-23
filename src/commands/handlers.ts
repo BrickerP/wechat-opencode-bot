@@ -10,9 +10,9 @@ import { logger } from '../logger.js';
 import { breaker, checkFallback, type FallbackCheck } from '../model-routing.js';
 import {
   clip,
-  composeSteer,
   formatElapsed,
   formatTime,
+  joinRunningTask,
   ORCHESTRATOR_AGENT,
   ORCHESTRATOR_READ_AGENT,
   STATUS_LABEL,
@@ -28,7 +28,6 @@ import {
   listSessions,
   openCodeInfo,
   resolveModelRef,
-  steerSession,
 } from '../opencode/provider.js';
 import type { EventStreamState } from '../opencode/events.js';
 import type { PermissionBroker } from '../permission.js';
@@ -85,7 +84,7 @@ const AGENTS_FIX = [
   '   修复: scripts/install-agents.sh --apply，再 reload：',
   `   (set -a; . ${join(DATA_DIR, 'env')}; set +a; opencode reload --server "\${OPENCODE_URL:-http://127.0.0.1:4096}")`,
 ].join('\n');
-/** How long /doctor and /steer wait for OpenCode, past the ~5 s it holds a request while its plugins load. */
+/** How long /doctor and /session wait for OpenCode, past the ~5 s it holds a request while its plugins load. */
 const OPENCODE_TIMEOUT_MS = 8000;
 /** /doctor flags a message token older than this: iLink may have expired it. */
 const TOKEN_STALE_MS = 12 * 60 * 60 * 1000;
@@ -134,7 +133,7 @@ Bot：
 直接发送文字或图片即创建任务；任务运行时新消息会排队，按顺序执行。只读 bot（如 @research）的任务单独排队，不等其他任务；它们只读不改，要改文件请发给其他 bot（如 @eng）。
 以 @bot 别名开头指定由哪个 bot 回复，@all 交给默认 bot 统筹，不指定时由默认 bot 回复（发送 /bots 查看）。
 以 @别名 开头或提到项目别名，任务就在该项目目录运行；可同时指定 bot 和项目，顺序不限，如 @research @miaoda 看下发布流程。
-以“继续”这类词开头的简短追问沿用上一个任务的项目和 bot（2 小时内）；以“新话题：”开头则都不沿用，以 @base 开头则在工作目录运行。
+以“继续”这类词开头的简短追问（2 小时内）跟着上一个任务：它还在排队就并入它，正在运行就交给它在下一个步骤采纳，已经结束就在它的会话里接着做；以“新话题：”开头则都不沿用，以 @base 开头则在工作目录运行。
 定时任务到点创建普通任务，内容可以带 @bot 和 @项目；它的上一个任务还没结束就跳过这次，bot 停机期间错过的只补一次。结果发不出去时，会在你下一条消息后补发。`;
 
 const PERMISSION_MODES: Record<PermissionMode, string> = {
@@ -409,8 +408,8 @@ export function formatDoctor(db: StateDb, accountId: string, probe: DoctorProbe,
 }
 
 /**
- * Shared by /tasks and --tasks. Newest first, each with what it used and the next step its handoff names. A task
- * whose prompt tokens reached taskWarnTokens() is flagged ⚠️.
+ * Shared by /tasks and --tasks. Newest first, each with what it used. A task whose prompt tokens reached
+ * taskWarnTokens() is flagged ⚠️.
  */
 export function formatTasks(db: StateDb, accountId: string, limit: number): string {
   const tasks = db.recentTasks(accountId, limit);
@@ -428,8 +427,6 @@ export function formatTasks(db: StateDb, accountId: string, limit: number): stri
       const lines = [head + used + high];
       const detail = t.summary || t.error;
       if (detail) lines.push(`    ${clip(detail, 80)}`);
-      const next = t.handoff && /^[-*]?[ \t]*next[:：][ \t]*(.+)$/im.exec(t.handoff)?.[1];
-      if (next) lines.push(`    ↳ next: ${clip(next, 60)}`);
       return lines.join('\n');
     })
     .join('\n');
@@ -594,8 +591,8 @@ export const handlers: Record<string, Handler> = {
   },
 
   /**
-   * A correction for a running task: more input to the task's session, which takes it in at its next step. The
-   * task stays one task in its lane, and its answer is still its one reply.
+   * A correction for a running task: it goes into the task's session, which takes it in at its next step (see
+   * joinRunningTask). The task stays one task in its lane, and its answer is still its one reply.
    */
   async steer(args, { accountId, db }) {
     const [, seq, text] = /^(?:[#＃](\d+)\s*)?([\s\S]*)$/.exec(args)!;
@@ -609,17 +606,11 @@ export const handlers: Record<string, Handler> = {
     }
     const task = seq ? running.find((t) => t.seq === Number(seq)) : running[0];
     if (!task) return `⚠️ 任务 #${seq} 没有在运行，发送 /status 查看`;
-    if (!task.session_id) return `⚠️ 任务 #${task.seq} 还没有会话，稍后再试`;
-    try {
-      // Bounded, as /doctor is.
-      await steerSession(task.session_id, composeSteer(text), AbortSignal.timeout(OPENCODE_TIMEOUT_MS));
-    } catch (err) {
-      // Not the text: it is the user's, like a message.
-      logger.warn('Steer failed', { taskId: task.id, seq: task.seq, error: requestError(err) });
-      return `⚠️ 修正没有发出：${requestError(err)}`;
-    }
-    logger.info('Steer sent', { taskId: task.id, seq: task.seq, sessionId: task.session_id });
-    return `🎯 已把修正发给任务 #${task.seq}，运行中会在下一个步骤采纳`;
+    // Its answer is final once it has closed; the correction is the user's to send again, as a message.
+    if (!joinRunningTask(task.id, text)) return `⚠️ 任务 #${task.seq} 已经在给出回复，修正没有发出；等它回复后再发消息`;
+    db.appendTaskInput(task.id, text, ['running']);
+    logger.info('Steer handed to the task', { taskId: task.id, seq: task.seq });
+    return `🎯 已把修正交给任务 #${task.seq}，运行中会在下一个步骤采纳`;
   },
 
   /** One queued task never starts; the reply is its notice, as with /stop. A running one is /stop's. */

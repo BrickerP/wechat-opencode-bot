@@ -187,7 +187,7 @@ test('without open tasks nothing is called; with them DEFAULT_MODEL is asked onc
   answers.push('{"action":"attach","task":1}');
   assert.deepEqual(await routeToTask(db, 'acc', '不是 M5，是 M1'), { action: 'attach', task });
   assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0].model, { providerID: 'oneapi', id: 'DeepSeek-V4.1-Flash' });
+  assert.deepEqual(calls[0].model, { providerID: 'oneapi', id: 'DeepSeek-V4.1-Flash', variant: 'low' });
   assert.match(calls[0].prompt, /<message>\n不是 M5，是 M1\n<\/message>$/);
   const logs = join(tmp, '.wechat-opencode-bot', 'logs');
   const log = readdirSync(logs).map((name) => readFileSync(join(logs, name), 'utf-8')).join('');

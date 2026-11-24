@@ -19,18 +19,20 @@ const plugin = (await import(new URL('../../plugin/wechat-bridge.js', import.met
 after(() => rmSync(tmp, { recursive: true, force: true }));
 
 /** What setup registers through a fake plugin context: the tools added and the session hooks. */
-async function load() {
+async function load(generalModel?: string) {
   const tools: any[] = [];
   const hooks = new Map<string, (event: any) => void | Promise<void>>();
   const registration = { dispose: async () => {} };
   await plugin.setup({
     tool: {
+      hook: async (name: string, cb: (event: any) => Promise<void>) => { hooks.set(name, cb); return registration; },
       transform: async (callback: (editor: unknown) => void) => {
         callback({ add: (tool: unknown) => void tools.push(tool) });
         return registration;
       },
     },
     session: {
+      get: async () => ({ metadata: { wechatGeneralModel: generalModel } }),
       hook: async (name: string, callback: (event: any) => void | Promise<void>) => {
         hooks.set(name, callback);
         return registration;
@@ -57,6 +59,19 @@ test('the plugin adds wechat_report and wechat_reply, with the fields the bridge
     assert.equal(typeof out.content, 'string', `${tool.name} only acknowledges`);
   }
   assert.match((await report.execute({}, {})).content, /End your turn now/);
+});
+
+test('only a new implementation delegation with a role model gets an override', async () => {
+  const root = { agent: ORCHESTRATOR_AGENT, tool: 'subagent', sessionID: 'ses_test' };
+  for (const model of [undefined, 'provider/writer']) {
+    const { hooks } = await load(model);
+    for (const input of [{ agent: 'wechat-general' }, { agent: 'wechat-general', model: 'internal/only' },
+      { agent: 'wechat-general', sessionID: 'ses_child' }, { agent: 'wechat-explore' }]) {
+      const event = { ...root, input: { ...input } };
+      await hooks.get('execute.before')!(event);
+      assert.equal(event.input.model, input.model ?? (input.agent === 'wechat-general' && !input.sessionID ? model : undefined));
+    }
+  }
 });
 
 test('every agent but the two orchestrators makes its model calls without the tools', async () => {

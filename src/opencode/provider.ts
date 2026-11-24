@@ -6,6 +6,8 @@ import { basename } from "node:path";
 import { pathToFileURL } from "node:url";
 
 export interface QueryOptions {
+  /** Writer model for this attempt. null clears a previous turn's role override. */
+  generalModel?: string | null;
   prompt: string;
   cwd: string;
   /** OpenCode agent that owns the new session. */
@@ -413,8 +415,9 @@ export function formatModelRef(ref: ModelRef): string {
   return `${ref.providerID}/${ref.id}${ref.variant ? `#${ref.variant}` : ""}`;
 }
 
-async function createSession(title: string, cwd: string, agent?: string, model?: string): Promise<string> {
+async function createSession(title: string, cwd: string, agent?: string, model?: string, generalModel?: string | null): Promise<string> {
   const body: Record<string, unknown> = { title, location: { directory: cwd } };
+  if (generalModel) body.metadata = { wechatGeneralModel: generalModel };
   if (agent) body.agent = agent;
   if (model) {
     // A model comes from /model or a bot's bots.json entry; both store provider/model[#variant], so a
@@ -977,8 +980,17 @@ export async function openCodeQuery(options: QueryOptions): Promise<QueryResult>
         return undefined;
       });
       if (model) await switchModel(continued, model);
+      // The server and daemon may have different environments. Bind role selection to this particular turn,
+      // including a retry or a newly set /model on a session that used a writer override before.
+      if (options.generalModel !== undefined) {
+        const path = `/api/session/${encodeURIComponent(continued)}`;
+        const { data } = await api<{ data: { metadata?: Record<string, unknown> } }>(path).catch(rethrowGone);
+        if ((data.metadata?.wechatGeneralModel ?? null) !== options.generalModel) {
+          await api(path, { method: 'PATCH', body: JSON.stringify({ metadata: { ...data.metadata, wechatGeneralModel: options.generalModel } }) }).catch(rethrowGone);
+        }
+      }
     } else {
-      sessionId = await createSession(title || "微信任务", cwd, agent, model);
+      sessionId = await createSession(title || "微信任务", cwd, agent, model, options.generalModel);
     }
     options.onSession?.(sessionId);
     if (signal?.aborted) throw new TurnInterrupted();

@@ -66,6 +66,7 @@ type Script =
   | 'no-report';
 
 interface FakeSession {
+  metadata?: Record<string, unknown>;
   id: string;
   parentID?: string;
   /** The model it was created with, then the one each switch set. */
@@ -90,6 +91,7 @@ interface FakeSession {
 
 /** A prompt the server got: the session, the session's model at that moment, the text and how it was to be delivered. */
 interface Prompt {
+  writer?: unknown;
   session: string;
   model: unknown;
   text: string;
@@ -234,13 +236,16 @@ function handle(req: IncomingMessage, res: ServerResponse): void {
     if (url.pathname === '/api/model') return send(MODELS);
     if (url.pathname === '/api/session') {
       if (req.method === 'GET') return send(sessions.filter((s) => s.parentID === url.searchParams.get('parentID') && !s.gone));
-      const { model, agent, location } = JSON.parse(body);
-      return send({ id: addSession({ model, agent, directory: location?.directory }).id });
+      const { model, agent, location, metadata } = JSON.parse(body);
+      return send({ id: addSession({ model, agent, metadata, directory: location?.directory }).id });
     }
     const [, , , id, action, item] = url.pathname.split('/');
     const session = sessions.find((s) => s.id === id && !s.gone);
     if (!session) return void res.writeHead(404, { 'Content-Type': 'application/json' }).end(notFound(id));
-    if (action === undefined) return send({ id: session.id, tokens: session.tokens, cost: session.cost });
+    if (action === undefined) {
+      if (req.method === 'PATCH') session.metadata = JSON.parse(body).metadata;
+      return send({ id: session.id, tokens: session.tokens, cost: session.cost, metadata: session.metadata });
+    }
     if (action === 'message') return send([...session.messages].reverse());
     if (action === 'permission') return send([]);
     if (action === 'model') {
@@ -264,7 +269,7 @@ function handle(req: IncomingMessage, res: ServerResponse): void {
     }
     if (action === 'prompt') {
       const { text, delivery, resume } = JSON.parse(body);
-      prompts.push({ session: session.id, model: session.model, text, delivery, resume });
+      prompts.push({ session: session.id, model: session.model, writer: session.metadata?.wechatGeneralModel, text, delivery, resume });
       const user = message('user');
       // A steer waits in the inbox until a turn takes it in; resume: false never starts one.
       if (delivery === 'steer') {
@@ -417,6 +422,17 @@ test('a session that is gone before the retry is replaced by a new one, with the
   assert.deepEqual(sent.map((p) => [p.session, p.model]), [[roots[0].id, undefined], [roots[1].id, GPT]]);
   assert.match(sent[1].text, /^<context>\nworkspace: [\s\S]*^retry: an earlier attempt/m);
   assert.equal(task.session_id, roots[1].id);
+});
+
+test('the writer override is cleared before a fallback turn and restored on a default-model follow-up', async (t) => {
+  const writer = 'example/strong';
+  process.env.OPENCODE_GENERAL_MODEL = writer;
+  t.after(() => { delete process.env.OPENCODE_GENERAL_MODEL; });
+  const first = await run(['provider-error', 'answer']);
+  assert.deepEqual(first.prompts.map(p => p.writer), [writer, null]);
+  const sid = first.task.session_id!;
+  const next = await run(['answer'], { continues: sid });
+  assert.deepEqual(next.prompts.map(p => [p.session, p.writer]), [[sid, writer]]);
 });
 
 test('a subagent that stops making progress times out the turn', async () => {

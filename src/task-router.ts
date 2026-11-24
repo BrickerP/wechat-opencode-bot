@@ -4,7 +4,7 @@
 import { defaultBot, loadBots } from './bots.js';
 import { stopOneTask, type CommandContext } from './commands/handlers.js';
 import { logger } from './logger.js';
-import { DEFAULT_MODEL } from './model-routing.js';
+import { ROUTER_MODEL } from './model-routing.js';
 import { generateText } from './opencode/provider.js';
 import { clip, formatTime, joinRunningTask, taskStatusLabel } from './orchestrator.js';
 import type { StateDb, TaskProject, TaskRow } from './tasks/db.js';
@@ -117,7 +117,7 @@ export function parseRoute(text: string, open: TaskRow[]): Route {
 
 /**
  * Where a message that no prefix settled goes. Without open tasks it is new work, and nothing is called; otherwise
- * DEFAULT_MODEL decides in one call. A failed call, a timeout or an answer that names no open task is new work too.
+ * ROUTER_MODEL decides in one call. A failed call, a timeout or an answer that names no open task is new work too.
  * message is the input its task would get: "[图片]" for an image, "[语音] …" for a voice message. Every decision is
  * logged with its latency, never with the message.
  */
@@ -127,7 +127,7 @@ export async function routeToTask(db: StateDb, accountId: string, message: strin
   const startedAt = Date.now();
   let route: Route;
   try {
-    const answer = await generateText(composeRouterPrompt(message, open, startedAt), DEFAULT_MODEL, AbortSignal.timeout(timeoutMs));
+    const answer = await generateText(composeRouterPrompt(message, open, startedAt), ROUTER_MODEL, AbortSignal.timeout(timeoutMs));
     route = parseRoute(answer, open);
   } catch (err) {
     const timedOut = err instanceof Error && err.name === 'TimeoutError';

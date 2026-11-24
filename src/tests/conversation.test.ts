@@ -146,7 +146,8 @@ interface RunOptions {
 /** Run one task through the reads of its turns. heard is what the user gets: each note, then the outcome. */
 async function run(plays: Read[][], { botId, onCommentary }: RunOptions = {}) {
   turns.push(...plays);
-  const task = db.startTaskNow('test', 'hi', undefined, botId)!;
+  db.createTask('test', 'hi', null, undefined, botId);
+  const task = db.claimNextTask('test')!;
   const controller = new AbortController();
   const stop = () => {
     db.finishTask(task.id, 'interrupted', { error: '用户停止', notified: true });
@@ -297,7 +298,8 @@ test('the notifier drops a note whose send fails or whose turn comes after its t
       sent.push(note);
     },
   };
-  const task = db.startTaskNow('acct', 'hi')!;
+  db.createTask('acct', 'hi');
+  const task = db.claimNextTask('acct')!;
   const io = createNotifier(db, {} as any, sender as any).taskIO(task, {} as any);
   await io.commentary!('网关挂了');
   // Handed over while the task runs; by its turn on the account's send chain the task is done.

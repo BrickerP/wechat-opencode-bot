@@ -399,24 +399,6 @@ export function openStateDb(file: string = STATE_DB_PATH) {
     },
 
     /**
-     * Insert a task directly as running (--simulate), if a slot and its session are available. sessionId, as with
-     * createTask, is the session it continues.
-     */
-    startTaskNow(
-      accountId: string,
-      input: string,
-      project?: TaskProject,
-      botId?: string,
-      sessionId?: string,
-    ): TaskRow | null {
-      return immediate(() => {
-        if (runningCount(accountId) >= maxTasks() + Number(!!sessionId)) return null;
-        if (sessionId && one("SELECT 1 FROM tasks WHERE session_id = ? AND status = 'running'", sessionId)) return null;
-        return start(insertTask(accountId, input, null, project, botId, null, sessionId).id);
-      });
-    },
-
-    /**
      * The tasks a new message may belong to, newest first: those running or queued, and those that finished at or
      * after since and still name a session (retention forgets the sessions it deleted). limit bounds the rows read.
      */
@@ -695,13 +677,6 @@ export function openStateDb(file: string = STATE_DB_PATH) {
     /** The oldest undelivered notice; later notices never overtake it. */
     pendingHead: (accountId: string) =>
       one<NoticeRow>('SELECT * FROM pending_notices WHERE account_id = ? AND delivered = 0 ORDER BY id LIMIT 1', accountId),
-
-    /** Undelivered notices whose backoff has elapsed, oldest first. */
-    dueNotices: (accountId: string, now: number = Date.now()) =>
-      all<NoticeRow>(
-        'SELECT * FROM pending_notices WHERE account_id = ? AND delivered = 0 AND COALESCE(next_at, 0) <= ? ORDER BY id',
-        accountId, now,
-      ),
 
     markNoticeDelivered(id: number): void {
       run('UPDATE pending_notices SET delivered = 1 WHERE id = ?', id);

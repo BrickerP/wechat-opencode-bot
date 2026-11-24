@@ -203,8 +203,6 @@ export function createNotifier(db: StateDb, api: WeChatApi, sender: Sender) {
   return { flush, send, reply, taskIO };
 }
 
-export type Notifier = ReturnType<typeof createNotifier>;
-
 /** --notify: 0 sent; 2 no_context_token and 3 send_failed keep the text pending for the next inbound message. */
 export async function runNotify(text: string): Promise<number> {
   const account = loadLatestAccount();

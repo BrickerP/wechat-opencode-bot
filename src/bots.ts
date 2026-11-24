@@ -6,7 +6,7 @@ import { logger } from './logger.js';
 
 /**
  * A persona the one WeChat bot speaks as. Personas shape the orchestrator's prompt and the reply
- * prefix; a read-only bot's tasks also run in the read lane on the read-only orchestrator (see
+ * prefix; a read-only bot's tasks also run on the read-only orchestrator (see
  * isReadOnlyBot). The repo's AGENTS.md and opencode.json still come first.
  */
 export interface Bot {
@@ -178,7 +178,7 @@ export function resolveBot(botId: string | null, bots: Bot[] = loadBots()): { bo
 }
 
 /**
- * A read-only bot's tasks run in the read lane, beside a write task: a specialist that prefers wechat-explore.
+ * A read-only bot's tasks use the read-only orchestrator: a specialist that prefers wechat-explore.
  * "@all", the default bot, removed bots and rows from before bots write.
  */
 export function isReadOnlyBot(botId: string | null, bots: Bot[] = loadBots()): boolean {

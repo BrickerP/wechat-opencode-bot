@@ -213,7 +213,7 @@ async function runDaemon(): Promise<void> {
 
     const answer = imageItem ? undefined : ANSWERS.get(text.toLowerCase());
     if (answer !== undefined) {
-      // A timeout is answered before the next ask: a late y/n must not approve the other lane's request.
+      // A timeout is answered before the next ask: a late y/n must not approve the next task's request.
       if (broker.isTimedOut(accountId)) {
         broker.clearTimedOut(accountId);
         const waiting = broker.getPending(accountId);
@@ -225,7 +225,7 @@ async function runDaemon(): Promise<void> {
         );
         return;
       }
-      // y/n answers the oldest ask; with both lanes asking that may not be the latest shown, so the reply names its task.
+      // y/n answers the oldest ask; with multiple tasks asking that may not be the latest shown, so the reply names its task.
       const ask = broker.getPending(accountId);
       if (broker.resolvePermission(accountId, answer)) {
         await notifier.reply(accountId, `${answer ? '✅ 已允许' : '❌ 已拒绝'}${ask?.label ? `：${ask.label}` : ''}`);
@@ -262,9 +262,9 @@ async function runDaemon(): Promise<void> {
       await notifier.reply(accountId, placed.reply);
       return;
     }
-    const { project, botId, lane, continues } = placed.task;
+    const { project, botId, continues } = placed.task;
     const messageId = msg.message_id ? String(msg.message_id) : null;
-    const { task, created } = db.createTask(accountId, input, messageId, project, botId, lane, undefined, continues);
+    const { task, created } = db.createTask(accountId, input, messageId, project, botId, undefined, continues);
     if (!created) {
       logger.debug('Duplicate message ignored', { messageId, taskId: task.id, seq: task.seq });
       return;
@@ -276,7 +276,6 @@ async function runDaemon(): Promise<void> {
       seq: task.seq,
       project: task.project_id,
       bot: task.bot_id,
-      lane: task.lane,
       continues: task.session_id ?? undefined,
       inputLength: input.length,
       image: Boolean(image),
@@ -285,10 +284,10 @@ async function runDaemon(): Promise<void> {
     });
     queue.kick(accountId);
     if (ahead > 0) {
-      // The ETA is a nicety: without it the ack still goes out. Only the task's own lane holds it up.
+      // The ETA is a nicety: without it the ack still goes out.
       let durations: number[] = [];
       try {
-        durations = db.recentDurations(accountId, task.lane);
+        durations = db.recentDurations(accountId);
       } catch (err) {
         logger.warn('Queue ETA unavailable', { error: String(err) });
       }

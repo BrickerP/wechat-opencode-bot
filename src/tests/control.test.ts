@@ -10,10 +10,11 @@ import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { after, test } from 'node:test';
 import type { CommandContext, DoctorProbe } from '../commands/handlers.js';
-import type { TaskLane } from '../tasks/db.js';
+
 
 const tmp = mkdtempSync(join(tmpdir(), 'owb-control-'));
 // Config and logs follow HOME, state and the registries OWB_DATA_DIR: keep all of them away from the real bot.
+process.env.OWB_MAX_TASKS = '2';
 process.env.HOME = tmp;
 process.env.OWB_DATA_DIR = join(tmp, 'data');
 process.env.OPENCODE_SERVER_PASSWORD = '';
@@ -83,7 +84,7 @@ const rejected = (reason: unknown): PromiseRejectedResult => ({ status: 'rejecte
 /** A report with its state.db size masked: SQLite decides when the file grows. */
 const sized = (text: string): string => text.replace(/^✅ state\.db: [\d.]+ (B|KB|MB)$/m, '✅ state.db: <size>');
 
-/** Lets every pending promise callback run, so a lane can claim its next task. */
+/** Lets every pending promise callback run, so a slot can take its next task. */
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
 test('/doctor asks the running OpenCode for its version, agents and plugins, and names what it lacks with the fix', async () => {
@@ -208,12 +209,12 @@ test('/doctor flags each thing that needs attention and counts them; a healthy d
 
 test('/panic stops and cancels every task, denies every ask, switches to plan and turns every routine off', async (t) => {
   const pdb = openStateDb(join(tmp, 'panic.db'));
-  const add = (accountId: string, input: string, lane: TaskLane = 'write') =>
-    pdb.createTask(accountId, input, null, undefined, undefined, lane).task;
-  // Each lane of "acc" runs a task with another queued behind it; "other" is another account of the same database.
-  const tasks = [add('acc', 'w1'), add('acc', 'r1', 'read'), add('acc', 'w2'), add('acc', 'r2', 'read')];
+  const add = (accountId: string, input: string) =>
+    pdb.createTask(accountId, input).task;
+  // Two tasks of "acc" run with two queued behind them; "other" is another account of the same database.
+  const tasks = [add('acc', 'w1'), add('acc', 'r1'), add('acc', 'w2'), add('acc', 'r2')];
   const theirs = [add('other', 'o1'), add('other', 'o2')];
-  pdb.claimNextTask('other', 'write');
+  pdb.claimNextTask('other');
   for (const name of ['daily', 'poll', 'old']) pdb.addRoutine('acc', { name, prompt: 'p', schedule: 'every30m', nextRunAt: Date.now() });
   pdb.setRoutineEnabled(pdb.routine('acc', 'old')!.id, false);
   pdb.addRoutine('other', { name: 'theirs', prompt: 'p', schedule: 'every30m', nextRunAt: Date.now() });
@@ -277,7 +278,7 @@ test('cancelQueuedTask ends just the queued task it names, which then never star
   const [running, first, second] = ['r', 'q1', 'q2'].map((input) => add('cancel-db', input));
   // Another account numbers its tasks from 1 too.
   const theirs = add('cancel-other', 'o1');
-  db.claimNextTask('cancel-db', 'write');
+  db.claimNextTask('cancel-db');
   assert.equal(db.cancelQueuedTask('cancel-db', running.seq, '用户取消'), null, 'a running task is for /stop');
   const cancelled = db.cancelQueuedTask('cancel-db', first.seq, '用户取消');
   assert.deepEqual(
@@ -289,17 +290,17 @@ test('cancelQueuedTask ends just the queued task it names, which then never star
   assert.equal(db.cancelQueuedTask('cancel-db', 9, '用户取消'), null);
   assert.deepEqual([running, second, theirs].map((t) => db.getTask(t.id)?.status), ['running', 'queued', 'queued']);
   db.finishTask(running.id, 'done');
-  assert.equal(db.claimNextTask('cancel-db', 'write')?.id, second.id, 'the lane skips the cancelled task');
+  assert.equal(db.claimNextTask('cancel-db')?.id, second.id, 'the scheduler skips the cancelled task');
 });
 
 test('/cancel takes one queued task off the queue, and says why when it cannot', async () => {
   const ctx = { accountId: 'cancel', db } as CommandContext;
   const add = (input: string) => db.createTask('cancel', input).task;
   const done = add('d');
-  db.claimNextTask('cancel', 'write');
+  db.claimNextTask('cancel');
   db.finishTask(done.id, 'done', { result: 'ok' });
   const running = add('r');
-  db.claimNextTask('cancel', 'write');
+  db.claimNextTask('cancel');
   const queued = add('q');
   const usage = '用法：/cancel <任务编号>，如 /cancel 3；运行中的任务用 /stop';
   for (const command of ['/cancel', '/cancel abc', '/cancel 0', '/cancel 3 4']) {
@@ -325,11 +326,11 @@ test('/steer picks the running task the correction is for, and refuses one with 
 
   // Running rows with no runTask behind them, as a task looks once it has closed: it takes no correction.
   db.createTask('steer', '修一下登录');
-  db.claimNextTask('steer', 'write');
+  db.claimNextTask('steer');
   assert.equal(await routeCommand('/steer 先别改测试', ctx), closed(1), 'the one running task needs no number');
-  // A read-lane task runs beside it, and another write task waits behind the first.
-  db.createTask('steer', '研究一下发布流程', null, undefined, 'research', 'read');
-  db.claimNextTask('steer', 'read');
+  // A research task runs beside it, while a third task is queued.
+  db.createTask('steer', '研究一下发布流程', null, undefined, 'research');
+  db.claimNextTask('steer');
   db.createTask('steer', '之后再做');
   assert.equal(
     await routeCommand('/steer 换个思路', ctx),

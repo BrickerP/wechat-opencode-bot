@@ -125,11 +125,11 @@ test('routines are kept per account by name, and a task can point at its routine
   db.markRoutineRun(b.id, NOW + 2 * HOUR, NOW);
   assert.deepEqual([db.routine('acc', 'b')?.next_run_at, db.routine('acc', 'b')?.last_run_at], [NOW + 2 * HOUR, NOW]);
 
-  const { task } = db.createTask('acc', 'pb', null, undefined, undefined, 'write', b.id);
+  const { task } = db.createTask('acc', 'pb', null, undefined, undefined, b.id);
   assert.equal(task.routine_id, b.id);
   assert.equal(db.createTask('acc', 'a message', 'm1').task.routine_id, null);
   assert.equal(db.hasOpenRoutineTask(b.id), true, 'queued');
-  assert.equal(db.claimNextTask('acc', 'write')?.id, task.id);
+  assert.equal(db.claimNextTask('acc')?.id, task.id);
   assert.equal(db.hasOpenRoutineTask(b.id), true, 'running');
   db.finishTask(task.id, 'done');
   assert.deepEqual([db.hasOpenRoutineTask(b.id), db.hasOpenRoutineTask(a.id)], [false, false]);
@@ -145,7 +145,7 @@ test('a v6 database gains the routines table and routine_id, and keeps its rows'
   const db = openStateDb(file);
   assert.ok(raw.prepare("SELECT name FROM pragma_table_info('tasks')").all().some((c) => c.name === 'routine_id'));
   assert.ok(raw.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'routines'").get());
-  assert.equal((raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 11);
+  assert.equal((raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 12);
   raw.close();
   assert.deepEqual([db.getTask(task.id)?.input, db.getTask(task.id)?.routine_id], ['old task', null]);
   assert.equal(openStateDb(file).getTask(task.id)?.input, 'old task', 'opening again changes nothing');
@@ -161,9 +161,9 @@ test('the tick queues a due routine as its message would have been, once, and sk
   const kick = () => void kicks++;
   const queued = tickRoutines(db, 'acc', kick, NOW + 20_000);
   assert.deepEqual(
-    queued.map((t) => [t.input, t.bot_id, t.project_id, t.project_dir, t.lane, t.routine_id, t.status, t.message_id]),
-    [['看下发布流程', 'research', 'miaoda', miaoda, 'read', watch.id, 'queued', null]],
-    "the research bot's task goes to the read lane",
+    queued.map((t) => [t.input, t.bot_id, t.project_id, t.project_dir, t.routine_id, t.status, t.message_id]),
+    [['看下发布流程', 'research', 'miaoda', miaoda, watch.id, 'queued', null]],
+    "the routine keeps its bot and project",
   );
   assert.equal(kicks, 1);
   assert.deepEqual([routine().next_run_at, routine().last_run_at], [NOW + 30 * MINUTE, NOW + 20_000], 'the tick ran late; the rhythm holds');
@@ -172,7 +172,7 @@ test('the tick queues a due routine as its message would have been, once, and sk
   assert.deepEqual(tickRoutines(db, 'acc', kick, NOW + 30 * MINUTE + 5000), []);
   assert.deepEqual([routine().next_run_at, routine().last_run_at], [NOW + 60 * MINUTE, NOW + 20_000]);
   assert.deepEqual([db.statusCounts('acc').queued, kicks], [1, 1]);
-  db.finishTask(db.claimNextTask('acc', 'read')!.id, 'done');
+  db.finishTask(db.claimNextTask('acc')!.id, 'done');
   assert.equal(tickRoutines(db, 'acc', kick, NOW + 60 * MINUTE).length, 1);
   assert.equal(kicks, 2);
 });
@@ -221,7 +221,7 @@ test('the tick runs a routine in its project as the registry has it now, and whe
   const tick = () => {
     const [task] = tickRoutines(db, 'acc', () => {}, now);
     now += 5 * MINUTE;
-    db.finishTask(db.claimNextTask('acc', 'write')!.id, 'done');
+    db.finishTask(db.claimNextTask('acc')!.id, 'done');
     return [task.project_id, task.project_dir];
   };
   try {
@@ -334,26 +334,26 @@ test('/routine off, on, run and rm manage a routine by its name, in any case', a
   const t1 = Date.now();
   assert.ok(row('poll').next_run_at >= t0 + 30 * MINUTE && row('poll').next_run_at <= t1 + 30 * MINUTE, 'on counts from now');
 
-  // run queues a task now, behind its lane's queue, and the schedule goes on.
+  // run queues a task now, in arrival order, and the schedule goes on.
   db.createTask('acc', 'hi');
-  assert.match(await send('/routine run daily'), /^▶️ 定时任务 daily 已创建任务 #2（前面还有 1 个任务），下次 \d\d-\d\d 09:00$/);
+  assert.match(await send('/routine run daily'), /^▶️ 定时任务 daily 已创建任务 #2，下次 \d\d-\d\d 09:00$/);
   assert.equal(kicks.n, 1);
   const [task] = db.recentTasks('acc', 1);
   assert.deepEqual(
-    [task.input, task.bot_id, task.lane, task.routine_id, task.message_id],
-    ['总结昨天的任务', 'chief', 'write', row('daily').id, null],
+    [task.input, task.bot_id, task.routine_id, task.message_id],
+    ['总结昨天的任务', 'chief', row('daily').id, null],
   );
   assert.equal(await send('/routine run daily'), '⏳ 定时任务 daily 的上一个任务还在排队或运行，这次不再创建');
   assert.deepEqual([db.statusCounts('acc').queued, kicks.n], [2, 1]);
   await send('/routine off poll');
-  assert.equal(await send('/routine run poll'), '▶️ 定时任务 poll 已创建任务 #3', 'its lane is free; off, it has no next run');
-  assert.deepEqual([row('poll').enabled, kicks.n, db.recentTasks('acc', 1)[0].lane], [0, 2, 'read']);
+  assert.equal(await send('/routine run poll'), '▶️ 定时任务 poll 已创建任务 #3', 'a slot is free; off, it has no next run');
+  assert.deepEqual([row('poll').enabled, kicks.n, db.recentTasks('acc', 1)[0].bot_id], [0, 2, 'research']);
 
   // rm deletes the routine, not a task it queued.
   assert.equal(await send('/routine rm daily'), '🗑 已删除定时任务 daily；它已创建的任务照常运行');
   assert.equal(await send('/routine rm daily'), '⚠️ 没有名为 daily 的定时任务，发送 /routine 查看');
   assert.equal(db.getTask(task.id)?.status, 'queued');
-  db.finishTask(db.claimNextTask('acc', 'read')!.id, 'done');
+  for (let next = db.claimNextTask('acc'); next; next = db.claimNextTask('acc')) db.finishTask(next.id, 'done');
   assert.equal(await send('/routine rm poll'), '🗑 已删除定时任务 poll');
 
   db.addRoutine('acc', { name: 'broken', prompt: 'p', schedule: 'cron', nextRunAt: NOW });

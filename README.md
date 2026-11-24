@@ -47,7 +47,7 @@ flowchart LR
 
 1. The daemon long-polls iLink and ignores anyone not in `WECHAT_ALLOWED_IDS`. Each message refreshes the chat's `context_token`, which every reply needs.
 2. `y`/`n` answers a waiting permission ask and a `/` command gets a direct reply. Anything else is for a task: the daemon downloads the first image and routes the text to a bot and a project. While the chat has open tasks, a message without a prefix first goes to the task router (see Routing), which may merge it into a task, hand it to a running one or stop one; otherwise the daemon stores a new task in `state.db`. With tasks ahead it replies `⏳ 已排队：任务 #N（前面还有 X 个任务）` and an estimate.
-3. The lane's worker takes the oldest queued task and opens a new OpenCode session at the project root, or in the chat's working directory. OpenCode loads that directory's `AGENTS.md` and `opencode.json`, whose rules take precedence over memory and recent tasks. A message the router attaches to a finished task instead continues that task's session (see Routing), and a retry continues the session it failed in.
+3. A worker claims the oldest eligible task and opens a new OpenCode session at the project root, or in the chat's working directory. OpenCode loads that directory's `AGENTS.md` and `opencode.json`, whose rules take precedence over memory and recent tasks. A message the router attaches to a finished task instead continues that task's session (see Routing), and a retry continues the session it failed in.
 4. A new session's prompt carries the context: time, attachments, the bot's role, the project, up to 8 agentmemory entries that match the message (each with its id and date) and the last 8 tasks, each with its session id and with reply excerpts for the latest 2. When a message needs what an earlier task did, the orchestrator has `wechat-explore` read that session with `--session <id>` (its path is in the prompt), instead of searching for it.
 5. The orchestrator hands the work to `wechat-explore` or `wechat-general`, at most 3 at once and 6 per task. Permission asks go to WeChat. A short message the orchestrator sends with `wechat_reply` reaches the chat as commentary; the daemon's own progress notes (elapsed time, running tools, subagent count) are off by default.
 6. The orchestrator ends each turn with a `wechat_report` call: `status` (`done`, `needs_input`, `blocked` or `failed`), `reply`, `summary`, and optional `memory` and `files`. Both tools come from the OpenCode plugin `plugin/wechat-bridge.js`, and the daemon reads their calls from the session. A turn that ends without the call gets one prompt to make it; still none, and the task fails. The daemon keeps the reply, saves up to 5 facts to agentmemory (a fact that starts with an entry's id updates that entry), stores the summary, the status, the token usage of this task's turns and the file paths, and sends the files after the text. `/tasks` and the router show a done task's status when it is not `done`, such as `完成·等你回复`.
@@ -75,10 +75,10 @@ flowchart LR
 
 ### Concurrency
 
-- Each account has a `write` lane and a `read` lane with one running task each. Each lane runs its tasks in arrival order, claimed atomically from `state.db`.
-- A read-only bot is a non-default bot whose `subagent` is `wechat-explore`, like `research`. Its tasks take the read lane on `wechat-orchestrator-read`, which can only start `wechat-explore`, so they run beside a write task without editing files. Read-only is an OpenCode permission rule, not a sandbox: `wechat-explore` can still run shell commands.
-- Every other task, `@all` included, takes the write lane. A task queued for over 24 hours expires. A restart interrupts the running tasks and their sessions; queued tasks still run.
-- Replies to one chat go out one at a time, whichever lane sends them. A running task's commentary and progress notes (off by default) wait their turn too, and one still waiting when its task finishes is dropped, so none arrives after the task's result.
+- An account normally runs up to `OWB_MAX_TASKS` tasks (default 3). One further slot is reserved for a continuation. SQLite atomically claims the oldest eligible task. Two turns never run together in the same session.
+- When another task occupies a registered project's checkout, a new task opens in its own Git worktree **only** for a single-repository root. The base workspace, non-repositories and projects with nested repositories within four levels run in place. If isolation fails, the task waits for the checkout; unrelated work can still start.
+- OpenCode creates a detached HEAD. The task is instructed to create a branch before editing, commit there and name it in the reply. Follow-ups keep the session's worktree. Retention removes a worktree only after all its sessions are gone and never forces removal of a dirty worktree.
+- Read-only bots still use `wechat-orchestrator-read`. Replies to a chat are sent one at a time. Queued tasks expire after 24 hours; a restart interrupts running tasks.
 
 ### Model routing and resilience
 
@@ -116,7 +116,7 @@ When OpenCode asks for approval, the daemon applies the mode in `config.env`, re
 
 | Path | Contents |
 |---|---|
-| `src/` | The daemon: `main.ts` (CLI, inbound messages), `task-router.ts` (the open task a message belongs to), `orchestrator.ts` (prompt, run, result), `opencode/` (HTTP client, watchdogs), `tasks/` (`state.db`, lanes), `wechat/` (iLink client), `commands/`, `tests/` |
+| `src/` | The daemon: `main.ts` (CLI, inbound messages), `task-router.ts` (the open task a message belongs to), `orchestrator.ts` (prompt, run, result), `opencode/` (HTTP client, watchdogs), `tasks/` (`state.db`, slots and worktrees), `wechat/` (iLink client), `commands/`, `tests/` |
 | `config/agents/` | The four agent prompts, see [config/agents/README.md](config/agents/README.md) |
 | `plugin/` | `wechat-bridge.js`, the OpenCode server plugin that adds `wechat_report` and `wechat_reply` for the two orchestrators |
 | `config/launchd/` | launchd job templates for the server, the daemon and the watchdog, run through `run-server.sh`, `run-bot.sh` and `scripts/watchdog.sh` |
@@ -164,7 +164,7 @@ An always-on bot runs a release instead. CI builds every push to `main` and uplo
 | `/status` | Working directory, project, bots, model, permission mode, running and queued tasks, where memories come from; then 24-hour outcomes, tokens used, open breakers, the outbox backlog and the token's age |
 | `/tasks [n]` | The last n tasks (default 5, at most 20), with token usage when recorded; ⚠️ marks a task at or over `OWB_TASK_WARN_TOKENS` |
 | `/session <id\|title>` | Read a session on this OpenCode server directly: its last assistant text, as is (cut at 20,000 characters); a title that matches several lists up to 5 ids |
-| `/stop` | Stop the running tasks in both lanes and deny waiting asks; `/stop all` also cancels the queue |
+| `/stop` | Stop the running tasks in all slots and deny waiting asks; `/stop all` also cancels the queue |
 | `/cancel <n>` | Cancel one queued task |
 | `/steer [#n] <text>` | Hand a correction to a running task, which steers it into its session at the next step. A task that is already writing its reply takes none |
 | `/cwd [path]` | Show or set the chat's working directory, inside the base directory |
@@ -185,7 +185,7 @@ Any other `/word` gets `未知命令`; commands never become tasks.
 
 | You send | It runs |
 |---|---|
-| `@research @myproj 看下发布流程` | as `research` in the read lane, in project `myproj` |
+| `@research @myproj 看下发布流程` | as `research` on the read-only orchestrator, in project `myproj` |
 | `@eng 修一下 myproj 的构建脚本` | as `eng`, in `myproj`, because the message mentions it |
 | `@base 列出所有仓库` | as the default bot, in the chat's working directory |
 | `新话题：今天天气怎么样` | as the default bot with no project; the last task's bot and project are not carried over |
@@ -216,6 +216,7 @@ Every `node dist/main.js` command loads `env` from the data directory, and varia
 | `OWB_FAILURE_ALERT_COUNT`, `OWB_FAILURE_ALERT_WINDOW_MS`, `OWB_FAILURE_ALERT_COOLDOWN_MS` | `3`, `1800000`, `1800000` | Failed tasks in the window that send an alert, the window, and the pause after an alert |
 | `OWB_ALERT_WEBHOOK` | empty | URL the watchdog also POSTs each of its alerts to, as plain text: an ntfy topic, a Slack proxy… |
 | `OWB_ALERT_PING_URL` | empty | URL the watchdog GETs after every healthy run, for an external dead-man's switch such as healthchecks.io |
+| `OWB_MAX_TASKS` | `3` | Ordinary slots per account; one further slot for continuations |
 | `OWB_SESSION_TTL_DAYS`, `OWB_SESSION_KEEP` | `7`, `300` | Session retention: age in days, and how many of the newest finished tasks keep all their sessions |
 | `OWB_PROGRESS_ENABLED` | empty | `true` turns on the diagnostic progress notes; any other value leaves them off. Commentary does not depend on it |
 | `OWB_PROGRESS_FIRST_MS`, `OWB_PROGRESS_MIN_GAP_MS`, `OWB_PROGRESS_EVERY_MS`, `OWB_PROGRESS_MAX` | `20000`, `90000`, `300000`, `4` | Progress notes, with `OWB_PROGRESS_ENABLED=true`: first after, minimum gap, regular interval, maximum per task; `OWB_PROGRESS_MAX=0` sends none |

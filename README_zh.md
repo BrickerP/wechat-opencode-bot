@@ -47,7 +47,7 @@ flowchart LR
 
 1. 守护进程长轮询 iLink，忽略不在 `WECHAT_ALLOWED_IDS` 里的人。每条消息都会刷新这个聊天的 `context_token`，每次回复都要用到它。
 2. `y`/`n` 回答正在等待的权限请求，`/` 命令直接得到回复。其余消息都交给任务：守护进程下载第一张图片，把文字分派给一个 bot 和一个项目。聊天有未结束的任务时，没有前缀的消息先交给任务分派器（见“路由”），它可能把消息并入某个任务、交给运行中的任务，或停止某个任务；否则守护进程把新任务存进 `state.db`。前面还有任务时，它会回复 `⏳ 已排队：任务 #N（前面还有 X 个任务）` 和预计等待时间。
-3. 通道的 worker 取出最早排队的任务，在项目根目录（没有项目时在聊天的工作目录）新开一个 OpenCode 会话。OpenCode 会加载该目录的 `AGENTS.md` 和 `opencode.json`，其中的规则优先于记忆和最近任务。分派器接到已结束任务上的消息则接着那个任务的会话做（见“路由”），重试也接着失败的那个会话。
+3. worker 领取最早可以运行的任务，在项目根目录（没有项目时在聊天的工作目录）新开一个 OpenCode 会话。OpenCode 会加载该目录的 `AGENTS.md` 和 `opencode.json`，其中的规则优先于记忆和最近任务。分派器接到已结束任务上的消息则接着那个任务的会话做（见“路由”），重试也接着失败的那个会话。
 4. 新会话的上下文由 prompt 携带：时间、附件、bot 的角色、项目、与消息相关的至多 8 条 agentmemory 记忆（各带 id 和日期），以及最近 8 个任务（各带会话 id，最近 2 个附回复摘录）。消息需要某个早先任务做过什么时，编排器让 `wechat-explore` 用 `--session <id>`（prompt 里给出路径）读那个会话，而不是去搜。
 5. orchestrator 把工作交给 `wechat-explore` 或 `wechat-general`，同时最多 3 个，每个任务最多 6 个。权限请求发到微信。orchestrator 用 `wechat_reply` 发的简短说明会作为过程说明发到聊天；守护进程自己的进度通知（已运行时长、正在运行的工具、子 agent 数量）默认关闭。
 6. orchestrator 每一轮都以一次 `wechat_report` 调用结束：`status`（`done`、`needs_input`、`blocked` 或 `failed`）、`reply`、`summary`，以及可选的 `memory` 和 `files`。两个工具都来自 OpenCode 插件 `plugin/wechat-bridge.js`，守护进程从会话里读取它们的调用。某一轮没有调用就结束时，会再发一条 prompt 让它补上；仍然没有，任务失败。守护进程保留回复、把最多 5 条事实存进 agentmemory（以某条记忆的 id 开头的事实会更新那一条），保存摘要、状态、本任务各轮的 token 用量和文件路径，并在文字之后发送文件。已完成任务的状态不是 `done` 时，`/tasks` 和分派器会显示出来，比如 `完成·等你回复`。
@@ -75,10 +75,10 @@ flowchart LR
 
 ### 并发
 
-- 每个账号有一条 `write` 通道和一条 `read` 通道，各自同时只跑一个任务。每条通道按到达顺序执行任务，任务从 `state.db` 原子领取。
-- 只读 bot 指 `subagent` 为 `wechat-explore` 的非默认 bot，比如 `research`。它的任务走 read 通道，运行在 `wechat-orchestrator-read` 上；后者只能派 `wechat-explore`，所以能和写任务并行而不改文件。只读是 OpenCode 的权限规则，不是沙箱：`wechat-explore` 仍能执行 shell 命令。
-- 其余任务（包括 `@all`）都走 write 通道。排队超过 24 小时的任务会过期。重启会中断正在运行的任务及其会话；排队中的任务照常执行。
-- 发给同一个聊天的回复逐条发出，不论来自哪条通道。运行中任务的过程说明和进度通知（默认关闭）也要排队；任务结束时仍在等待的会被丢弃，所以它们不会晚于任务结果到达。
+- 每个账号通常最多同时运行 `OWB_MAX_TASKS` 个任务（默认 3），还有一个槽位专供续接会话。SQLite 原子领取最早的可运行任务；同一会话不会同时执行两轮。
+- 同一注册项目的原目录已被其他任务占用时，只有单仓库根目录会为新任务建立独立 Git worktree。基础目录、非仓库和四层内含嵌套仓库的项目仍在原地并行。建树失败时，该任务等待原目录释放，其他项目照常运行。
+- 新 worktree 的 HEAD 是分离的。任务会被要求在修改前创建分支、提交修改并在回复里给出分支名。续接沿用原会话的 worktree；所有相关会话删除后才清理，未提交的改动不会被强删。
+- 只读 bot 仍用 `wechat-orchestrator-read`。同一聊天的消息逐条发送。排队 24 小时会过期，重启会中断运行中的任务。
 
 ### 模型路由与容错
 
@@ -116,7 +116,7 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 
 | 路径 | 内容 |
 |---|---|
-| `src/` | 守护进程：`main.ts`（CLI、收消息）、`task-router.ts`（消息属于哪个未结束的任务）、`orchestrator.ts`（prompt、执行、结果）、`opencode/`（HTTP 客户端、watchdog）、`tasks/`（`state.db`、通道）、`wechat/`（iLink 客户端）、`commands/`、`tests/` |
+| `src/` | 守护进程：`main.ts`（CLI、收消息）、`task-router.ts`（消息属于哪个未结束的任务）、`orchestrator.ts`（prompt、执行、结果）、`opencode/`（HTTP 客户端、watchdog）、`tasks/`（`state.db`、槽位与 worktree）、`wechat/`（iLink 客户端）、`commands/`、`tests/` |
 | `config/agents/` | 四个 agent 的提示词，见 [config/agents/README.md](config/agents/README.md) |
 | `plugin/` | `wechat-bridge.js`：给两个 orchestrator 加上 `wechat_report` 和 `wechat_reply` 的 OpenCode 服务端插件 |
 | `config/launchd/` | server、daemon、watchdog 三个 launchd 模板，分别经 `run-server.sh`、`run-bot.sh`、`scripts/watchdog.sh` 启动 |
@@ -164,7 +164,7 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 | `/status` | 工作目录、项目、bot、模型、权限模式、运行中和排队的任务、记忆来源；以及 24 小时结果、token 用量、已打开的熔断、待补发数量和消息令牌的时效 |
 | `/tasks [n]` | 最近 n 个任务（默认 5 个，最多 20 个），有记录时附带 token 用量；达到 `OWB_TASK_WARN_TOKENS` 的任务标 ⚠️ |
 | `/session <id\|标题>` | 直接读这台 OpenCode 上的会话：原样返回它最后一条助手文本（超过 20000 字截断）；标题匹配多个时列出最多 5 个 id |
-| `/stop` | 停止两条通道里正在运行的任务，并拒绝等待中的权限请求；`/stop all` 同时取消队列 |
+| `/stop` | 停止所有槽位中正在运行的任务，并拒绝等待中的权限请求；`/stop all` 同时取消队列 |
 | `/cancel <编号>` | 取消一个排队中的任务 |
 | `/steer [#编号] <内容>` | 把一条修正交给运行中的任务，由它在下一个步骤送进会话。已经在给出回复的任务不再接收 |
 | `/cwd [path]` | 查看或设置聊天的工作目录，须在基础目录内 |
@@ -185,7 +185,7 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 
 | 你发送 | 执行方式 |
 |---|---|
-| `@research @myproj 看下发布流程` | 由 `research` 在 read 通道执行，项目是 `myproj` |
+| `@research @myproj 看下发布流程` | 由 `research` 使用只读 orchestrator 执行，项目是 `myproj` |
 | `@eng 修一下 myproj 的构建脚本` | 由 `eng` 执行，项目是 `myproj`，因为消息里提到了它 |
 | `@base 列出所有仓库` | 由默认 bot 在聊天的工作目录执行 |
 | `新话题：今天天气怎么样` | 由默认 bot 执行，不指定项目；不沿用上一个任务的 bot 和项目 |
@@ -216,6 +216,7 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 | `OWB_FAILURE_ALERT_COUNT`、`OWB_FAILURE_ALERT_WINDOW_MS`、`OWB_FAILURE_ALERT_COOLDOWN_MS` | `3`、`1800000`、`1800000` | 窗口内触发告警的失败任务数、窗口长度、告警后的静默时长 |
 | `OWB_ALERT_WEBHOOK` | 空 | watchdog 的每条告警也以纯文本 POST 到这个 URL，例如 ntfy 主题或 Slack 代理 |
 | `OWB_ALERT_PING_URL` | 空 | watchdog 每次运行结果健康时 GET 这个 URL，供外部的 dead-man's switch（如 healthchecks.io）在收不到 ping 时告警 |
+| `OWB_MAX_TASKS` | `3` | 每个账号的普通并发槽位，另留一个给续接任务 |
 | `OWB_SESSION_TTL_DAYS`、`OWB_SESSION_KEEP` | `7`、`300` | 会话保留：天数，以及最近多少个已完成任务保留它们的全部会话 |
 | `OWB_PROGRESS_ENABLED` | 空 | 取 `true` 时开启诊断用的进度通知，其他值都不开启。过程说明不受它影响 |
 | `OWB_PROGRESS_FIRST_MS`、`OWB_PROGRESS_MIN_GAP_MS`、`OWB_PROGRESS_EVERY_MS`、`OWB_PROGRESS_MAX` | `20000`、`90000`、`300000`、`4` | 进度通知（需 `OWB_PROGRESS_ENABLED=true`）：首条时间、最小间隔、常规间隔、每个任务的上限；`OWB_PROGRESS_MAX=0` 时一条都不发 |

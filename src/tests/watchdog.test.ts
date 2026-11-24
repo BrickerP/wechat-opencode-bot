@@ -1,7 +1,7 @@
 // runTask against a fake OpenCode server: the first-response and stall watchdogs, the one retry on the configured
 // fallback in the same session, a session that is gone, the breaker that skips a failing gateway, the progress notes
 // of a long task (diagnostics, off unless OWB_PROGRESS_ENABLED), the directory each session opens in, the bot a task
-// speaks as and the model it runs on, the orchestrator agent of each lane, the memories a task reads and saves through
+// speaks as and the model it runs on, the orchestrator agent selected by the bot, the memories a task reads and saves through
 // a fake agentmemory engine, follow-ups that join a running task or continue a finished one's session, and the usage
 // and the attachments a task records.
 import assert from 'node:assert/strict';
@@ -13,7 +13,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { after, beforeEach, test } from 'node:test';
 import type { CommandContext } from '../commands/handlers.js';
-import type { TaskLane, TaskProject, TaskRow } from '../tasks/db.js';
+import type { TaskProject, TaskRow } from '../tasks/db.js';
 
 const FIRST_MS = 2000;
 const STALL_MS = 2500;
@@ -319,7 +319,6 @@ interface RunOptions {
   stopAfterMs?: number;
   project?: TaskProject;
   botId?: string;
-  lane?: TaskLane;
   /** Every progress note fails to send, as a reply does while WeChat is unreachable. */
   progressFails?: boolean;
   /** As --simulate runs a task: it reads memories but saves none. */
@@ -333,10 +332,10 @@ interface RunOptions {
 /** Run one task through the given turn scripts; prompts are the ones the server got during it. */
 async function run(
   plan: Script[],
-  { stopAfterMs, project, botId, lane, progressFails, readOnlyMemory, continues, whileRunning }: RunOptions = {},
+  { stopAfterMs, project, botId, progressFails, readOnlyMemory, continues, whileRunning }: RunOptions = {},
 ) {
   scripts.push(...plan);
-  let task = db.startTaskNow('test', 'hi', project, botId, lane)!;
+  let task = db.startTaskNow('test', 'hi', project, botId)!;
   if (continues) {
     db.setTaskSession(task.id, continues);
     task = db.getTask(task.id)!;
@@ -579,8 +578,8 @@ test('a read-only run, as --simulate is, reads memories and saves none; a failed
   assert.deepEqual(memoryWrites, []);
 });
 
-test('a read-lane task runs on the read-only orchestrator, its retry too; a write task on the full one', async () => {
-  const read = await run(['provider-error', 'answer'], { botId: 'research', lane: 'read' });
+test('a read-only bot runs on the read-only orchestrator, its retry too; a write task on the full one', async () => {
+  const read = await run(['provider-error', 'answer'], { botId: 'research' });
   assert.equal(read.task.status, 'done');
   assert.deepEqual(read.roots.map((s) => s.agent), ['wechat-orchestrator-read']);
   assert.equal(read.prompts.length, 2);

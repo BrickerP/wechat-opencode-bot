@@ -1,11 +1,11 @@
-// The queue ack's estimate: how long the recent done tasks of the lane ran, and the wait built from their median.
+// The queue ack's estimate: how long the recent done tasks ran, and the wait built from their median.
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { after, test } from 'node:test';
-import type { TaskLane } from '../tasks/db.js';
+
 
 const tmp = mkdtempSync(join(tmpdir(), 'owb-eta-'));
 // Logs follow HOME, state OWB_DATA_DIR: keep both away from the real bot.
@@ -19,15 +19,15 @@ const MIN = 60_000;
 
 after(() => rmSync(tmp, { recursive: true, force: true }));
 
-test('only done tasks with both timestamps count, newest first, and only those of the lane when one is given', () => {
+test('only done tasks with both timestamps count, newest first, for the specified account', () => {
   const file = join(tmp, 'state.db');
   const db = openStateDb(file);
   const raw = new DatabaseSync(file);
   const t0 = Date.now() - 60 * MIN;
-  const add = (status: string, started: number | null, finished: number | null, account = 'acc', lane: TaskLane = 'write') =>
+  const add = (status: string, started: number | null, finished: number | null, account = 'acc') =>
     raw
       .prepare('UPDATE tasks SET status = ?, started_at = ?, finished_at = ? WHERE id = ?')
-      .run(status, started, finished, db.createTask(account, 'x', null, undefined, undefined, lane).task.id);
+      .run(status, started, finished, db.createTask(account, 'x').task.id);
   add('done', t0, t0 + MIN);
   add('failed', t0, t0 + 9 * MIN);
   add('queued', null, null);
@@ -35,21 +35,19 @@ test('only done tasks with both timestamps count, newest first, and only those o
   add('done', t0 + 9 * MIN, t0); // finished before it started: the clock went back
   add('done', t0, t0 + 9 * MIN, 'other');
   add('done', t0, t0 + 2 * MIN);
-  add('done', t0, t0 + 5 * MIN, 'acc', 'read');
+  add('done', t0, t0 + 5 * MIN, 'acc');
   raw.close();
   assert.deepEqual(db.recentDurations('acc'), [5 * MIN, 2 * MIN, MIN]);
-  assert.deepEqual(db.recentDurations('acc', 'write'), [2 * MIN, MIN]);
-  assert.deepEqual(db.recentDurations('acc', 'read'), [5 * MIN]);
-  assert.deepEqual(db.recentDurations('acc', 'write', 1), [2 * MIN]);
+  assert.deepEqual(db.recentDurations('acc', 1), [5 * MIN]);
   assert.deepEqual(db.recentDurations('nobody'), []);
 });
 
 test('the ack estimates the wait as the median run time once per task ahead, in whole minutes', () => {
   const ack = '⏳ 已排队：任务 #7（前面还有 2 个任务）';
   assert.equal(formatQueueAck(7, 2, []), ack, 'no history, no estimate');
-  assert.equal(formatQueueAck(7, 2, [10 * MIN, MIN, 3 * MIN]), `${ack}，预计约 6 分钟`);
-  assert.equal(formatQueueAck(7, 2, [MIN, 10 * MIN, 2 * MIN, 3 * MIN]), `${ack}，预计约 5 分钟`, 'the mean of the middle two');
-  assert.equal(formatQueueAck(7, 2, [45_000]), `${ack}，预计约 2 分钟`, '90 seconds rounds up');
+  assert.equal(formatQueueAck(7, 2, [10 * MIN, MIN, 3 * MIN]), `${ack}，预计约 3 分钟`);
+  assert.equal(formatQueueAck(7, 2, [MIN, 10 * MIN, 2 * MIN, 3 * MIN]), `${ack}，预计约 3 分钟`, 'the mean of the middle two');
+  assert.equal(formatQueueAck(7, 2, [45_000]), `${ack}，预计不到 1 分钟`, '90 seconds rounds up');
   assert.equal(formatQueueAck(7, 2, [10_000, 20_000]), `${ack}，预计不到 1 分钟`);
-  assert.equal(formatQueueAck(7, 2, [90 * MIN]), `${ack}，预计约 180 分钟`, 'no cap');
+  assert.equal(formatQueueAck(7, 6, [90 * MIN]), `${ack.replace('2 个', '6 个')}，预计约 180 分钟`, 'no cap');
 });

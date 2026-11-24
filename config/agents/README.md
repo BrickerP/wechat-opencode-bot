@@ -5,7 +5,7 @@ The prompts the bot's tasks run with. Both orchestrators end every turn with a `
 | File | Mode | Job |
 |------|------|-----|
 | `wechat-orchestrator.md` | primary | Scopes each task, briefs the two subagents, checks their reports and answers with `wechat_report` |
-| `wechat-orchestrator-read.md` | primary | The read lane's orchestrator, for read-only bots such as @research: it can only start `wechat-explore`, never the writer `wechat-general`, so it cannot change anything beside a running write task. Same tools |
+| `wechat-orchestrator-read.md` | primary | The orchestrator for read-only bots such as @research: it can only start `wechat-explore`, never the writer `wechat-general`, so it cannot change anything beside a running write task. Same tools |
 | `wechat-explore.md` | subagent | Read-only investigation: the answer, each fact with its source, and what it could not check |
 | `wechat-general.md` | subagent | Implementation with full access: what changed, the commands it ran and their results |
 

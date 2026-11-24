@@ -1,4 +1,3 @@
-import { isReadOnlyBot } from './bots.js';
 import { resultText, runTask, type TaskIO } from './orchestrator.js';
 import { pingOpenCode, startEventStream, stopEventStream } from './opencode/provider.js';
 import { routeMessage } from './projects.js';
@@ -30,19 +29,10 @@ export async function runSimulate(text: string): Promise<number> {
     console.log(`[simulate] 路由：停止任务 #${route.task.seq}（simulate 不执行）`);
     return 0;
   }
-  // As in the daemon: a read-only bot's task runs on the read agent.
-  const placed: NewTask =
-    route?.action === 'attach' ? followUpOf(route.task) : { project, botId, lane: isReadOnlyBot(botId) ? 'read' : 'write' };
+  const placed: NewTask = route?.action === 'attach' ? followUpOf(route.task) : { project, botId };
   if (route?.action === 'attach') console.log(`[simulate] 路由：接着任务 #${route.task.seq}`);
-  const start = () => db.startTaskNow(accountId, input, placed.project, placed.botId, placed.lane, placed.continues);
-
-  let task = start();
-  while (!task) {
-    console.log('[simulate] 已有任务在运行，2 秒后重试...');
-    await new Promise((resolve) => setTimeout(resolve, RETRY_MS));
-    task = start();
-  }
-  console.log(`[simulate] task ${task.id} (#${task.seq}) bot=${task.bot_id ?? '-'} project=${task.project_id ?? '-'} lane=${task.lane}`);
+  const { task } = db.createTask(accountId, input, null, placed.project, placed.botId, undefined, placed.continues);
+  console.log(`[simulate] task ${task.id} (#${task.seq}) bot=${task.bot_id ?? '-'} project=${task.project_id ?? '-'}`);
 
   const io: TaskIO = {
     async deliver(task) {
@@ -58,7 +48,7 @@ export async function runSimulate(text: string): Promise<number> {
   const controller = new AbortController();
   // Free the account before the session winds down: a running row left behind blocks every later
   // simulate. SIGKILL cannot be caught; the next daemon start interrupts such a row.
-  const release = () => db.finishTask(task.id, 'interrupted', { error: 'simulate 进程退出' });
+  const release = () => db.cancelQueuedTask(accountId, task.seq, 'simulate 进程退出') || db.finishTask(task.id, 'interrupted', { error: 'simulate 进程退出' });
   const onSignal = () => {
     release();
     controller.abort();
@@ -69,7 +59,11 @@ export async function runSimulate(text: string): Promise<number> {
   // As in the daemon, so a long reasoning step is not taken for silence; closed below, so the process can exit.
   startEventStream();
   try {
-    await runTask(db, task, io, controller.signal);
+    while (!controller.signal.aborted && db.getTask(task.id)?.status === 'queued') {
+      const claimed = db.claimNextTask(accountId, task.id);
+      if (claimed) await runTask(db, claimed, io, controller.signal);
+      if (db.getTask(task.id)?.status === 'queued') await new Promise(resolve => setTimeout(resolve, RETRY_MS));
+    }
   } catch (err) {
     db.finishTask(task.id, 'failed', { error: err instanceof Error ? err.message : String(err) });
     console.error('[simulate] 任务异常:', err);

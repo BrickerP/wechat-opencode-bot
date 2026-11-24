@@ -1,5 +1,5 @@
 import { logger } from './logger.js';
-import { deleteSession, listChildSessions } from './opencode/provider.js';
+import { deleteSession, listChildSessions, removeWorktree } from './opencode/provider.js';
 import type { StateDb } from './tasks/db.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -14,9 +14,10 @@ const keepCount = (): number => Math.trunc(Number(process.env.OWB_SESSION_KEEP))
 export interface RetentionApi {
   listChildren(sessionId: string): Promise<Array<{ id: string }>>;
   deleteSession(sessionId: string): Promise<void>;
+  removeWorktree(project: string, directory: string): Promise<void>;
 }
 
-const openCode: RetentionApi = { listChildren: listChildSessions, deleteSession };
+const openCode: RetentionApi = { listChildren: listChildSessions, deleteSession, removeWorktree };
 
 /** True once OpenCode deleted the session; a failure is logged. */
 async function tryDelete(api: RetentionApi, sessionId: string): Promise<boolean> {
@@ -67,6 +68,15 @@ export async function pruneSessions(
       deleted++;
       // OpenCode deletes a session's children with it, so a child that failed above went too.
       db.forgetSession(sessionId);
+    }
+    // A session can have several turns and a worktree can have several sessions. Keep it until all are gone.
+    for (const { project, directory } of db.unusedWorktrees(cutoff)) {
+      try {
+        await api.removeWorktree(project, directory);
+        db.forgetWorktree(directory);
+      } catch (err) {
+        logger.warn('Worktree retained', { project, directory, error: String(err) });
+      }
     }
   } catch (err) {
     logger.warn('Session retention failed', { error: String(err) });

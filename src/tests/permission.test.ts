@@ -27,7 +27,7 @@ const sender = {
 } as any;
 const notifier = createNotifier(db, {} as any, sender);
 const eng = db.createTask('acc', '跑下测试', null, undefined, 'eng').task;
-const research = db.createTask('acc', '看下日志', null, undefined, 'research', 'read').task;
+const research = db.createTask('acc', '看下日志', null, undefined, 'research').task;
 const plain = db.createTask('acc', 'hi').task;
 const request = (action: string) => ({ id: `per_${action}`, sessionId: 'ses_1', action, resources: ['/tmp/x'] });
 

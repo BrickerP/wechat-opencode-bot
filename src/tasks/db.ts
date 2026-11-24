@@ -6,9 +6,11 @@ import { DATA_DIR } from '../constants.js';
 
 export type TaskStatus = 'queued' | 'running' | 'done' | 'failed' | 'interrupted';
 export type FinishedStatus = Exclude<TaskStatus, 'queued' | 'running'>;
-/** An account runs one task per lane at a time, so a read-only task does not wait for a write task. */
-export const TASK_LANES = ['write', 'read'] as const;
-export type TaskLane = (typeof TASK_LANES)[number];
+/** New work uses the ordinary slots. Only a continuation can take the extra slot. */
+export function maxTasks(): number {
+  const n = Number(process.env.OWB_MAX_TASKS);
+  return Number.isSafeInteger(n) && n > 0 ? n : 3;
+}
 
 export interface UserRow {
   account_id: string;
@@ -43,8 +45,9 @@ export interface TaskRow {
   project_dir: string | null;
   /** Bot the message was addressed to: a registry id, or "all" for "@all". Null (older rows) means the default bot. */
   bot_id: string | null;
-  /** read for a read-only bot's task; write for every other task, older rows included. */
-  lane: TaskLane;
+  worktree_dir: string | null;
+  /** Task occupying the original checkout at claim time, or the task a requeued row must wait for. */
+  workspace_peer: string | null;
   /** Routine that queued the task; null for a message's task, older rows included. */
   routine_id: string | null;
   /** Tokens the task's sessions read over all its attempts, subagents and cache reads included; null when unknown. */
@@ -272,6 +275,12 @@ export function openStateDb(file: string = STATE_DB_PATH) {
       if (!hasColumn('tasks', 'outcome')) db.exec('ALTER TABLE tasks ADD COLUMN outcome TEXT');
       db.exec('PRAGMA user_version = 11');
     }
+    if (version < 12) {
+      for (const column of ['worktree_dir', 'workspace_peer']) {
+        if (!hasColumn('tasks', column)) db.exec(`ALTER TABLE tasks ADD COLUMN ${column} TEXT`);
+      }
+      db.exec('PRAGMA user_version = 12');
+    }
   });
 
   const getTask = (id: string) => one<TaskRow>(`${TASK_SELECT} WHERE t.id = ?`, id);
@@ -282,27 +291,38 @@ export function openStateDb(file: string = STATE_DB_PATH) {
     const row = one<{ id: string }>('SELECT id FROM tasks WHERE account_id = ? ORDER BY rowid LIMIT 1 OFFSET ?', accountId, seq - 1);
     return row && getTask(row.id);
   }
-  const hasRunning = (accountId: string, lane: TaskLane) =>
-    one(`SELECT 1 FROM tasks WHERE account_id = ? AND lane = ? AND status = 'running'`, accountId, lane) !== undefined;
+  const runningCount = (accountId: string) =>
+    one<{ n: number }>("SELECT COUNT(*) AS n FROM tasks WHERE account_id = ? AND status = 'running'", accountId)!.n;
+
+  // Called inside BEGIN IMMEDIATE. Pick the checkout owner before exposing the new claim to other processes.
+  function start(id: string): TaskRow {
+    run(`UPDATE tasks SET status = 'running', started_at = ?, workspace_peer = (
+      SELECT p.id FROM tasks p WHERE p.project_dir = tasks.project_dir AND p.status = 'running'
+        AND p.worktree_dir IS NULL AND p.id != tasks.id ORDER BY p.rowid LIMIT 1
+    ) WHERE id = ?`, Date.now(), id);
+    return getTask(id)!;
+  }
+
+  const eligible = `? < ? + (q.session_id IS NOT NULL) AND NOT EXISTS (
+    SELECT 1 FROM tasks r WHERE r.status = 'running' AND (r.session_id = q.session_id OR r.id = q.workspace_peer)
+  )`;
 
   function insertTask(
     accountId: string,
     input: string,
-    status: 'queued' | 'running',
     messageId: string | null = null,
     project: TaskProject | null = null,
     botId: string | null = null,
-    lane: TaskLane = 'write',
     routineId: string | null = null,
     sessionId: string | null = null,
   ): TaskRow {
     const id = randomUUID();
     const now = Date.now();
     run(
-      `INSERT INTO tasks (id, account_id, input, status, created_at, started_at, message_id, project_id, project_dir, bot_id, lane, routine_id, session_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      id, accountId, input, status, now, status === 'running' ? now : null, messageId, project?.id ?? null, project?.dir ?? null, botId, lane,
-      routineId, sessionId,
+      `INSERT INTO tasks (id, account_id, input, status, created_at, message_id, project_id, project_dir, bot_id, routine_id, session_id, worktree_dir)
+       VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?,
+         (SELECT worktree_dir FROM tasks WHERE session_id = ? AND worktree_dir IS NOT NULL ORDER BY rowid DESC LIMIT 1))`,
+      id, accountId, input, now, messageId, project?.id ?? null, project?.dir ?? null, botId, routineId, sessionId, sessionId,
     );
     // task_sessions keeps the task that first ran in a session; tasks.session_id names this one's use of it.
     if (sessionId) run('INSERT OR IGNORE INTO task_sessions (session_id, task_id, created_at) VALUES (?, ?, ?)', sessionId, id, now);
@@ -355,7 +375,6 @@ export function openStateDb(file: string = STATE_DB_PATH) {
       messageId: string | null = null,
       project?: TaskProject,
       botId?: string,
-      lane?: TaskLane,
       routineId?: string,
       sessionId?: string,
     ): { task: TaskRow; created: boolean } {
@@ -365,7 +384,7 @@ export function openStateDb(file: string = STATE_DB_PATH) {
             ? undefined
             : one<TaskRow>(`${TASK_SELECT} WHERE t.account_id = ? AND t.message_id = ?`, accountId, messageId);
         if (existing) return { task: existing, created: false };
-        return { task: insertTask(accountId, input, 'queued', messageId, project, botId, lane, routineId, sessionId), created: true };
+        return { task: insertTask(accountId, input, messageId, project, botId, routineId, sessionId), created: true };
       });
     },
 
@@ -380,7 +399,7 @@ export function openStateDb(file: string = STATE_DB_PATH) {
     },
 
     /**
-     * Insert a task directly as running (--simulate), unless its lane already has a running task. sessionId, as with
+     * Insert a task directly as running (--simulate), if a slot and its session are available. sessionId, as with
      * createTask, is the session it continues.
      */
     startTaskNow(
@@ -388,12 +407,13 @@ export function openStateDb(file: string = STATE_DB_PATH) {
       input: string,
       project?: TaskProject,
       botId?: string,
-      lane: TaskLane = 'write',
       sessionId?: string,
     ): TaskRow | null {
-      return immediate(() =>
-        hasRunning(accountId, lane) ? null : insertTask(accountId, input, 'running', null, project, botId, lane, null, sessionId),
-      );
+      return immediate(() => {
+        if (runningCount(accountId) >= maxTasks() + Number(!!sessionId)) return null;
+        if (sessionId && one("SELECT 1 FROM tasks WHERE session_id = ? AND status = 'running'", sessionId)) return null;
+        return start(insertTask(accountId, input, null, project, botId, null, sessionId).id);
+      });
     },
 
     /**
@@ -408,31 +428,34 @@ export function openStateDb(file: string = STATE_DB_PATH) {
         accountId, since, limit,
       ),
 
-    /** Atomically move the lane's oldest queued task to running; null if the lane is busy or has nothing queued. */
-    claimNextTask(accountId: string, lane: TaskLane): TaskRow | null {
+    /** Claim the oldest eligible task; a simulator retry may claim only its own row. */
+    claimNextTask(accountId: string, onlyId?: string): TaskRow | null {
       return immediate(() => {
-        if (hasRunning(accountId, lane)) return null;
         const next = one<{ id: string }>(
-          "SELECT id FROM tasks WHERE account_id = ? AND lane = ? AND status = 'queued' ORDER BY rowid LIMIT 1",
-          accountId, lane,
+          `SELECT q.id FROM tasks q WHERE q.account_id = ? AND q.status = 'queued' AND ${eligible}
+             AND (? IS NULL OR q.id = ?) ORDER BY q.rowid LIMIT 1`,
+          accountId, runningCount(accountId), maxTasks(), onlyId ?? null, onlyId ?? null,
         );
-        if (!next) return null;
-        run("UPDATE tasks SET status = 'running', started_at = ? WHERE id = ?", Date.now(), next.id);
-        return getTask(next.id)!;
+        return next ? start(next.id) : null;
       });
     },
 
-    /** The running tasks, at most one per lane, oldest first. */
+    /** Running tasks, oldest first. */
     runningTasks: (accountId: string) =>
       all<TaskRow>(`${TASK_SELECT} WHERE t.account_id = ? AND t.status = 'running' ORDER BY t.rowid`, accountId),
 
-    /** Tasks that will run before the given one: its lane's running task plus the lane's older queued tasks. */
+    /** Total ahead, or zero if there is capacity for this row. */
     countAhead(accountId: string, taskId: string): number {
-      return one<{ n: number }>(
-        `SELECT COUNT(*) AS n FROM tasks WHERE account_id = ? AND id != ? AND lane = (SELECT lane FROM tasks WHERE id = ?)
+      const task = getTask(taskId);
+      if (!task) return 0;
+      const n = one<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM tasks WHERE account_id = ? AND id != ?
            AND (status = 'running' OR (status = 'queued' AND rowid < (SELECT rowid FROM tasks WHERE id = ?)))`,
-        accountId, taskId, taskId, taskId,
+        accountId, taskId, taskId,
       )!.n;
+      if (task.session_id && one("SELECT 1 FROM tasks WHERE id != ? AND session_id = ? AND status = 'running'", taskId, task.session_id)) return Math.max(n, 1);
+      if (task.session_id && runningCount(accountId) === maxTasks()) return 0;
+      return n < maxTasks() + Number(!!task.session_id) ? 0 : n;
     },
 
     /** Most recent tasks, newest first. With beforeTaskId, only tasks inserted before it. */
@@ -445,13 +468,31 @@ export function openStateDb(file: string = STATE_DB_PATH) {
         : all<TaskRow>(`${TASK_SELECT} WHERE t.account_id = ? ORDER BY t.rowid DESC LIMIT ?`, accountId, limit);
     },
 
-    /** How long the newest done tasks (of the lane, if given) ran (ms), newest first; the queue ack's ETA comes from them. */
-    recentDurations(accountId: string, lane?: TaskLane, limit = 10): number[] {
+    /** How long this account's newest done tasks ran (ms). */
+    recentDurations(accountId: string, limit = 10): number[] {
       return all<{ ms: number }>(
-        `SELECT finished_at - started_at AS ms FROM tasks WHERE account_id = ? AND lane = COALESCE(?, lane) AND status = 'done'
+        `SELECT finished_at - started_at AS ms FROM tasks WHERE account_id = ? AND status = 'done'
            AND started_at IS NOT NULL AND finished_at IS NOT NULL AND finished_at >= started_at ORDER BY rowid DESC LIMIT ?`,
-        accountId, lane ?? null, limit,
+        accountId, limit,
       ).map((row) => row.ms);
+    },
+
+    waitForCheckout(id: string): void {
+      run("UPDATE tasks SET status = 'queued', started_at = NULL WHERE id = ? AND status = 'running'", id);
+    },
+
+    setWorktree(id: string, directory: string): void {
+      run('UPDATE tasks SET worktree_dir = ? WHERE id = ?', directory, id);
+    },
+
+    unusedWorktrees: (cutoff: number) => all<{ directory: string; project: string }>(
+      `SELECT worktree_dir AS directory, project_dir AS project FROM tasks WHERE worktree_dir IS NOT NULL
+       GROUP BY worktree_dir HAVING COUNT(finished_at) = COUNT(*) AND MAX(finished_at) < ? AND COUNT(session_id) = 0
+       AND MAX(EXISTS (SELECT 1 FROM task_sessions s WHERE s.task_id = tasks.id)) = 0`, cutoff,
+    ),
+
+    forgetWorktree(directory: string): void {
+      run('UPDATE tasks SET worktree_dir = NULL WHERE worktree_dir = ?', directory);
     },
 
     statusCounts(accountId: string): Record<TaskStatus, number> {

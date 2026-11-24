@@ -1,13 +1,13 @@
 // Which open task an inbound message belongs to, if any. A message that opens with a prefix ("@bot", "@project",
 // "@base", "新话题") is new work and never comes here; any other one goes to one short call of a fast model, with no
 // session and no tools, while the chat has open tasks.
-import { defaultBot, isReadOnlyBot, loadBots } from './bots.js';
+import { defaultBot, loadBots } from './bots.js';
 import { stopOneTask, type CommandContext } from './commands/handlers.js';
 import { logger } from './logger.js';
 import { DEFAULT_MODEL } from './model-routing.js';
 import { generateText } from './opencode/provider.js';
 import { clip, formatTime, joinRunningTask, taskStatusLabel } from './orchestrator.js';
-import type { StateDb, TaskLane, TaskProject, TaskRow } from './tasks/db.js';
+import type { StateDb, TaskProject, TaskRow } from './tasks/db.js';
 
 /** What a message does: new work, more input for one open task (attach), or the end of one (stop). */
 export type Route = { action: 'new'; reason?: string } | { action: 'attach' | 'stop'; task: TaskRow };
@@ -143,16 +143,14 @@ export async function routeToTask(db: StateDb, accountId: string, message: strin
 export interface NewTask {
   project?: TaskProject;
   botId?: string;
-  lane: TaskLane;
   continues?: string;
 }
 
-/** A task for a message that attaches to task: it runs where that one did, after it in its lane, and continues its session. */
+/** A follow-up runs where the conversation started, once its session is free. */
 export function followUpOf(task: TaskRow): NewTask {
   return {
     project: task.project_id && task.project_dir ? { id: task.project_id, dir: task.project_dir } : undefined,
     botId: task.bot_id ?? undefined,
-    lane: task.lane,
     continues: task.session_id ?? undefined,
   };
 }
@@ -174,14 +172,14 @@ export type Placement = { reply: string } | { task: NewTask };
  * Place an inbound message. Stop ends the task it names (stopOneTask). Attach puts the words into the task while it
  * is open, merged into its input while it waits and handed to it while it runs; both are synchronous, so the task
  * cannot start or close in between. Otherwise, an image included, attach makes a task that follows it (followUpOf).
- * New work runs where routeMessage said, its lane given by its bot.
+ * New work runs where routeMessage said.
  */
 export async function placeMessage(ctx: CommandContext, { input, image, routed }: Inbound): Promise<Placement> {
   const { db, accountId } = ctx;
   const route: Route = routed.prefixed ? { action: 'new' } : await routeToTask(db, accountId, input);
   if (route.action === 'stop') return { reply: stopOneTask(ctx, route.task.seq) };
   const target = route.action === 'attach' ? db.getTask(route.task.id) : undefined;
-  if (!target) return { task: { project: routed.project, botId: routed.botId, lane: isReadOnlyBot(routed.botId) ? 'read' : 'write' } };
+  if (!target) return { task: { project: routed.project, botId: routed.botId } };
   if (!image) {
     if (db.appendTaskInput(target.id, input, ['queued'])) {
       logger.info('Message merged into a queued task', { taskId: target.id, seq: target.seq });

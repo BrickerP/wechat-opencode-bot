@@ -195,6 +195,29 @@ export function stopEventStream(): void {
 /** The stream's state for /doctor; undefined when this process does not follow it. */
 export const eventStreamState = (): EventStreamState | undefined => events?.state();
 
+async function projectAt(directory: string): Promise<string> {
+  const params = new URLSearchParams({ 'location[directory]': directory });
+  const { project } = await api<{ project: { id: string } }>(`/api/location?${params}`, { signal: AbortSignal.timeout(15_000) });
+  if (!project?.id) throw new Error(`OpenCode has no project at ${directory}`);
+  return project.id;
+}
+
+export async function createWorktree(project: string, name: string): Promise<string> {
+  const projectID = await projectAt(project);
+  const { directory } = await api<{ directory: string }>('/api/worktree', {
+    method: 'POST', body: JSON.stringify({ projectID, name, from: project }), signal: AbortSignal.timeout(60_000),
+  });
+  if (!directory || !directory.startsWith('/') || directory === project) throw new Error('Invalid worktree directory');
+  return directory;
+}
+
+export async function removeWorktree(project: string, directory: string): Promise<void> {
+  const projectID = await projectAt(project);
+  await api('/api/worktree', {
+    method: 'DELETE', body: JSON.stringify({ projectID, directory, force: false }), signal: AbortSignal.timeout(60_000),
+  });
+}
+
 async function api<T = any>(path: string, init: RequestInit = {}): Promise<T> {
   const headers: Record<string, string> = {
     Accept: "application/json",

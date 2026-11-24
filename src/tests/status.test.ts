@@ -1,4 +1,4 @@
-// /status: the running task of each lane, and its health: the last 24 hours' outcomes and latest failure, the
+// /status: all running tasks, and its health: the last 24 hours' outcomes and latest failure, the
 // open breakers, the outbox backlog and the message token's age, never the token itself.
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -98,17 +98,17 @@ test('/status of a quiet account: nothing failed, no breaker open, no outbox lin
   assert.match(status, /^🔑 消息令牌: 无$/m);
 });
 
-test('/status shows the running task of each lane, oldest first, with its lane', () => {
+test('/status shows all running tasks, oldest first, with elapsed time', () => {
   const { task: write } = db.createTask('busy', '跑下测试', null, undefined, 'eng');
-  const { task: read } = db.createTask('busy', '看下日志', null, undefined, 'research', 'read');
+  const { task: read } = db.createTask('busy', '看下日志', null, undefined, 'research');
   assert.match(formatStatus(db, 'busy'), /^▶️ 运行中: 无$/m, 'queued tasks are not running');
-  db.claimNextTask('busy', 'read');
-  db.claimNextTask('busy', 'write');
+  db.claimNextTask('busy');
+  db.claimNextTask('busy');
   raw.prepare('UPDATE tasks SET started_at = ? WHERE id = ?').run(Date.now() - 3 * MINUTE, write.id);
   raw.prepare('UPDATE tasks SET started_at = ? WHERE id = ?').run(Date.now() - 40_000, read.id);
   assert.match(
     formatStatus(db, 'busy'),
-    /^▶️ 运行中: #1 @eng 跑下测试（write，已运行 3分钟）；#2 @research 看下日志（read，已运行 40秒）$/m,
+    /^▶️ 运行中: #1 @eng 跑下测试（已运行 3分钟）；#2 @research 看下日志（已运行 40秒）$/m,
   );
 });
 

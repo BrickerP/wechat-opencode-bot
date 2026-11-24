@@ -77,6 +77,7 @@ const notFound = (id: string): string =>
 function fakeApi(children: Record<string, string[]> = {}, fail: { list?: string[]; remove?: string[] } = {}) {
   const calls: string[] = [];
   const api: RetentionApi = {
+    async removeWorktree(_project, directory) { calls.push(`worktree ${directory}`); },
     async listChildren(sessionId) {
       calls.push(`list ${sessionId}`);
       if (fail.list?.includes(sessionId)) throw new Error('fetch failed');
@@ -107,7 +108,7 @@ test('a v7 database gains task_sessions, filled with the session each task names
   update.run('running', T0 - 3 * DAY, null, 'ses_running', running);
 
   const db = openStateDb(join(tmp, 'v7.db'));
-  assert.equal((raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 11);
+  assert.equal((raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 12);
   const rows = () =>
     raw.prepare('SELECT session_id, task_id, created_at FROM task_sessions ORDER BY session_id').all()
       .map((row) => [row.session_id, row.task_id, row.created_at]);
@@ -171,7 +172,7 @@ test('staleSessionIds: a session a follow-up continued goes only once every task
   const { db, raw, seed } = fresh('shared');
   const first = seed('done', 'ses_shared', T0 - 10 * DAY);
   seed('done', 'ses_other', T0 - 9 * DAY);
-  const { task: next } = db.createTask('acc', '继续', null, undefined, undefined, 'write', undefined, 'ses_shared');
+  const { task: next } = db.createTask('acc', '继续', null, undefined, undefined, undefined, 'ses_shared');
   seed('done', 'ses_recent', T0 - DAY);
   const cutoff = T0 - 7 * DAY;
   const set = raw.prepare('UPDATE tasks SET status = ?, finished_at = ? WHERE id = ?');
@@ -208,6 +209,27 @@ test('deleteSession: deleted or already gone resolves; any other failure rejects
     'DELETE /api/session/ses_unrouted',
     'DELETE /api/session/..%2Finfo',
   ]);
+});
+
+test('a shared worktree outlives every referencing session; a failed removal is retried by directory', async () => {
+  const { db, seed } = fresh('worktree');
+  const first = seed('done', 'ses_tree', T0 - 10 * DAY);
+  const next = seed('done', 'ses_next', T0 - 9 * DAY);
+  const directory = join(tmp, 'wechat-1');
+  for (const id of [first, next]) db.setWorktree(id, directory);
+  const { api, calls } = fakeApi();
+  api.removeWorktree = async () => { throw new Error('dirty worktree'); };
+  await pruneSessions(db, api, NOW);
+  assert.equal(db.getTask(next)?.session_id, 'ses_next', 'newest session is protected');
+  seed('done', 'ses_recent', T0);
+  await pruneSessions(db, api, NOW);
+  assert.equal(db.getTask(next)?.worktree_dir, directory);
+  assert.ok(logText().includes('dirty worktree'));
+  api.removeWorktree = async (_project, dir) => { calls.push(`remove ${dir}`); };
+  await pruneSessions(db, api, NOW);
+  assert.equal(calls.at(-1), `remove ${directory}`);
+  assert.equal(db.getTask(first)?.worktree_dir, null);
+  assert.equal(db.getTask(next)?.worktree_dir, null);
 });
 
 test('pruneSessions goes through the OpenCode API, subagent sessions before their parent, and forgets what went', async () => {

@@ -50,7 +50,7 @@ test('a v8 database gains the usage columns, and the handoff column older binari
   const migrated = openStateDb(v8);
   const columns = old.prepare("SELECT name FROM pragma_table_info('tasks')").all().map((c) => c.name);
   for (const column of ['handoff', 'tokens_in', 'tokens_out', 'cost_usd']) assert.ok(columns.includes(column), column);
-  assert.equal((old.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 11);
+  assert.equal((old.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 12);
   old.close();
   const row = migrated.getTask(task.id)!;
   assert.deepEqual([row.input, row.tokens_in, row.tokens_out, row.cost_usd], ['old task', null, null, null]);
@@ -147,7 +147,7 @@ test('a follow-up joins a task only while the task has one of the statuses given
   assert.equal(db.appendTaskInput(task.id, '还有 nginx 的', ['queued']), true);
   assert.equal(db.getTask(task.id)!.input, '看下日志\n还有 nginx 的');
   assert.equal(db.appendTaskInput(task.id, '晚了', ['running']), false, 'still queued');
-  db.claimNextTask('join', 'write');
+  db.claimNextTask('join');
   assert.equal(db.appendTaskInput(task.id, '再看下 redis', ['queued']), false, 'started meanwhile');
   assert.equal(db.appendTaskInput(task.id, '再看下 redis', ['running']), true);
   db.finishTask(task.id, 'done', { result: 'ok' });
@@ -158,7 +158,7 @@ test('a follow-up joins a task only while the task has one of the statuses given
 test('a follow-up task names the session it continues from the start; task_sessions keeps the task that ran there first', () => {
   const first = finished('cont');
   db.setTaskSession(first.id, 'ses_work');
-  const { task } = db.createTask('cont', '继续', 'msg-1', undefined, undefined, 'write', undefined, 'ses_work');
+  const { task } = db.createTask('cont', '继续', 'msg-1', undefined, undefined, undefined, 'ses_work');
   assert.equal(task.session_id, 'ses_work');
   assert.equal(task.status, 'queued');
   const owners = raw.prepare("SELECT task_id FROM task_sessions WHERE session_id = 'ses_work'").all().map((row) => row.task_id);

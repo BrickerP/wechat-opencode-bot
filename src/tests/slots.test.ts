@@ -1,7 +1,7 @@
-// Lanes: a read-only bot's task runs beside a write task. The v6 lane column, each lane's claim and queue
-// position, the queue's worker per lane, and /stop for both lanes.
+// Independent SQLite connections share the account limit, the reserved slot, and the session lock.
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -9,7 +9,8 @@ import { after, test } from 'node:test';
 import type { CommandContext } from '../commands/handlers.js';
 import type { StateDb, TaskRow } from '../tasks/db.js';
 
-const tmp = mkdtempSync(join(tmpdir(), 'owb-lanes-'));
+const tmp = mkdtempSync(join(tmpdir(), 'owb-slots-'));
+process.env.OWB_MAX_TASKS = '2';
 // Config and logs follow HOME, state and the registries OWB_DATA_DIR: keep all of them away from the real bot.
 process.env.HOME = tmp;
 process.env.OWB_DATA_DIR = join(tmp, 'data');
@@ -18,52 +19,90 @@ const { openStateDb } = await import('../tasks/db.js');
 const { createTaskQueue } = await import('../tasks/queue.js');
 const { createPermissionBroker } = await import('../permission.js');
 const { routeCommand } = await import('../commands/router.js');
+const { prepareWorkspace } = await import('../tasks/worktree.js');
 
 after(() => rmSync(tmp, { recursive: true, force: true }));
 
-/** Lets every pending promise callback run, so a lane can claim its next task. */
+test('worktree only for a contended single repository; reuse it for the next turn', async () => {
+  for (const kind of ['single', 'nested', 'nonrepo', 'base', 'unregistered', 'failure']) {
+    const dir = mkdtempSync(join(tmp, 'checkout-'));
+    if (kind !== 'nonrepo') execFileSync('git', ['init', '-q', dir]);
+    if (kind === 'nested') {
+      const nested = join(dir, 'one/two/three/four');
+      mkdirSync(nested, { recursive: true });
+      writeFileSync(join(nested, '.git'), 'gitdir: elsewhere');
+    }
+    const project = kind === 'unregistered' ? undefined : { id: kind, dir };
+    const db = openStateDb(join(tmp, `${kind}.db`));
+    const owner = db.startTaskNow('a', 'first', project)!;
+    let calls = 0;
+    const create = async (root: string, name: string) => {
+      calls++;
+      assert.deepEqual([root, name], [dir, 'wechat-2']);
+      if (kind === 'failure') throw new Error('disk full');
+      return `${dir}-isolated`;
+    };
+    assert.ok(await prepareWorkspace(db, owner, create));
+    assert.equal(calls, 0);
+    const second = db.startTaskNow('a', 'second', project)!;
+    assert.equal(await prepareWorkspace(db, second, create), kind !== 'failure');
+    assert.equal(calls, Number(kind === 'single' || kind === 'failure'));
+    if (kind === 'single') {
+      db.setTaskSession(second.id, 'session');
+      db.finishTask(second.id, 'done');
+      const next = db.startTaskNow('a', 'continue', project, undefined, 'session')!;
+      assert.equal(next.worktree_dir, `${dir}-isolated`);
+      assert.ok(await prepareWorkspace(db, next, create));
+      assert.equal(calls, 1);
+    } else if (kind === 'failure') {
+      db.createTask('a', 'unrelated');
+      assert.equal(db.getTask(second.id)?.status, 'queued');
+      assert.equal(db.claimNextTask('a')?.input, 'unrelated');
+      db.finishTask(owner.id, 'done');
+      const retry = db.claimNextTask('a')!;
+      assert.equal(retry.id, second.id);
+      assert.ok(await prepareWorkspace(db, retry, create));
+      assert.equal(calls, 1);
+    }
+  }
+});
+
+/** Let a finished runner release its slot. */
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
-/** Queue tasks of account "acc" in order; an input that starts with "r" goes to the read lane. */
 const addTasks = (db: StateDb, ...inputs: string[]): TaskRow[] =>
-  inputs.map((input) => db.createTask('acc', input, null, undefined, undefined, input.startsWith('r') ? 'read' : 'write').task);
+  inputs.map((input) => db.createTask('acc', input).task);
 
-test('a v5 database gains the lane column and its tasks are writes; new tasks store their lane', () => {
+test('migration keeps old rows and the lane default for rollback', () => {
   const file = join(tmp, 'v5.db');
   const { task } = openStateDb(file).createTask('acc', 'old task');
   const raw = new DatabaseSync(file);
   raw.exec('ALTER TABLE tasks DROP COLUMN lane; PRAGMA user_version = 5;');
   const db = openStateDb(file);
   assert.ok(raw.prepare("SELECT name FROM pragma_table_info('tasks')").all().some((c) => c.name === 'lane'));
-  assert.equal((raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 11);
+  assert.equal(raw.prepare('PRAGMA user_version').get()?.user_version, 12);
+  assert.equal(raw.prepare('SELECT lane FROM tasks').get()?.lane, 'write');
   raw.close();
-  assert.deepEqual([db.getTask(task.id)?.input, db.getTask(task.id)?.lane], ['old task', 'write']);
-  assert.equal(openStateDb(file).getTask(task.id)?.lane, 'write', 'opening again changes nothing');
-  assert.equal(db.createTask('acc', 'hi').task.lane, 'write');
-  assert.equal(db.createTask('acc', 'hi', 'm1', undefined, 'research', 'read').task.lane, 'read');
+  assert.deepEqual([db.getTask(task.id)?.input, db.getTask(task.id)?.worktree_dir], ['old task', null]);
 });
 
-test('each lane claims its own oldest task, and only tasks of the same lane count as ahead', () => {
-  const db = openStateDb(join(tmp, 'claim.db'));
-  const [w1, r1, w2, r2, r3] = addTasks(db, 'w1', 'r1', 'w2', 'r2', 'r3');
-  assert.deepEqual([w1, r1, w2, r2, r3].map((t) => db.countAhead('acc', t.id)), [0, 0, 1, 1, 2]);
-  assert.equal(db.claimNextTask('acc', 'read')?.id, r1.id, 'the read lane does not wait for the older write');
-  assert.equal(db.claimNextTask('acc', 'read'), null, 'one read at a time');
-  assert.equal(db.claimNextTask('acc', 'write')?.id, w1.id);
-  assert.equal(db.claimNextTask('acc', 'write'), null, 'one write at a time');
-  assert.deepEqual(db.runningTasks('acc').map((t) => t.input), ['w1', 'r1'], 'oldest first');
-  // The lane's running task plus its older queued tasks.
-  assert.deepEqual([w2, r2, r3].map((t) => db.countAhead('acc', t.id)), [1, 1, 2]);
-  db.finishTask(r1.id, 'done');
-  assert.equal(db.claimNextTask('acc', 'read')?.id, r2.id, 'the next read starts while the write still runs');
-  assert.equal(db.countAhead('acc', r3.id), 1);
-  // --simulate starts a task only while its lane is free.
-  assert.ok(db.startTaskNow('sim', 'w'));
-  assert.equal(db.startTaskNow('sim', 'w'), null);
-  assert.equal(db.startTaskNow('sim', 'r', undefined, 'research', 'read')?.lane, 'read');
+test('new work cannot consume the last slot; oldest eligible continuation starts, never two turns in one session', () => {
+  const file = join(tmp, 'claim.db');
+  const db = openStateDb(file), other = openStateDb(file);
+  const [a, b, c] = addTasks(db, 'a', 'b', 'c');
+  assert.equal(db.claimNextTask('acc')?.id, a.id);
+  assert.equal(other.claimNextTask('acc')?.id, b.id);
+  db.setTaskSession(a.id, 'busy');
+  for (const session of ['busy', 'free']) db.createTask('acc', session, null, undefined, undefined, undefined, session);
+  assert.equal(other.claimNextTask('acc')?.input, 'free');
+  assert.equal(db.claimNextTask('acc'), null);
+  db.finishTask(a.id, 'done');
+  assert.equal(db.claimNextTask('acc')?.input, 'busy');
+  for (const task of db.runningTasks('acc')) db.finishTask(task.id, 'done');
+  assert.equal(db.claimNextTask('acc')?.id, c.id);
 });
 
-test('the queue runs a read task beside a write task, and each lane waits only for itself', async () => {
+test('the queue fills ordinary slots and refills each as soon as its runner finishes', async () => {
   const db = openStateDb(join(tmp, 'queue.db'));
   addTasks(db, 'w1', 'r1', 'r2', 'w2');
   const started: string[] = [];
@@ -81,7 +120,7 @@ test('the queue runs a read task beside a write task, and each lane waits only f
   );
   const stopPolling = queue.start('acc');
   try {
-    assert.deepEqual([started, finished], [['w1', 'r1'], []], 'both lanes start before either finishes');
+    assert.deepEqual([started, finished], [['w1', 'r1'], []]);
     release.get('r1')!();
     await settle();
     assert.deepEqual(started, ['w1', 'r1', 'r2'], 'the second read follows the first read, not the write');
@@ -98,7 +137,7 @@ test('the queue runs a read task beside a write task, and each lane waits only f
   }
 });
 
-test('a runner crash fails only its task, the lane goes on, and the outbox hears of it', async () => {
+test('a runner crash fails only its task and the outbox hears of it', async () => {
   const db = openStateDb(join(tmp, 'crash.db'));
   const [r1, r2] = addTasks(db, 'r1', 'r2');
   const flushed: string[] = [];
@@ -116,7 +155,7 @@ test('a runner crash fails only its task, the lane goes on, and the outbox hears
   assert.deepEqual(flushed, ['acc']);
 });
 
-test('/stop stops the running task of both lanes and names them; /stop all also empties both queues', async () => {
+test('/stop names and stops all running tasks; /stop all also empties the queue', async () => {
   const db = openStateDb(join(tmp, 'stop.db'));
   addTasks(db, 'w1', 'r1', 'w2', 'r2');
   const aborted: string[] = [];
@@ -136,7 +175,7 @@ test('/stop stops the running task of both lanes and names them; /stop all also 
   queue.kick('acc');
   assert.equal(await routeCommand('/stop', ctx), '⏹ 已停止：任务 #1、#2');
   assert.deepEqual([...aborted].sort(), ['r1', 'w1']);
-  // Each lane moves on to its next task.
+  // Both free slots take new tasks.
   await settle();
   addTasks(db, 'w3', 'r3');
   assert.equal(await routeCommand('/stop all', ctx), '⏹ 已停止：任务 #3、#4\n🗑 已取消 2 个排队任务');

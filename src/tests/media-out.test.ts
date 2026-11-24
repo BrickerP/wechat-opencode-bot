@@ -250,7 +250,7 @@ test('a v9 database gains the files column and keeps its rows', () => {
   const migrated = openStateDb(v9);
   const columns = old.prepare("SELECT name FROM pragma_table_info('tasks')").all().map((c) => c.name);
   assert.ok(columns.includes('files'));
-  assert.equal((old.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 11);
+  assert.equal((old.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 12);
   old.close();
   const row = migrated.getTask(task.id)!;
   assert.deepEqual([row.input, row.files], ['old task', null]);

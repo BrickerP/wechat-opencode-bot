@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { checkMemory, memoryConnection, type MemoryCheck } from '../agentmemory.js';
-import { BOTS_PATH, defaultBot, detectBot, isReadOnlyBot, loadBots, type Bot } from '../bots.js';
+import { BOTS_PATH, defaultBot, detectBot, loadBots, type Bot } from '../bots.js';
 import { loadConfig, saveConfig, type PermissionMode } from '../config.js';
 import { DATA_DIR } from '../constants.js';
 import { logger } from '../logger.js';
@@ -133,7 +133,7 @@ Bot：
   /help             显示帮助
   /version          查看版本
 
-直接发送文字或图片即可。有运行中、排队中或 24 小时内结束的任务时，先由快速模型判断这条消息是接着其中一个任务（排队中就并入，运行中就交给它在下一个步骤采纳，已结束就在它的会话里接着做）、停止某个任务，还是新任务；新任务按顺序排队执行。只读 bot（如 @research）的任务单独排队，不等其他任务；它们只读不改，要改文件请发给其他 bot（如 @eng）。
+直接发送文字或图片即可。有运行中、排队中或 24 小时内结束的任务时，先由快速模型判断这条消息是接着其中一个任务（排队中就并入，运行中就交给它在下一个步骤采纳，已结束就在它的会话里接着做）、停止某个任务，还是新任务；新任务按空闲槽位并行执行（默认 3 个，另留一个给续接任务）。只读 bot（如 @research）只读不改，要改文件请发给其他 bot（如 @eng）。
 以 @bot 别名开头指定由哪个 bot 回复，@all 交给默认 bot 统筹，不指定时由默认 bot 回复（发送 /bots 查看）。
 以 @别名 开头或提到项目别名，任务就在该项目目录运行；可同时指定 bot 和项目，顺序不限，如 @research @miaoda 看下发布流程。
 以 @bot、@项目、@base 或“新话题：”开头的消息总是新任务，不经判断；@base 开头则在工作目录运行。
@@ -230,7 +230,7 @@ export function formatStatus(db: StateDb, accountId: string, gateways?: Gateway[
   const now = Date.now();
   const running = db
     .runningTasks(accountId)
-    .map((t) => `#${t.seq} ${taskInput(t, 30, primary.id)}（${t.lane}，已运行 ${formatElapsed(t.started_at ?? t.created_at, now)}）`);
+    .map((t) => `#${t.seq} ${taskInput(t, 30, primary.id)}（已运行 ${formatElapsed(t.started_at ?? t.created_at, now)}）`);
   const day = db.usageSince(accountId, now - DAY_MS);
   const lines = [
     `📂 工作目录: ${user?.workspace || config.workingDirectory}`,
@@ -473,18 +473,17 @@ function routineProject(routine: RoutineRow, bots: Bot[]): TaskProject | undefin
 }
 
 /**
- * Queue the routine's task the way its message would have been: its bot, its project, the bot's lane. The
+ * Queue the routine's task the way its message would have been: its bot and project. The
  * routine then counts as run at now. Shared by the scheduler and /routine run.
  */
 function queueRoutine(db: StateDb, routine: RoutineRow, schedule: Schedule, now: number): { task: TaskRow; nextRunAt: number } {
   const bots = loadBots();
   const project = routineProject(routine, bots);
-  const lane = isReadOnlyBot(routine.bot_id, bots) ? 'read' : 'write';
-  const { task } = db.createTask(routine.account_id, routine.prompt, null, project, routine.bot_id ?? undefined, lane, routine.id);
+  const { task } = db.createTask(routine.account_id, routine.prompt, null, project, routine.bot_id ?? undefined, routine.id);
   const nextRunAt = schedule.nextRunAt(now, routine.next_run_at);
   db.markRoutineRun(routine.id, nextRunAt, now);
   // Not the prompt: it is the user's, like a message.
-  logger.info('Routine queued', { routineId: routine.id, name: routine.name, taskId: task.id, seq: task.seq, lane });
+  logger.info('Routine queued', { routineId: routine.id, name: routine.name, taskId: task.id, seq: task.seq });
   return { task, nextRunAt };
 }
 
@@ -626,7 +625,7 @@ export const handlers: Record<string, Handler> = {
 
   /**
    * A correction for a running task: it goes into the task's session, which takes it in at its next step (see
-   * joinRunningTask). The task stays one task in its lane, and its answer is still its one reply.
+   * joinRunningTask). The task stays one task, and its answer is still its one reply.
    */
   async steer(args, { accountId, db }) {
     const [, seq, text] = /^(?:[#＃](\d+)\s*)?([\s\S]*)$/.exec(args)!;

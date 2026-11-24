@@ -3,18 +3,19 @@ import { extname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { maybeAlertFailures } from './alerts.js';
 import { saveMemories, searchMemories, type Memory } from './agentmemory.js';
-import { defaultBot, loadBots, resolveBot, type Bot } from './bots.js';
+import { defaultBot, isReadOnlyBot, loadBots, resolveBot, type Bot } from './bots.js';
 import { loadConfig } from './config.js';
 import { DATA_DIR } from './constants.js';
 import { logger } from './logger.js';
 import { breaker, checkFallback, DEFAULT_MODEL, providerOf, type FallbackCheck } from './model-routing.js';
 import { openCodeQuery, type FollowUps, type PermissionDecision, type PermissionRequest, type QueryResult, type Usage } from './opencode/provider.js';
 import { isRealPathInside } from './projects.js';
-import type { StateDb, TaskRow, TaskStatus, TaskUsage } from './tasks/db.js';
+import { maxTasks, type StateDb, type TaskRow, type TaskStatus, type TaskUsage } from './tasks/db.js';
+import { prepareWorkspace } from './tasks/worktree.js';
 
 /** OpenCode agent that plans each task and delegates the work to subagent sessions. */
 export const ORCHESTRATOR_AGENT = 'wechat-orchestrator';
-/** The read lane's orchestrator: it can only delegate to wechat-explore, so it cannot write beside a write task. */
+/** A read-only bot can delegate only to wechat-explore. */
 export const ORCHESTRATOR_READ_AGENT = 'wechat-orchestrator-read';
 
 const RECENT_TASKS = 8;
@@ -247,6 +248,12 @@ export function composePrompt(
   const bots = loadBots();
   const { bot, all } = resolveBot(task.bot_id, bots);
   const context = [`workspace: ${workspace}`, `time: ${formatTime(Date.now())} (Asia/Shanghai)`, `task: #${task.seq}`];
+  if (task.worktree_dir) {
+    const peer = task.workspace_peer && db.getTask(task.workspace_peer);
+    context.push(`worktree: ${workspace}. Another task${peer ? ` #${peer.seq}` : ''} used the original checkout (${task.project_dir}). ` +
+      `Keep all work here; never change the original checkout. HEAD starts detached: before editing run git switch -c wechat-${task.seq} ` +
+      'if still detached, commit changes on your branch, and name the branch in your reply.');
+  }
   if (existsSync(WORK_ACTIVITY_COLLECTOR)) context.push(`collector: ${WORK_ACTIVITY_COLLECTOR}`);
   if (existsSync(SESSION_READER)) context.push(`session-reader: node ${SESSION_READER} --session`);
   if (retry) {
@@ -256,7 +263,7 @@ export function composePrompt(
   const recent = db.recentTasks(task.account_id, RECENT_TASKS, task.id).reverse();
   // The repo's own instructions reach the session through OpenCode, never through this prompt.
   const project = task.project_id
-    ? [`<project>\nid: ${task.project_id}\ndir: ${task.project_dir}\n${PROJECT_PRECEDENCE}\n</project>`]
+    ? [`<project>\nid: ${task.project_id}\ndir: ${task.worktree_dir ?? task.project_dir}\n${PROJECT_PRECEDENCE}\n</project>`]
     : [];
   return [
     `<context>\n${context.join('\n')}\n</context>`,
@@ -401,7 +408,7 @@ export function formatQueueAck(seq: number, ahead: number, durations: number[]):
   const sorted = [...durations].sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);
   const median = sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-  const eta = median * ahead;
+  const eta = median * Math.max(1, Math.floor(ahead / maxTasks()));
   return `${ack}，${eta < 60_000 ? '预计不到 1 分钟' : `预计约 ${Math.round(eta / 60_000)} 分钟`}`;
 }
 
@@ -497,7 +504,8 @@ export async function runTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Ab
     },
   };
   try {
-    await runOpenTask(db, task, io, signal, followUps);
+    if (task.workspace_peer && !await prepareWorkspace(db, task)) return;
+    if (!signal.aborted && db.getTask(task.id)?.status === 'running') await runOpenTask(db, db.getTask(task.id)!, io, signal, followUps);
   } finally {
     openTasks.delete(task.id);
   }
@@ -530,7 +538,7 @@ async function runOpenTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Abort
     pruneAttachments();
     const user = db.getUser(task.account_id);
     // A project task opens at the repo root, so OpenCode loads that repo's AGENTS.md and opencode.json.
-    workspace = task.project_dir || user?.workspace || loadConfig().workingDirectory;
+    workspace = task.worktree_dir || task.project_dir || user?.workspace || loadConfig().workingDirectory;
     // The session the work runs in: the one this task continues, if any, then the one its last attempt ran in.
     let sessionId = task.session_id ?? undefined;
     const attachments = resolveAttachments(db, task, sessionId === undefined);
@@ -544,7 +552,7 @@ async function runOpenTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Abort
       openCodeQuery({
         prompt,
         cwd: workspace,
-        agent: task.lane === 'read' ? ORCHESTRATOR_READ_AGENT : ORCHESTRATOR_AGENT,
+        agent: isReadOnlyBot(task.bot_id) ? ORCHESTRATOR_READ_AGENT : ORCHESTRATOR_AGENT,
         // A continued session switches to this attempt's model; the agent's own counts as DEFAULT_MODEL there.
         model: session ? next ?? DEFAULT_MODEL : next,
         sessionId: session,
@@ -698,7 +706,6 @@ async function runOpenTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Abort
   try {
     await io.deliver(finished);
   } finally {
-    // The lane takes its next task only once this one's memory is written, so that task can find it.
     await saving;
   }
 }

@@ -21,7 +21,7 @@ export interface PendingPermission {
 export type OnPermissionTimeout = (ask: PendingPermission) => void;
 
 /**
- * Asks wait in a queue per account, so the read and write lanes can both ask: y/n answers the oldest ask,
+ * Asks wait in a queue per account, so the concurrent tasks can all ask: y/n answers the oldest ask,
  * the one shown first. Each ask times out on its own.
  */
 export function createPermissionBroker(onTimeout?: OnPermissionTimeout) {

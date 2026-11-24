@@ -14,6 +14,7 @@ import type { StateDb, TaskRow, TaskStatus } from '../tasks/db.js';
 
 const tmp = mkdtempSync(join(tmpdir(), 'owb-task-router-'));
 // Config and logs follow HOME, state and the registries OWB_DATA_DIR: keep all of them away from the real bot.
+process.env.OWB_MAX_TASKS = '2';
 process.env.HOME = tmp;
 process.env.OWB_DATA_DIR = join(tmp, 'data');
 mkdirSync(join(tmp, 'work', 'medo'), { recursive: true });
@@ -76,13 +77,12 @@ function fresh() {
       ago?: number;
       session?: string;
       botId?: string;
-      lane?: 'read' | 'write';
       summary?: string;
       result?: string;
       outcome?: string;
     } = {},
   ): TaskRow => {
-    const { task } = db.createTask('acc', input, null, undefined, fields.botId, fields.lane);
+    const { task } = db.createTask('acc', input, null, undefined, fields.botId);
     const status = fields.status ?? 'queued';
     const at = Date.now() - (fields.ago ?? 0);
     raw
@@ -123,7 +123,7 @@ function context(db: StateDb) {
   return { ctx, queue, aborted };
 }
 
-/** Lets every pending promise callback run, so a lane can claim its next task. */
+/** Lets every pending promise callback run, so a slot can take its next task. */
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
 test('open tasks: running, queued, and finished within 24 hours with a session; one per session, newest first, at most 6', () => {
@@ -210,23 +210,23 @@ test('a failed call, an empty answer or no answer in time is new work', async ()
   assert.ok(Date.now() - startedAt < 3000, 'it does not wait for the answer');
 });
 
-test('a prefixed message never reaches the router; new work runs where routeMessage said, in the lane of its bot', async () => {
+test('a prefixed message never reaches the router; new work runs where routeMessage said, with its own bot', async () => {
   const { db, add } = fresh();
   add('看下日志', { status: 'running', session: 'ses_a' });
   const { ctx } = context(db);
   const medo = { id: 'medo', dir: join(tmp, 'work', 'medo') };
-  assert.deepEqual(await placeMessage(ctx, inbound('@research 继续')), { task: { project: undefined, botId: 'research', lane: 'read' } });
-  assert.deepEqual(await placeMessage(ctx, inbound('@medo 看下')), { task: { project: medo, botId: 'chief', lane: 'write' } });
+  assert.deepEqual(await placeMessage(ctx, inbound('@research 继续')), { task: { project: undefined, botId: 'research' } });
+  assert.deepEqual(await placeMessage(ctx, inbound('@medo 看下')), { task: { project: medo, botId: 'chief' } });
   assert.equal(calls.length, 0);
   answers.push('{"action":"new"}');
-  assert.deepEqual(await placeMessage(ctx, inbound('看下 medo 的部署')), { task: { project: medo, botId: 'chief', lane: 'write' } });
+  assert.deepEqual(await placeMessage(ctx, inbound('看下 medo 的部署')), { task: { project: medo, botId: 'chief' } });
   assert.equal(calls.length, 1);
 });
 
 test('attach merges words into a queued task; a finished or running task, or an image, gets a task that follows it', async () => {
   const { db, add } = fresh();
   const queued = add('看下日志');
-  const finished = add('查下发布', { status: 'done', ago: HOUR, session: 'ses_done', botId: 'research', lane: 'read' });
+  const finished = add('查下发布', { status: 'done', ago: HOUR, session: 'ses_done', botId: 'research' });
   const running = add('跑测试', { status: 'running', session: 'ses_run' });
   const { ctx } = context(db);
   answers.push(`{"action":"attach","task":${queued.seq}}`);
@@ -234,7 +234,7 @@ test('attach merges words into a queued task; a finished or running task, or an 
   assert.equal(db.getTask(queued.id)!.input, '看下日志\n还有 nginx 的');
   answers.push(`{"action":"attach","task":${finished.seq}}`);
   assert.deepEqual(await placeMessage(ctx, inbound('那第二个呢')), {
-    task: { project: undefined, botId: 'research', lane: 'read', continues: 'ses_done' },
+    task: { project: undefined, botId: 'research', continues: 'ses_done' },
   });
   // Running, but in no runner of this process, as right after a restart: it cannot take the words in.
   answers.push(`{"action":"attach","task":${running.seq}}`);
@@ -243,7 +243,7 @@ test('attach merges words into a queued task; a finished or running task, or an 
   assert.equal(db.getTask(running.id)!.input, '跑测试', 'nothing joined it');
   answers.push(`{"action":"attach","task":${queued.seq}}`);
   assert.deepEqual(await placeMessage(ctx, inbound('[图片]', true)), {
-    task: { project: undefined, botId: undefined, lane: 'write', continues: undefined },
+    task: { project: undefined, botId: undefined, continues: undefined },
   });
   assert.equal(db.getTask(queued.id)!.input, '看下日志\n还有 nginx 的', 'an image is not merged');
 });
@@ -251,7 +251,7 @@ test('attach merges words into a queued task; a finished or running task, or an 
 test('stop cancels a queued task, or stops one running task alone and denies its asks; an ended task says so', async () => {
   const { db, add } = fresh();
   const w1 = add('w1');
-  const r1 = add('r1', { botId: 'research', lane: 'read' });
+  const r1 = add('r1', { botId: 'research' });
   const w2 = add('w2');
   const { ctx, queue, aborted } = context(db);
   queue.kick('acc');
@@ -267,9 +267,9 @@ test('stop cancels a queued task, or stops one running task alone and denies its
     assert.deepEqual(aborted, ['w1']);
     const row = db.getTask(w1.id)!;
     assert.deepEqual([row.status, row.error, row.notified], ['interrupted', '用户停止', 1]);
-    assert.equal(db.getTask(r1.id)!.status, 'running', 'the read lane runs on');
+    assert.equal(db.getTask(r1.id)!.status, 'running', 'the other task runs on');
     assert.equal(ctx.broker.getPending('acc')?.answer, other, 'and its ask still waits');
-    assert.equal(db.getTask(w2.id)!.status, 'running', 'the write lane moved on');
+    assert.equal(db.getTask(w2.id)!.status, 'running', 'the next task started');
 
     const w3 = add('w3');
     answers.push(`{"action":"stop","task":${w3.seq}}`);

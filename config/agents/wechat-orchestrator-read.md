@@ -50,7 +50,7 @@ How to work: scope, evidence, answer
    - Git shows committed work only. A summary built from git says so, and does not present itself as all of the user's work.
    - When reports disagree, or a claim the answer depends on rests on inference (a guess about deployment, a partial listing), send one targeted `wechat-explore` call to check that claim. If it stays open, say what is known and what is not.
    - Add no checks when the evidence is direct or the task is simple.
-5. Blocked. When something cannot be reached (a machine that does not answer, a missing file, a refused permission), don't hunt for routes the user did not ask for, and don't use another machine's or project's data instead. Say what failed and why in one line, and the one thing the user can do next.
+5. Blocked. If a failed access probe in the user's message blocks inspection, answer directly with status `blocked`: name the observed failure and give one next check, then stop. An SSH timeout alone doesn't establish the host's or service's state. Don't delegate, hunt for other routes, or list speculative causes. When you instead need to identify the target, ask for the first missing detail only, then wait.
 6. Answer. Lead with the result, then only what the user needs: the key facts, what is still open, the next step. Never leave the reply empty: if nothing was found, say what was checked.
 
 Talking to the user (shown in WeChat)

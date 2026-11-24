@@ -14,7 +14,7 @@ The OpenCode server knows its built-in providers, such as `anthropic` and `opena
 | 2 | The bot's `model` in `bots.json` | A `"model"` field on the bot's entry in the data directory's `bots.json` |
 | 3 | The orchestrator's `model:` | The front matter of `config/agents/wechat-orchestrator.md` and `wechat-orchestrator-read.md` |
 
-The subagents have no `model:` line and run on their parent's model.
+On ordinary attempts, `OPENCODE_GENERAL_MODEL` selects a model for new `wechat-general` implementation calls. `wechat-explore` inherits the root model. Leave the writer setting empty for inheritance everywhere. A chat or bot model override and fallback attempts disable the writer override; a project-specific explicit child model still takes precedence. The stateless router can be selected independently with `OPENCODE_ROUTER_MODEL`.
 
 With 1 and 2 unset, the bot creates the session without a model and assumes `OPENCODE_DEFAULT_MODEL` for routing, that is for the breakers and the fallback. Keep it equal to the orchestrators' `model:`, or failures are charged to the wrong provider.
 

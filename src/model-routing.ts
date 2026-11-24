@@ -9,6 +9,15 @@ export type ErrorKind = 'auth' | 'quota' | 'timeout' | 'transport' | 'server' | 
  */
 export const DEFAULT_MODEL = process.env.OPENCODE_DEFAULT_MODEL || 'oneapi/DeepSeek-V4.1-Flash';
 
+/** A stateless classification doesn't need the orchestrator's reasoning budget. Keep custom models/variants intact. */
+export const ROUTER_MODEL = process.env.OPENCODE_ROUTER_MODEL?.trim() ||
+  (DEFAULT_MODEL === 'oneapi/DeepSeek-V4.1-Flash' ? `${DEFAULT_MODEL}#low` : DEFAULT_MODEL);
+
+/** An explicit task model (including a fallback) applies to the entire attempt. */
+export function generalModel(attemptOverride?: string): string | null {
+  return attemptOverride ? null : process.env.OPENCODE_GENERAL_MODEL?.trim() || null;
+}
+
 const MAX_COOLDOWN_MS = 60 * 60 * 1000;
 
 /** The gateway, i.e. the OpenCode provider, of "provider/model[#variant]". */

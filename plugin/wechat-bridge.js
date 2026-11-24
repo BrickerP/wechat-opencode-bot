@@ -65,6 +65,15 @@ const reply = {
 export default {
   id: "wechat-bridge",
   async setup(ctx) {
+    // Set a default on new implementation delegations only. An explicit model in the brief (e.g. a project's
+    // restricted provider), a resumed child, other agents, and ordinary OpenCode sessions retain their selection.
+    await ctx.tool.hook("execute.before", async (event) => {
+      if (event.tool !== "subagent" || event.agent !== "wechat-orchestrator" || event.input?.agent !== "wechat-general" ||
+          event.input.sessionID || event.input.model) return
+      const session = await ctx.session.get({ sessionID: event.sessionID })
+      const model = session.metadata?.wechatGeneralModel
+      if (typeof model === "string" && model) event.input = { ...event.input, model }
+    })
     await ctx.tool.transform((editor) => {
       editor.add(report)
       editor.add(reply)

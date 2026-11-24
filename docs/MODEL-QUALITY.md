@@ -1,6 +1,6 @@
 # Model quality
 
-Status on 2026-11-12: a proposal, not applied. The five cases below were run in a synthetic harness, see [Results on 2026-11-12](#results-on-2026-11-12): on the default `oneapi/DeepSeek-V4.1-Flash`, the prompts that v0.2.5 ships passed all five, and `oneapi-chat/Opus 5.5` failed every run with HTTP 502, so the example's choice of Opus is not evaluated. [`config/evaluation/bot-models.example.json`](../config/evaluation/bot-models.example.json) suggests a model per bot; the bot never reads that file. When this was written, the production bots set no `model`. In the example, only chief and eng change model: research's value equals today's default, and ops keeps none.
+The November 12 per-bot proposal below is historical. For role-based selection use `OPENCODE_ROUTER_MODEL` and `OPENCODE_GENERAL_MODEL`. The five cases below were run in a synthetic harness, see [Results on 2026-11-12](#results-on-2026-11-12): on the default `oneapi/DeepSeek-V4.1-Flash`, the prompts that v0.2.5 ships passed all five, and `oneapi-chat/Opus 5.5` failed every run with HTTP 502, so the example's choice of Opus is not evaluated. [`config/evaluation/bot-models.example.json`](../config/evaluation/bot-models.example.json) suggests a model per bot; the bot never reads that file. When this was written, the production bots set no `model`. In the example, only chief and eng change model: research's value equals today's default, and ops keeps none.
 
 ## How a task gets its model
 
@@ -10,9 +10,9 @@ A task runs on the first of these that is set:
 2. The bot's `model` in the data directory's `bots.json`. `/bots` shows each bot's model and the file's path. The file is re-read for every message, so an edit needs no restart.
 3. The orchestrator agent's `model:`, `oneapi/DeepSeek-V4.1-Flash` in both orchestrators, which routing takes to be `OPENCODE_DEFAULT_MODEL`. Leave both as they are.
 
-Subagents have no `model:` line and run on their parent's model. When chief briefs a subagent in research's role, that subagent runs on chief's model, however cheap research's `model` is. Research's own `model` applies only to tasks routed to research, such as a message that starts with `@研究` or `@research`. `@all` goes to chief, so every specialist's subagent then runs on chief's model.
+On ordinary attempts, `OPENCODE_GENERAL_MODEL` selects a model for new `wechat-general` implementation calls. `wechat-explore` inherits the root model. Leave the writer setting empty for inheritance everywhere. A chat or bot model override and fallback attempts disable the writer override; a project-specific explicit child model still takes precedence. The daemon sets this policy per attempt in session metadata, so a fallback or a new `/model` on a continued session clears the previous writer selection.
 
-Fallback stays as configured. After an upstream failure, such as a 429, a 5xx or a timeout, the task gets one retry in the same session, switched to `OPENCODE_FALLBACK_MODEL`, for every bot, if the server lists it at that moment, and its subagents follow because nothing pins them; without it there is no retry. Do not add `model:` to `wechat-explore.md` or `wechat-general.md`: it would pin the subagents of every bot, on the retry too, so neither the parent's model nor the fallback would reach them. Nothing here verifies that the primary's provider and the fallback's run on different hosts; if they share one, an outage of that host takes the retry down too ([Your own gateway](PROVIDERS.md#your-own-gateway)).
+Nothing here verifies that the primary's provider and the fallback's run on different hosts; if they share one, an outage of that host takes the retry down too ([Your own gateway](PROVIDERS.md#your-own-gateway)).
 
 ## Apply the example (pending)
 

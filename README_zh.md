@@ -67,7 +67,7 @@ flowchart LR
 | 聊天有未结束任务时的其他消息 | 分派器把它接到哪个任务上就用那个任务的（见下），否则同上 | 同左 |
 
 - 没有 `@` 时由默认 bot 回答；bot 不会根据正文猜测。项目取正文任意位置出现的 2 字及以上别名（ASCII 别名须整词匹配），没有就不指定。只认 `projects.json`：正文里的路径不会被当作目录打开。与 bot 别名相同的项目别名会被丢弃。
-- 以表中前缀（`@bot`、`@项目`、`@base`、`@all`、`新话题`）开头的消息总是新任务。其他消息在聊天有未结束的任务时先交给任务分派器（`src/task-router.ts`）：经 OpenCode 的 `POST /api/experimental/generate/text` 调用一次 `OPENCODE_DEFAULT_MODEL`，不建会话、不用工具，约 2 秒，最长 15 秒。未结束的任务指运行中、排队中，以及 24 小时内结束且会话仍在的任务，取最新的 6 个，接着做的同一段对话只算一个。分派器能看到每个任务的状态、时间、bot、项目、输入、摘要，以及回复结尾问用户的问题（如果有），然后给出下面之一：
+- 以表中前缀（`@bot`、`@项目`、`@base`、`@all`、`新话题`）开头的消息总是新任务。其他消息在聊天有未结束的任务时先交给任务分派器（`src/task-router.ts`）：经 OpenCode 的 `POST /api/experimental/generate/text` 调用一次路由模型，不建会话、不用工具，约 2 秒，最长 15 秒。未结束的任务指运行中、排队中，以及 24 小时内结束且会话仍在的任务，取最新的 6 个，接着做的同一段对话只算一个。分派器能看到每个任务的状态、时间、bot、项目、输入、摘要，以及回复结尾问用户的问题（如果有），然后给出下面之一：
   - attach #N：消息是在接着、修正、缩小或回答任务 #N。它还在排队，文字就追加到它的输入里（`↪️ 已合并到排队中的任务 #N`）。它正在运行，就由它在下一个步骤把消息送进会话；若这一轮已经答完，就给这条消息单独一轮，任务仍只回复一次（`↪️ 已追加到正在运行的任务 #N…`）。它已经结束，消息就成为新任务，用 #N 的 bot 和项目，接着 #N 的会话做，因此能看到之前的全部工作；会话已不存在时，新任务另开一个会话。图片总是单独成为一个任务，跟在 #N 后面。
   - stop #N：排队中的任务被取消（`🗑 已取消任务 #N`），运行中的任务单独停止（`⏹ 已停止任务 #N`）。`/stop` 仍然停止所有运行中的任务。
   - new：新任务，按上表分派。
@@ -82,7 +82,7 @@ flowchart LR
 
 ### 模型路由与容错
 
-- 任务优先使用聊天里 `/model` 设置的模型；没有时使用 `bots.json` 中该 bot 的 `model`；都没有时使用 orchestrator 自己的 `model:`，路由假定它等于 `OPENCODE_DEFAULT_MODEL`。子 agent 没有 `model:` 行，沿用父会话的模型。
+- 任务优先使用聊天里 `/model` 设置的模型；没有时使用 `bots.json` 中该 bot 的 `model`；都没有时使用 orchestrator 自己的 `model:`，路由假定它等于 `OPENCODE_DEFAULT_MODEL`。普通任务可用 `OPENCODE_GENERAL_MODEL` 指定实现任务的模型；只读调查沿用父模型。聊天或 bot 显式选模型、或切换到备用模型时，写任务也沿用本轮模型。项目明确指定的子任务模型优先。
 - `bots.json` 的每个 bot 可以选填 `model`（`provider/model[#variant]`）；`/model` 会覆盖所有 bot，`/model default` 恢复各 bot 自己的 model。
 - 上游失败会在 `OPENCODE_FALLBACK_MODEL` 上重试一次，前提是设置了它、且服务器此刻的模型列表（`GET /api/model`）里有它；模型可能在 bot 运行期间被移除，所以每次使用前、启动时和 `/doctor` 都会核对。设置了但列表里没有的备用模型不会被尝试，任务的错误会说明原因；没有设置时，上游失败不重试。上游失败包括 429 或额度不足、5xx 或过载、超时、连接错误、鉴权以外的 `provider.*` 错误，以及模型首次输出前沉默 120 秒、或两次进展之间沉默 180 秒。进展包括正在流式输出的推理、正文和工具参数，守护进程从 OpenCode 的事件流（`GET /api/event`）读取它们；消息快照要等它们输出完才看得到。事件流断开时只靠轮询判断进展，`/doctor` 会提示。重试接着同一个会话、换成备用模型，用一段简短的 prompt 说明第一次尝试为何停下，并要求先检查它改过什么再继续；会话已不存在时，新开一个会话并给完整 prompt。你只会看到最终结果。
 - 不重试：鉴权、权限、4xx 和未知错误，本地服务的错误，以及单轮 30 分钟的上限。
@@ -209,7 +209,9 @@ OpenCode 请求审批时，守护进程按 `config.env` 里的模式处理。每
 | `OPENCODE_PORT` | `4096` | 没有服务响应时，守护进程自行启动的服务所用端口 |
 | `OPENCODE_SERVER_PASSWORD` | 空 | 服务密码，以用户 `opencode` 的 Basic auth 发送 |
 | `WECHAT_ALLOWED_IDS` | 绑定的账号 | bot 接收消息的微信用户 id，逗号分隔 |
-| `OPENCODE_DEFAULT_MODEL` | `oneapi/DeepSeek-V4.1-Flash` | 没有 `/model` 时路由假定的模型，也是任务分派器用的模型；与 orchestrator 的 `model:` 保持一致 |
+| `OPENCODE_ROUTER_MODEL` | 内置 Flash 用 `#low`，否则沿用 `OPENCODE_DEFAULT_MODEL` | 仅用于判断消息属于哪个任务 |
+| `OPENCODE_GENERAL_MODEL` | 未设 | 实现任务可用的较强模型，格式为服务端支持的 `provider/model[#variant]` |
+| `OPENCODE_DEFAULT_MODEL` | `oneapi/DeepSeek-V4.1-Flash` | 未指定时的主任务模型；与 orchestrator 的 `model:` 保持一致 |
 | `OPENCODE_FALLBACK_MODEL` | 无 | 上游失败后那一次重试使用的模型，即使与主模型在同一个 provider 上。只在服务器列出它时使用；启动时、`/doctor` 和每次使用前都会核对。未设置：不重试 |
 | `OPENCODE_FIRST_RESPONSE_TIMEOUT_MS`、`OPENCODE_STALL_TIMEOUT_MS` | `120000`、`180000` | 首次输出前、两次进展之间允许的沉默时长（事件流上的流式输出算作进展） |
 | `OWB_BREAKER_THRESHOLD`、`OWB_BREAKER_COOLDOWN_MS` | `3`、`600000` | 打开熔断所需的连续上游失败次数，以及首次冷却时长 |

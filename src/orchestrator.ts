@@ -7,7 +7,7 @@ import { defaultBot, isReadOnlyBot, loadBots, resolveBot, type Bot } from './bot
 import { loadConfig } from './config.js';
 import { DATA_DIR } from './constants.js';
 import { logger } from './logger.js';
-import { breaker, checkFallback, DEFAULT_MODEL, providerOf, type FallbackCheck } from './model-routing.js';
+import { breaker, checkFallback, DEFAULT_MODEL, generalModel, providerOf, type FallbackCheck } from './model-routing.js';
 import { openCodeQuery, type FollowUps, type PermissionDecision, type PermissionRequest, type QueryResult, type Usage } from './opencode/provider.js';
 import { isRealPathInside } from './projects.js';
 import { maxTasks, type StateDb, type TaskRow, type TaskStatus, type TaskUsage } from './tasks/db.js';
@@ -555,6 +555,7 @@ async function runOpenTask(db: StateDb, task: TaskRow, io: TaskIO, signal: Abort
         agent: isReadOnlyBot(task.bot_id) ? ORCHESTRATOR_READ_AGENT : ORCHESTRATOR_AGENT,
         // A continued session switches to this attempt's model; the agent's own counts as DEFAULT_MODEL there.
         model: session ? next ?? DEFAULT_MODEL : next,
+        generalModel: generalModel(next),
         sessionId: session,
         title: `微信 #${task.seq}${retry ? ' 重试' : ''}: ${clip(task.input, 20)}`,
         // A retry's session has the attachments already.

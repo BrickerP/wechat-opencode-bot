@@ -9,7 +9,7 @@ The prompts the bot's tasks run with. Both orchestrators end every turn with a `
 | `wechat-explore.md` | subagent | Read-only investigation: the answer, each fact with its source, and what it could not check |
 | `wechat-general.md` | subagent | Implementation with full access: what changed, the commands it ran and their results |
 
-The two subagents have no `model:` line on purpose: OpenCode then runs them on the parent session's model, so a task that fell back to another gateway keeps its whole session tree on that gateway. Both orchestrators pin the default primary model; a chat's `/model` or a bot's `model` in `bots.json` overrides it. Keep the pinned model equal to `OPENCODE_DEFAULT_MODEL` (default `oneapi/DeepSeek-V4.1-Flash`) in both: routing assumes this gateway when neither is set, and the two disagreeing would charge failures to the wrong gateway.
+On ordinary attempts, `OPENCODE_GENERAL_MODEL` selects a model for new `wechat-general` implementation calls. `wechat-explore` inherits the root model. Leave the writer setting empty for inheritance everywhere. A chat or bot model override and fallback attempts disable the writer override; a project-specific explicit child model still takes precedence. Both orchestrators pin the default primary model; a chat's `/model` or a bot's `model` in `bots.json` overrides it. Keep the pinned model equal to `OPENCODE_DEFAULT_MODEL` (default `oneapi/DeepSeek-V4.1-Flash`) in both: routing assumes this gateway when neither is set, and the two disagreeing would charge failures to the wrong gateway.
 
 `wechat-ducc.md` is not part of the setup: no agent may delegate to Ducc.
 

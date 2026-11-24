@@ -106,10 +106,6 @@ export interface WeixinMessage {
 
 // ── GetUpdates API ──────────────────────────────────────────────────────────
 
-export interface GetUpdatesReq {
-  get_updates_buf?: string;
-}
-
 export interface GetUpdatesResp {
   ret?: number;
   retmsg?: string;

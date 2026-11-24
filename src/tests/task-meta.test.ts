@@ -33,7 +33,8 @@ after(() => {
 
 /** A done task of the account, with the given usage, that finished at the given time. */
 function finished(account: string, fields: { usage?: TaskUsage } = {}, at = Date.now()): TaskRow {
-  const task = db.startTaskNow(account, '改 parser')!;
+  db.createTask(account, '改 parser');
+  const task = db.claimNextTask(account)!;
   db.finishTask(task.id, 'done', { result: 'ok', summary: '改了 parser', ...fields });
   raw.prepare('UPDATE tasks SET finished_at = ? WHERE id = ?').run(at, task.id);
   return db.getTask(task.id)!;
@@ -61,7 +62,8 @@ test('finishTask stores the usage, even when /stop finished the task first', () 
   assert.deepEqual([done.tokens_in, done.tokens_out, done.cost_usd], [5000, 250, 0.25]);
   const bare = finished('fin');
   assert.deepEqual([bare.tokens_in, bare.tokens_out, bare.cost_usd], [null, null, null], 'unknown, not 0');
-  const stopped = db.startTaskNow('fin', '跑测试')!;
+  db.createTask('fin', '跑测试');
+  const stopped = db.claimNextTask('fin')!;
   assert.ok(db.finishTask(stopped.id, 'interrupted', { error: '用户停止', notified: true }));
   assert.equal(db.finishTask(stopped.id, 'interrupted', { error: 'aborted', usage: { input: 10, output: 2, cost: 0 } }), false);
   const row = db.getTask(stopped.id)!;
@@ -130,7 +132,8 @@ test('/tasks flags a task whose prompt tokens reach OWB_TASK_WARN_TOKENS, keepin
 
 test('/tasks and <recent_tasks> name a done task that asked the user, was blocked or failed by its own report', () => {
   for (const outcome of ['needs_input', 'blocked', 'failed', 'done']) {
-    const task = db.startTaskNow('outcome', '看下')!;
+    db.createTask('outcome', '看下');
+    const task = db.claimNextTask('outcome')!;
     db.finishTask(task.id, 'done', { result: 'ok', outcome });
   }
   const labels = formatTasks(db, 'outcome', 5)

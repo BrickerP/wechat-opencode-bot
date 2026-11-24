@@ -175,7 +175,8 @@ test('routeMessage stores the stripped input and the repo dir', () => {
   const { task } = db.createTask('acc', first.input, 'm1', first.project);
   assert.deepEqual([task.input, task.project_id, task.project_dir], ['看下 AGENTS.md', medo.id, medo.dir]);
   assert.deepEqual(route('继续'), { input: '继续', botId: 'chief' }, 'the task router, not a rule here, ties it to the last task');
-  assert.equal(db.startTaskNow('sim', '继续', medo)?.project_dir, medo.dir);
+  db.createTask('sim', '继续', null, medo);
+  assert.equal(db.claimNextTask('sim')?.project_dir, medo.dir);
 });
 
 test('"@bot" comes off first, then the project is routed from the rest', () => {

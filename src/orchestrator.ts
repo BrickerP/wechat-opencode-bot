@@ -51,8 +51,6 @@ export interface TaskIO {
   readOnlyMemory?: boolean;
 }
 
-export const shortId = (id: string): string => id.slice(0, 6);
-
 // User-facing times follow the user's clock, not the host timezone.
 const TIME_FORMAT = new Intl.DateTimeFormat('sv-SE', {
   timeZone: 'Asia/Shanghai',

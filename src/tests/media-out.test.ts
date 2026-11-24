@@ -257,10 +257,12 @@ test('a v9 database gains the files column and keeps its rows', () => {
 });
 
 test('finishTask stores the accepted paths as a JSON array, and an empty list as null', () => {
-  const sent = db.startTaskNow('fin', '画图')!;
+  db.createTask('fin', '画图');
+  const sent = db.claimNextTask('fin')!;
   assert.ok(db.finishTask(sent.id, 'done', { result: 'ok', files: ['/ws/a.png', '/ws/b.pdf'] }));
   assert.equal(db.getTask(sent.id)!.files, '["/ws/a.png","/ws/b.pdf"]');
-  const bare = db.startTaskNow('fin', '你好')!;
+  db.createTask('fin', '你好');
+  const bare = db.claimNextTask('fin')!;
   assert.ok(db.finishTask(bare.id, 'done', { result: 'ok', files: [] }));
   assert.equal(db.getTask(bare.id)!.files, null);
 });
@@ -278,7 +280,8 @@ function fakeSender({ failing = [] as string[], textFails = false } = {}) {
 /** Finish a task of the account that lists files, then deliver it as the daemon does. */
 async function deliver(account: string, files: string[], sender: ReturnType<typeof fakeSender>['sender']): Promise<void> {
   db.saveContextToken(account, 'wx-user', 'ctx');
-  const task = db.startTaskNow(account, '发文件')!;
+  db.createTask(account, '发文件');
+  const task = db.claimNextTask(account)!;
   db.finishTask(task.id, 'done', { result: '文件在这', files });
   await createNotifier(db, {} as any, sender as any).taskIO(task, {} as any).deliver(db.getTask(task.id)!);
 }

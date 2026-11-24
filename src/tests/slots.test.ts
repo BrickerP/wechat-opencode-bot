@@ -34,7 +34,8 @@ test('worktree only for a contended single repository; reuse it for the next tur
     }
     const project = kind === 'unregistered' ? undefined : { id: kind, dir };
     const db = openStateDb(join(tmp, `${kind}.db`));
-    const owner = db.startTaskNow('a', 'first', project)!;
+    db.createTask('a', 'first', null, project);
+    const owner = db.claimNextTask('a')!;
     let calls = 0;
     const create = async (root: string, name: string) => {
       calls++;
@@ -44,13 +45,15 @@ test('worktree only for a contended single repository; reuse it for the next tur
     };
     assert.ok(await prepareWorkspace(db, owner, create));
     assert.equal(calls, 0);
-    const second = db.startTaskNow('a', 'second', project)!;
+    db.createTask('a', 'second', null, project);
+    const second = db.claimNextTask('a')!;
     assert.equal(await prepareWorkspace(db, second, create), kind !== 'failure');
     assert.equal(calls, Number(kind === 'single' || kind === 'failure'));
     if (kind === 'single') {
       db.setTaskSession(second.id, 'session');
       db.finishTask(second.id, 'done');
-      const next = db.startTaskNow('a', 'continue', project, undefined, 'session')!;
+      db.createTask('a', 'continue', null, project, undefined, undefined, 'session');
+      const next = db.claimNextTask('a')!;
       assert.equal(next.worktree_dir, `${dir}-isolated`);
       assert.ok(await prepareWorkspace(db, next, create));
       assert.equal(calls, 1);

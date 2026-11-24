@@ -340,11 +340,8 @@ async function run(
   { stopAfterMs, project, botId, progressFails, readOnlyMemory, continues, whileRunning }: RunOptions = {},
 ) {
   scripts.push(...plan);
-  let task = db.startTaskNow('test', 'hi', project, botId)!;
-  if (continues) {
-    db.setTaskSession(task.id, continues);
-    task = db.getTask(task.id)!;
-  }
+  const { task: queued } = db.createTask('test', 'hi', null, project, botId, undefined, continues);
+  const task = db.claimNextTask('test', queued.id)!;
   const controller = new AbortController();
   if (stopAfterMs !== undefined) {
     later(stopAfterMs, () => {

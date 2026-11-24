@@ -159,7 +159,8 @@ test('a v3 database gains bot_id and keeps its rows; new tasks store their bot',
   assert.deepEqual([db.getTask(task.id)?.input, db.getTask(task.id)?.bot_id], ['old task', null]);
   assert.equal(openStateDb(file).getTask(task.id)?.input, 'old task', 'opening again changes nothing');
   assert.equal(db.createTask('acc', 'hi', 'm1', undefined, 'research').task.bot_id, 'research');
-  assert.equal(db.startTaskNow('sim', 'hi', undefined, 'all')?.bot_id, 'all');
+  db.createTask('sim', 'hi', null, undefined, 'all');
+  assert.equal(db.claimNextTask('sim')?.bot_id, 'all');
 });
 
 test('the prompt names the persona, and the default bot also lists the specialists; <memory> shows the matches with ids', () => {

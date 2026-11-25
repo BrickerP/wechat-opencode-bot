@@ -453,7 +453,7 @@ function readUsage(session: any): Usage {
 /** Sessions spawned by the subagent tool carry parentID. created is when OpenCode created the session. */
 export async function listChildSessions(
   parentId: string,
-): Promise<Array<{ id: string; title: string; agent?: string; created?: number; usage: Usage }>> {
+): Promise<Array<{ id: string; title: string; agent?: string; created?: number; busy?: number; idle?: number; usage: Usage }>> {
   const params = new URLSearchParams({ parentID: parentId, limit: "50" });
   const out = await api<{ data: any[] }>(`/api/session?${params.toString()}`);
   return (out.data || []).map((s) => ({
@@ -461,6 +461,8 @@ export async function listChildSessions(
     title: s.title || s.id,
     agent: s.agent,
     created: typeof s.time?.created === "number" ? s.time.created : undefined,
+    busy: s.time?.busy,
+    idle: s.time?.idle,
     usage: readUsage(s),
   }));
 }
@@ -783,6 +785,57 @@ function readReport(input: any): Report | undefined {
 const lastReport = (messages: any[]): Report | undefined =>
   completedCalls(messages, REPORT_TOOL).map((call) => readReport(call.input)).filter((report) => report !== undefined).at(-1);
 
+type Admission = { since: number; id?: string };
+
+/** Oldest first, including every automatic resume since this prompt. A long turn must not lose an outstanding
+ * handoff off the back of the first page. A cursor already encodes the order. */
+async function turnMessages(sessionId: string, { since, id }: Admission, signal?: AbortSignal): Promise<any[]> {
+  const newestFirst: any[] = [];
+  let cursor: string | undefined;
+  do {
+    const query = cursor ? `cursor=${encodeURIComponent(cursor)}` : "order=desc";
+    const page = await api<{ data: any[]; cursor?: { next?: string } }>(
+      `/api/session/${sessionId}/message?limit=100&${query}`, { signal },
+    );
+    for (const m of page.data) {
+      if ((m.time?.created ?? 0) < since) return id ? [] : newestFirst.reverse();
+      newestFirst.push(m);
+      if (id && m.id === id) return newestFirst.reverse();
+    }
+    cursor = page.cursor?.next;
+  } while (cursor);
+  // An admitted input can still be queued. Do not accept an idle from the preceding turn in the same millisecond.
+  return id ? [] : newestFirst.reverse();
+}
+
+/** Project the server's handoffs and receipts in transcript order. A completed subagent *tool call* with
+ * metadata.status=running only means the handoff succeeded. A foreground call on 2.2.1 has no pending receipt. */
+function backgroundWork(messages: any[]) {
+  const receipts = new Map<string, number | undefined>(); // undefined: waiting for this child's next terminal result
+  let answerFrom = 0;
+  for (const [i, m] of messages.entries()) {
+    if (m.type === "assistant") {
+      for (const part of m.content ?? []) {
+        const meta = part.state?.metadata;
+        if (part.type === "tool" && part.name === "subagent" && part.state?.status === "completed" && meta?.status === "running") {
+          if (typeof meta.sessionID !== "string" || !meta.sessionID) throw new Error("OpenCode 后台子任务缺少会话 ID");
+          receipts.set(meta.sessionID, undefined); // re-arms an existing child on a follow-up, too
+        }
+      }
+    } else if (m.type === "synthetic" && m.metadata?.source === "subagent" && receipts.has(m.metadata.childID)) {
+      // In 2.3/2.4 metadata.state describes this *period*. The server-generated opening tag says 'running'
+      // if the child still owns background work. Never interpret the child's prose or a user-supplied tag.
+      const partial = /^<(?:subagent|background-result kind="subagent") sessionID="[^"]+" state="running"(?:\s|>)/.test(m.text ?? "");
+      const terminal = ["completed", "error", "cancelled"].includes(m.metadata.state) && !partial;
+      receipts.set(m.metadata.childID, terminal ? m.time.created : undefined);
+      answerFrom = i + 1; // even a plausible report from before the last receipt is stale
+    } else if (m.type === "idle" && i < messages.length - 1) {
+      answerFrom = i + 1;
+    }
+  }
+  return { receipts, answerFrom };
+}
+
 /**
  * Hands onReply each completed wechat_reply call of the root session once, oldest first, by its call id. Checked
  * when the callback is due, not when it is queued: an abort in between drops the note.
@@ -804,11 +857,12 @@ function announceReplies(sessionId: string, assistants: any[], announced: Set<st
  * FIRST_RESPONSE_TIMEOUT_MS, or no sign of progress in the session or its subagent sessions for STALL_TIMEOUT_MS.
  * Signs of progress are a changed snapshot, a running tool or a pending permission, and what the event stream
  * shows streaming (events.ts): without it a long reasoning step looked like silence.
- * The answer is the turn's last wechat_report call; undefined when it made none, which openCodeQuery deals with.
+ * Background handoffs may give the parent several idle/resume rounds. Only a report after the final result counts;
+ * undefined after that round, and only then, lets openCodeQuery ask for a missing report.
  * Follow-ups (options.followUps) are steered in at every poll; one whose steer fails goes to held, for the next turn.
  * A continued session's subagent sessions from earlier turns are left out.
  */
-async function waitForTurn(sessionId: string, since: number, options: QueryOptions, held: string[]): Promise<Report | undefined> {
+async function waitForTurn(sessionId: string, admission: Admission, options: QueryOptions, held: string[]): Promise<Report | undefined> {
   const startedAt = Date.now();
   const deadline = startedAt + TURN_TIMEOUT_MS;
   const handledPermissions = new Set<string>();
@@ -830,11 +884,17 @@ async function waitForTurn(sessionId: string, since: number, options: QueryOptio
       }
     }
 
-    // Real work runs in subagent sessions, and each of them asks for its own permissions.
-    const children = (await listChildSessions(sessionId).catch(() => [] as Array<{ id: string; created?: number }>)).filter(
-      (child) => (child.created ?? since) >= since,
+    const turn = await turnMessages(sessionId, admission, options.signal);
+    const { receipts, answerFrom } = backgroundWork(turn);
+    const assistants = turn.filter((m) => m.type === "assistant");
+    if (options.onReply) announceReplies(sessionId, assistants, announced, options);
+
+    // An earlier turn's child can be reused. Keep its permissions and its watchdog live across parent idles.
+    const children = (await listChildSessions(sessionId).catch(() => [])).filter(
+      (child) => (child.created ?? admission.since) >= admission.since || receipts.has(child.id),
     );
-    const pending = (await Promise.all([sessionId, ...children.map((c) => c.id)].map(listPendingPermissions))).flat();
+    const childIds = [...new Set([...children.map((c) => c.id), ...receipts.keys()])];
+    const pending = (await Promise.all([sessionId, ...childIds].map(listPendingPermissions))).flat();
     for (const request of pending) {
       if (handledPermissions.has(request.id)) continue;
       handledPermissions.add(request.id);
@@ -868,16 +928,9 @@ async function waitForTurn(sessionId: string, since: number, options: QueryOptio
     // A session waiting on the user is not a silent model, however long the answer takes.
     if (pending.length) progressAt = Date.now();
 
-    const out = await api<{ data: any[] }>(`/api/session/${sessionId}/message?limit=100&order=desc`);
-    const turn = (out.data || []).filter((m) => (m?.time?.created ?? 0) >= since);
-    const assistants = turn
-      .filter((m) => m?.type === "assistant")
-      .sort((a, b) => (a.time?.created ?? 0) - (b.time?.created ?? 0));
-    // Before the idle check, so a note that came in the same poll as the end of the turn is told ahead of the answer.
-    if (options.onReply) announceReplies(sessionId, assistants, announced, options);
-
-    const idle = turn.find((m) => m?.type === "idle");
-    if (idle) {
+    if (options.signal?.aborted) throw new TurnInterrupted();
+    const idle = turn.at(-1);
+    if (idle?.type === "idle") {
       if (idle.outcome === "failed") {
         const { message, kind, upstream } = classifyIdleError(idle.error);
         throw upstream ? new UpstreamError(message, kind) : new TurnFailed(message, kind);
@@ -885,13 +938,19 @@ async function waitForTurn(sessionId: string, since: number, options: QueryOptio
       if (idle.outcome === "interrupted") {
         throw new TurnInterrupted("OpenCode 执行被中断");
       }
-      return lastReport(assistants);
+      // A child's idle and delivery of its result are separate events. A late receipt for a previous period of a
+      // reused child also cannot settle a newer busy/idle period. No sleep or grace interval can establish this.
+      const waiting = [...receipts.values()].includes(undefined) || children.some((child) => {
+        const receipt = receipts.get(child.id);
+        return receipt !== undefined && ((child.busy ?? 0) > (child.idle ?? 0) || (child.idle ?? 0) > receipt);
+      });
+      if (!waiting) return lastReport(turn.slice(answerFrom).filter((m) => m.type === "assistant"));
     }
 
     const childMessages = (
       await Promise.all(
-        children.map((c) =>
-          api<{ data: any[] }>(`/api/session/${c.id}/message?limit=5&order=desc`).then((o) => o.data || [], () => []),
+        childIds.map((id) =>
+          api<{ data: any[] }>(`/api/session/${id}/message?limit=5&order=desc`).then((o) => o.data || [], () => []),
         ),
       )
     ).flat();
@@ -906,7 +965,7 @@ async function waitForTurn(sessionId: string, since: number, options: QueryOptio
       progressAt = now;
     }
     // The event stream shows reasoning, text and tool input while they stream; a snapshot only once they are done.
-    const streamedAt = lastActivityAt([sessionId, ...children.map((c) => c.id)]);
+    const streamedAt = lastActivityAt([sessionId, ...childIds]);
     if (streamedAt !== undefined && streamedAt > progressAt) progressAt = streamedAt;
     const responded =
       turn.some((m) => m?.type === "assistant" && (m.content?.length || m.time?.streamed)) ||
@@ -920,7 +979,7 @@ async function waitForTurn(sessionId: string, since: number, options: QueryOptio
     try {
       options.onProgress?.({
         elapsedMs: now - startedAt,
-        children: children.length,
+        children: childIds.length,
         idleMs: now - progressAt,
         tools: [...new Set(tools)].slice(0, PROGRESS_TOOLS),
       });
@@ -935,14 +994,14 @@ async function waitForTurn(sessionId: string, since: number, options: QueryOptio
 }
 
 /** Sends text as the session's next turn; resolves with the time OpenCode admitted it. */
-async function sendTurn(sessionId: string, text: string, files?: string[]): Promise<number> {
+async function sendTurn(sessionId: string, text: string, files?: string[]): Promise<Admission> {
   const body: Record<string, unknown> = { text, delivery: "queue" };
   if (files?.length) body.files = files.map((p) => ({ uri: pathToFileURL(p).href, name: basename(p) }));
-  const admitted = await api<{ data: { time?: { created?: number } } }>(`/api/session/${encodeURIComponent(sessionId)}/prompt`, {
+  const admitted = await api<{ data: { id?: string; time?: { created?: number } } }>(`/api/session/${encodeURIComponent(sessionId)}/prompt`, {
     method: "POST",
     body: JSON.stringify(body),
   }).catch(rethrowGone);
-  return admitted?.data?.time?.created ?? Date.now();
+  return { id: admitted?.data?.id, since: admitted?.data?.time?.created ?? Date.now() };
 }
 
 /**
@@ -967,9 +1026,9 @@ export async function openCodeQuery(options: QueryOptions): Promise<QueryResult>
   const held: string[] = [];
   /** text as the session's next turn, and the answer to it. */
   const turn = async (text: string, turnFiles?: string[]): Promise<Report | undefined> => {
-    const since = await sendTurn(sessionId, text, turnFiles);
+    const admission = await sendTurn(sessionId, text, turnFiles);
     admitted = true;
-    return waitForTurn(sessionId, since, options, held);
+    return waitForTurn(sessionId, admission, options, held);
   };
   try {
     if (continued) {
@@ -1018,11 +1077,11 @@ export async function openCodeQuery(options: QueryOptions): Promise<QueryResult>
       logger.warn("Session to continue is gone", { sessionId });
       return { sessionId, error: err.message, gone: true };
     }
-    const interrupted = err instanceof TurnInterrupted;
+    const interrupted = err instanceof TurnInterrupted || signal?.aborted === true;
     const upstream = err instanceof UpstreamError;
     // Errors from the local OpenCode server itself (unreachable, HTTP errors) have no kind and are never upstream.
     const errorKind = err instanceof TurnFailed ? err.errorKind : undefined;
-    const error = err instanceof Error ? err.message : String(err);
+    const error = interrupted && !(err instanceof TurnInterrupted) ? "任务已停止" : err instanceof Error ? err.message : String(err);
     // Timeouts, aborts and transport errors can leave the session executing on the server; an idle one is a no-op.
     if (sessionId) await interruptSession(sessionId);
     // Read once the interrupt is in, so the stopped sessions are counted as they ended.

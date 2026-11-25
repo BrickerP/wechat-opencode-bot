@@ -284,7 +284,7 @@ export function composeContinuation(task: TaskRow, attachments: Attachments, mem
     `<context>\n${context.join('\n')}\n</context>`,
     `<memory>\n${formatMemories(memories)}\n</memory>`,
     `<user_message>\n${messageText(task)}\n</user_message>`,
-    'This message follows up on the work in this session. End your turn with wechat_report, as before.',
+    'This message follows up on the work in this session. Give the whole answer with wechat_report once the work is complete.',
   ].join('\n\n');
 }
 
@@ -293,14 +293,14 @@ export function composeRetry(error: string): string {
   return [
     `<retry>\nYour previous attempt stopped: ${clip(error, MAX_ERROR_CHARS)}\n</retry>`,
     'It may already have changed files or started work, and its last step may be cut off. Check the current state, ' +
-      'then continue from where it stopped instead of starting over. End your turn with wechat_report, as before.',
+      'then continue from where it stopped instead of starting over. Report after the work is complete.',
   ].join('\n\n');
 }
 
 /** One more turn for a turn that ended without wechat_report, the only answer that reaches the user. */
 const REPORT_NUDGE =
-  'Your turn ended without calling wechat_report, so the user got nothing. Call wechat_report now, once, with your ' +
-  'whole answer for the user, and end the turn.';
+  'Your turn ended without calling wechat_report after the final results. Use the results in this session to give ' +
+  'the whole answer once with wechat_report. If the work failed or was cancelled, say so; do not repeat it.';
 
 /**
  * What a follow-up or /steer sends into a running task's session. The session has the task's prompt already; the

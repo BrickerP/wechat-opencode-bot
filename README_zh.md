@@ -50,7 +50,7 @@ flowchart LR
 3. worker 领取最早可以运行的任务，在项目根目录（没有项目时在聊天的工作目录）新开一个 OpenCode 会话。OpenCode 会加载该目录的 `AGENTS.md` 和 `opencode.json`，其中的规则优先于记忆和最近任务。分派器接到已结束任务上的消息则接着那个任务的会话做（见“路由”），重试也接着失败的那个会话。
 4. 新会话的上下文由 prompt 携带：时间、附件、bot 的角色、项目、与消息相关的至多 8 条 agentmemory 记忆（各带 id 和日期），以及最近 8 个任务（各带会话 id，最近 2 个附回复摘录）。消息需要某个早先任务做过什么时，编排器让 `wechat-explore` 用 `--session <id>`（prompt 里给出路径）读那个会话，而不是去搜。
 5. orchestrator 把工作交给 `wechat-explore` 或 `wechat-general`，同时最多 3 个，每个任务最多 6 个。权限请求发到微信。orchestrator 用 `wechat_reply` 发的简短说明会作为过程说明发到聊天；守护进程自己的进度通知（已运行时长、正在运行的工具、子 agent 数量）默认关闭。
-6. orchestrator 每一轮都以一次 `wechat_report` 调用结束：`status`（`done`、`needs_input`、`blocked` 或 `failed`）、`reply`、`summary`，以及可选的 `memory` 和 `files`。两个工具都来自 OpenCode 插件 `plugin/wechat-bridge.js`，守护进程从会话里读取它们的调用。某一轮没有调用就结束时，会再发一条 prompt 让它补上；仍然没有，任务失败。守护进程保留回复、把最多 5 条事实存进 agentmemory（以某条记忆的 id 开头的事实会更新那一条），保存摘要、状态、本任务各轮的 token 用量和文件路径，并在文字之后发送文件。已完成任务的状态不是 `done` 时，`/tasks` 和分派器会显示出来，比如 `完成·等你回复`。
+6. orchestrator 用 `wechat_report` 给出最终答复：`status`（`done`、`needs_input`、`blocked` 或 `failed`）、`reply`、`summary`，以及可选的 `memory` 和 `files`。两个工具都来自 `plugin/wechat-bridge.js`。子任务在后台运行时，即使父会话暂时空闲，守护进程也会等所有结果送达父会话，再取这一轮的最终报告。如果缺少报告，只提醒一次；仍然没有就报失败，不发送之前的答复。守护进程保留回复、把最多 5 条事实存进 agentmemory（以某条记忆的 id 开头的事实会更新那一条），保存摘要、状态、本任务各轮的 token 用量和文件路径，并在文字之后发送文件。已完成任务的状态不是 `done` 时，`/tasks` 和分派器会显示出来，比如 `完成·等你回复`。
 7. 接着做的会话只在下一轮收到新的内容：时间、任务编号、附件、相关记忆和消息，因为会话里已经有之前的工作。结果加上 bot 的回复前缀后只进入待发队列一次，按 2048 字分段；失败显示 `⚠️ 任务 #N 失败：…`，重启中断显示 `⏹ 任务 #N 已中断…`。
 
 ### 路由

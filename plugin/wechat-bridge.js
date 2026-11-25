@@ -11,8 +11,8 @@ const REPLY = "wechat_reply"
 const report = {
   name: REPORT,
   description:
-    "End every turn with this, exactly once, as the last thing you do: the answer the user reads in WeChat and what " +
-    "the bridge records. Nothing else you write reaches the user. Write nothing after it.",
+    "Give the final answer in WeChat, once, after every delegated result has arrived. If a helper is still running, " +
+    "end the turn without this call; its result will resume you. Write nothing after the final report.",
   input: {
     type: "object",
     properties: {
@@ -51,7 +51,7 @@ const reply = {
   name: REPLY,
   description:
     "Send the user one short message now, while the work goes on: the scope you settled on, or what you check next. " +
-    "At most twice a turn, and only when the work takes a while. It is never the answer: that goes in wechat_report.",
+    "At most twice per task, only when useful. This is a progress note; the final answer goes in wechat_report after the work finishes.",
   input: {
     type: "object",
     properties: { text: { type: "string", description: "One or two sentences, plain text." } },

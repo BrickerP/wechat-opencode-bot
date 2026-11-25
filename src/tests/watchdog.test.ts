@@ -75,8 +75,9 @@ interface FakeSession {
   agent?: string;
   /** The location.directory the session was created with. */
   directory?: string;
-  time: { created: number };
+  time: { created: number; busy?: number; idle?: number };
   messages: any[];
+  beforeRead?: () => void;
   interrupted: boolean;
   /** Input steered in that no turn took in. */
   inbox: Array<{ id: string; type: 'user'; payload: { text: string } }>;
@@ -102,7 +103,8 @@ interface Prompt {
 const sessions: FakeSession[] = [];
 const prompts: Prompt[] = [];
 /** How each turn behaves, in the order the turns start: each queued prompt starts one. */
-const scripts: Script[] = [];
+type Scenario = Script | ((root: FakeSession) => void);
+const scripts: Scenario[] = [];
 /** Runs once, at the next read of an inbox. */
 let onInboxRead: (() => void) | undefined;
 let ids = 0;
@@ -246,7 +248,14 @@ function handle(req: IncomingMessage, res: ServerResponse): void {
       if (req.method === 'PATCH') session.metadata = JSON.parse(body).metadata;
       return send({ id: session.id, tokens: session.tokens, cost: session.cost, metadata: session.metadata });
     }
-    if (action === 'message') return send([...session.messages].reverse());
+    if (action === 'message') {
+      const cursor = url.searchParams.get('cursor');
+      if (!cursor) session.beforeRead?.();
+      if (cursor && url.searchParams.has('order')) return json(400, 'order is encoded in cursor');
+      const offset = Number(cursor ?? 0), limit = Number(url.searchParams.get('limit') ?? 100);
+      const all = [...session.messages].reverse();
+      return json(200, { data: all.slice(offset, offset + limit), cursor: offset + limit < all.length ? { next: String(offset + limit) } : {} });
+    }
     if (action === 'permission') return send([]);
     if (action === 'model') {
       session.model = JSON.parse(body).model;
@@ -278,7 +287,9 @@ function handle(req: IncomingMessage, res: ServerResponse): void {
       }
       session.messages.push(user);
       charge(session);
-      play[scripts.shift() ?? 'silent'](session);
+      session.beforeRead = undefined;
+      const scenario = scripts.shift() ?? 'silent';
+      (typeof scenario === 'function' ? scenario : play[scenario])(session);
       return send({ id: user.id, time: user.time });
     }
     res.writeHead(404).end();
@@ -336,7 +347,7 @@ interface RunOptions {
 
 /** Run one task through the given turn scripts; prompts are the ones the server got during it. */
 async function run(
-  plan: Script[],
+  plan: Scenario[],
   { stopAfterMs, project, botId, progressFails, readOnlyMemory, continues, whileRunning }: RunOptions = {},
 ) {
   scripts.push(...plan);
@@ -391,6 +402,85 @@ after(() => {
   server.close();
   rmSync(tmp, { recursive: true, force: true });
   delete process.env.OWB_BREAKER_THRESHOLD;
+});
+
+// Each frame is what the next root poll can actually see. A child's idle, the synthetic input reaching its
+// parent, and the parent finishing its resumed turn are deliberately *different* frames.
+const frames = (...steps: Array<(root: FakeSession) => void>) => (root: FakeSession) => {
+  root.beforeRead = () => steps.shift()?.(root);
+};
+const handoff = (child: FakeSession, status = 'running') => ({
+  type: 'tool', name: 'subagent', state: { status: 'completed', metadata: { sessionID: child.id, status } },
+});
+const receipt = (child: FakeSession, state: string, tag = 'background-result kind="subagent"') => message('synthetic', {
+  metadata: { source: 'subagent', childID: child.id, state: state === 'running' ? 'completed' : state },
+  text: `<${tag} sessionID="${child.id}" state="${state}" description="sample">\nchild output`,
+});
+
+test('background: wait for both deliveries and the resumed parent; only the last answer is delivered', async () => {
+  let a: FakeSession, b: FakeSession;
+  const { task, delivered, prompts: sent } = await run([frames(
+    (s) => {
+      a = addSession({ parentID: s.id }); b = addSession({ parentID: s.id });
+      s.messages.push(assistant(handoff(a), handoff(b)));
+      // The outstanding launches are outside the newest message page, even on the first poll.
+      for (let i = 0; i < 101; i++) s.messages.push(assistant({ type: 'text', text: 'step' }));
+      answer(s, { reply: 'I started both', memory: ['premature'] });
+    },
+    (s) => { a.time.idle = Date.now(); s.messages.push(receipt(a, 'completed')); answer(s, { reply: 'only A' }); },
+    (s) => { b.time.idle = Date.now(); b.messages.push(idle('succeeded')); s.messages.push(message('user', { text: receipt(b, 'completed').text }), idle('succeeded')); },
+    (s) => s.messages.push(receipt(b, 'completed')), // old root idle still in the transcript
+    (s) => answer(s, { reply: 'A and B verified', summary: 'both finished' }),
+  )]);
+  assert.equal(sent.length, 1, 'no report nudge or retry at an intermediate idle');
+  assert.deepEqual(delivered.map((t) => t.result), ['A and B verified']);
+  assert.equal(task.summary, 'both finished');
+  assert.equal(memoryWrites.length, 0, 'a premature report cannot save memories');
+});
+
+test('background: reusing a child needs another result; a still-running envelope is not terminal', async () => {
+  let child: FakeSession;
+  const { delivered, prompts: sent } = await run([frames(
+    (s) => {
+      child = addSession({ parentID: s.id, time: { created: 1 } }); // child from an earlier turn
+      s.messages.push(assistant(handoff(child)), receipt(child, 'completed'), assistant(handoff(child)), idle('succeeded'));
+    },
+    (s) => { s.messages.push(receipt(child, 'running', 'subagent')); answer(s, { reply: 'partial (2.3)' }); },
+    (s) => { s.messages.push(receipt(child, 'running')); answer(s, { reply: 'partial (2.4)' }); },
+    (s) => { s.messages.push(receipt(child, 'cancelled')); answer(s, { status: 'blocked', reply: 'second job cancelled' }); },
+  )]);
+  assert.equal(sent.length, 1);
+  assert.deepEqual(delivered.map((t) => [t.outcome, t.result]), [['blocked', 'second job cancelled']]);
+});
+
+test('background: nudge once only after the resumed parent omits its report; never reuse the early report', async () => {
+  let child: FakeSession, resultDelivered = false;
+  const { delivered, prompts: sent } = await run([frames(
+    (s) => { child = addSession({ parentID: s.id }); s.messages.push(assistant(handoff(child))); answer(s, { reply: 'done already' }); },
+    (s) => { resultDelivered = true; s.messages.push(receipt(child, 'error'), assistant({ type: 'text', text: 'could not finish' }), idle('succeeded')); },
+  ), (s) => answer(s, { reply: resultDelivered ? 'helper failed' : 'nudged too soon', status: 'failed' })]);
+  assert.equal(sent.length, 2);
+  assert.deepEqual(delivered.map((t) => t.result), ['helper failed']);
+});
+
+test('background: stopping during a parent idle interrupts the helper without delivering a placeholder', async () => {
+  let child: FakeSession | undefined;
+  const { task, delivered, prompts: sent } = await run([(s) => {
+    child = addSession({ parentID: s.id }); s.messages.push(assistant(handoff(child))); answer(s, { reply: 'later' });
+  }], { stopAfterMs: 300 });
+  assert.equal(task.status, 'interrupted');
+  assert.ok(child?.interrupted);
+  assert.equal(sent.length, 1);
+  assert.deepEqual(delivered, []);
+});
+
+test('2.2.1 foreground: a completed inline result needs no synthetic delivery or additional prompt', async () => {
+  const { delivered, prompts: sent } = await run([(s) => {
+    const child = addSession({ parentID: s.id }); child.messages.push(idle('succeeded'));
+    s.messages.push(assistant(handoff(child, 'completed'))); answer(s, { reply: 'verified inline' });
+  }]);
+  assert.equal(sent.length, 1);
+  assert.deepEqual(delivered.map((t) => t.result), ['verified inline']);
 });
 
 test('a model that never answers times out, and the same session goes on with the fallback model', async () => {
